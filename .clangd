@@ -1,0 +1,9 @@
+# clangd takes its flags from compile_commands.json, which lists only the two
+# unity TUs (src/unity_app.cpp, src/unity_test.cpp). The pure-core sources under
+# src/winspace/ are #included into those TUs, so they have no entry of their own.
+# Open one directly and clangd falls back to clang-cl's default — C++14 — where
+# <string_view>/<ranges> are gated out ("no type named 'string_view' in namespace
+# 'std'"). Pin the language standard for every file so the #included fragments
+# parse exactly as the build compiles them. Keep this in sync with build.ps1.
+CompileFlags:
+  Add: [/std:c++latest]
