@@ -22,7 +22,7 @@
 // Populated by tasks 02 (config parser) and 03 (reducer). Each core source is
 // pulled in through its test file, which #includes the source under test:
 #include "winspace/config_test.cpp"
-//   #include "winspace/reducer_test.cpp"
+#include "winspace/reducer_test.cpp"
 
 TEST_CASE("build harness compiles, links, and runs a pure test", "[harness]") {
     REQUIRE(1 + 1 == 2);

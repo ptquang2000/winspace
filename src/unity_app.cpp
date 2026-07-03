@@ -11,7 +11,7 @@
 // ── core (pure, no <windows.h>) ─────────────────────────────────────────────
 // Populated by tasks 02 (config parser) and 03 (reducer):
 #include "winspace/config.cpp"
-//   #include "winspace/reducer.cpp"
+#include "winspace/reducer.cpp"
 
 // ── I/O adapters (own all <windows.h> / COM) ────────────────────────────────
 // Populated by tasks 04 (worker + threads), 05 (hotkey adapter), 06 (VD bridge):
