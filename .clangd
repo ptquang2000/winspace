@@ -6,4 +6,10 @@
 # 'std'"). Pin the language standard for every file so the #included fragments
 # parse exactly as the build compiles them. Keep this in sync with build.ps1.
 CompileFlags:
-  Add: [/std:c++latest]
+  # /std pins the language standard (see above). /Isrc and /Ithird_party mirror
+  # the -I roots in compile_commands.json so the quoted includes in the #included
+  # fragments (e.g. #include "winspace/reducer.cpp", #include "io/worker.cpp")
+  # resolve when a file is opened directly rather than only as part of a unity TU.
+  # Without them clangd searches relative to the open file and reports the include
+  # as "file not found". Keep this in sync with build.ps1 / compile_commands.json.
+  Add: [/std:c++latest, /Isrc, /Ithird_party]

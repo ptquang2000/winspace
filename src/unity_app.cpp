@@ -14,18 +14,20 @@
 #include "winspace/reducer.cpp"
 
 // ── I/O adapters (own all <windows.h> / COM) ────────────────────────────────
-// Populated by tasks 04 (worker + threads), 05 (hotkey adapter), 06 (VD bridge):
-//   #include "io/worker.cpp"
+// Task 04 (worker + two-thread spine) landed io/worker.cpp + io/app.cpp.
+// Still to come: 05 (hotkey adapter), 06 (VD bridge):
+#include "io/worker.cpp"
+#include "io/app.cpp"
 //   #include "io/hotkeys.cpp"
 //   #include "io/vd_bridge.cpp"
 
 // ── entry point ─────────────────────────────────────────────────────────────
 #include <windows.h>
 
-// Windowless no-op. Defining wWinMain makes the linker select the Unicode
-// windows CRT startup (wWinMainCRTStartup) automatically. Parameter names are
-// omitted so /W4 /WX doesn't flag them as unreferenced. The real Hotkey→Worker
-// spine lands in task 04.
+// Windowless entry. Defining wWinMain makes the linker select the Unicode
+// windows CRT startup (wWinMainCRTStartup) automatically; /SUBSYSTEM:WINDOWS
+// gives us no console. Parameter names are omitted so /W4 /WX doesn't flag them
+// as unreferenced. All wiring lives in the I/O spine (io/app.cpp).
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    return 0;
+    return winspace::io::runApp();
 }
