@@ -15,11 +15,12 @@
 
 // ── I/O adapters (own all <windows.h> / COM) ────────────────────────────────
 // Task 04 landed io/worker.cpp + io/app.cpp; task 05 landed io/hotkeys.cpp
-// (pulled in by io/app.cpp). Still to come: 06 (VD bridge):
+// (pulled in by io/app.cpp); task 06 landed io/vd_bridge.cpp (pulled in by
+// io/worker.cpp, which owns the bridge on its STA thread).
 #include "io/hotkeys.cpp"
+#include "io/vd_bridge.cpp"
 #include "io/worker.cpp"
 #include "io/app.cpp"
-//   #include "io/vd_bridge.cpp"
 
 // ── entry point ─────────────────────────────────────────────────────────────
 #include <windows.h>

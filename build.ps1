@@ -91,7 +91,7 @@ else {
 
 # WM import libraries — linked by the app TU only. The test TU links none of
 # these, which is what turns any stray OS call in core into a link error.
-$wmLibs = @('user32.lib', 'ole32.lib', 'oleaut32.lib', 'dwmapi.lib', 'shcore.lib')
+$wmLibs = @('user32.lib', 'ole32.lib', 'oleaut32.lib', 'dwmapi.lib', 'shcore.lib', 'advapi32.lib')
 
 # ── always-clean rebuild of this config ─────────────────────────────────────
 if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }

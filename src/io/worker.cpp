@@ -23,6 +23,7 @@
 #include <memory>
 #include <thread>
 
+#include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
 #include "winspace/reducer.cpp"
 
 namespace winspace::io {
@@ -65,9 +66,20 @@ public:
         // the ctor so hwnd() is valid before run() (and before any producer posts).
         m_hwnd = CreateWindowExW(0, k_className, nullptr, 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, instance, this);
+
+        // Build the COM Virtual Desktop bridge on this STA thread — its sole owner.
+        // Null on an unsupported OS variant (a loud diagnostic is already logged);
+        // switch Effects then no-op rather than calling through a wrong vtable.
+        // Adoption ran in the factory, so seed State from the active desktop.
+        m_bridge = makeVirtualDesktopBridge();
+        if (m_bridge) m_state.current_workspace = m_bridge->currentWorkspace();
     }
 
     ~Worker() {
+        // Release the COM bridge BEFORE CoUninitialize: a member is destroyed
+        // only after this body runs, so an implicit release would fire on a
+        // torn-down apartment. Reset here to keep COM teardown thread-correct.
+        m_bridge.reset();
         if (m_hwnd) DestroyWindow(m_hwnd);
         if (m_comInitialized) CoUninitialize();
     }
@@ -122,10 +134,11 @@ private:
         std::visit(
             detail::overload{
                 [&](const SwitchToWorkspace& s) {
-                    // task 06: bridge_->switch_to(s.logical). The bridge (sole
-                    // owner: this thread) resolves the Logical number to a
-                    // Virtual Desktop GUID and calls SwitchDesktop.
-                    (void)s;
+                    // The bridge (sole owner: this thread) resolves the Logical
+                    // number to a Virtual Desktop GUID and calls SwitchDesktop,
+                    // materializing the workspace on demand. Null bridge (an
+                    // unsupported OS variant) → the switch is a no-op.
+                    if (m_bridge) m_bridge->switchTo(s.logical);
                 },
                 [&](const Exit&) {
                     // End run()'s loop; the process then unwinds cleanly.
@@ -138,6 +151,7 @@ private:
     State m_state{};
     HWND m_hwnd = nullptr;
     bool m_comInitialized = false;
+    std::unique_ptr<IVirtualDesktopBridge> m_bridge;  // COM VD bridge; null if unsupported
 };
 
 // Worker thread entry. Constructs the Worker (COM + message-only HWND), publishes
