@@ -23,6 +23,7 @@
 #include <memory>
 #include <thread>
 
+#include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
 #include "winspace/reducer.cpp"
 
@@ -51,7 +52,9 @@ public:
     Worker() {
         // This thread is the single STA that will own the COM bridge (task 06).
         // COINIT_APARTMENTTHREADED demands a message loop, which run() supplies.
-        m_comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+        // A failed init is tolerated (the bridge factory degrades to a null bridge);
+        // the derived bool is what gates the matching CoUninitialize in the dtor.
+        m_comInitialized = ok(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)).has_value();
 
         const HINSTANCE instance = GetModuleHandleW(nullptr);
         WNDCLASSEXW wc{};
@@ -66,6 +69,14 @@ public:
         // the ctor so hwnd() is valid before run() (and before any producer posts).
         m_hwnd = CreateWindowExW(0, k_className, nullptr, 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, instance, this);
+        // A null HWND is the fatal signal the spine acts on (via workerThreadMain);
+        // checkWin32 here just names WHY it failed. Snapshot GetLastError immediately,
+        // before any later call can clobber it. RegisterClassExW above stays unchecked:
+        // its only failure is the benign already-registered case, which CreateWindowExW
+        // shrugs off — a genuine problem resurfaces here as the null HWND.
+        if (const auto created = ok(static_cast<BOOL>(m_hwnd != nullptr)); !created) {
+            lg::error("worker: message-only window creation failed: {}", created.error());
+        }
 
         // Build the COM Virtual Desktop bridge on this STA thread — its sole owner.
         // Null on an unsupported OS variant (a loud diagnostic is already logged);

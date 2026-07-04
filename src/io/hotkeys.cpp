@@ -17,6 +17,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "io/error.cpp"          // lg:: levels — the shared I/O diagnostic sink
@@ -141,16 +142,22 @@ public:
     explicit HotkeyTable(const std::vector<Bind>& binds) : m_binds(binds) {
         for (int id = 0; id < static_cast<int>(m_binds.size()); ++id) {
             const Bind& bind = m_binds[static_cast<size_t>(id)];
-            if (RegisterHotKey(nullptr, id, toWin32Mods(bind.mods), toWin32Vk(bind.key))) {
+            const auto registered =
+                ok(RegisterHotKey(nullptr, id, toWin32Mods(bind.mods), toWin32Vk(bind.key)));
+            if (registered) {
                 m_registered.emplace_back(new int(id));
             } else {
-                const DWORD err = GetLastError();
+                // The boundary consumer for the table: inspect the Win32 code to keep
+                // the "already registered by another app" case a warn-and-skip, distinct
+                // from a genuine failure, then fold the combo name in at the log site.
+                // Either way we skip-and-continue so the remaining binds still register.
                 const std::string combo = describeCombo(bind);
-                if (err == ERROR_HOTKEY_ALREADY_REGISTERED) {
+                const auto* win32 = std::get_if<Win32Error>(&registered.error().code);
+                if (win32 && win32->code == ERROR_HOTKEY_ALREADY_REGISTERED) {
                     lg::warn(
                         "hotkey {} is already registered by another app — skipping", combo);
                 } else {
-                    lg::error("failed to register hotkey {} (error {})", combo, err);
+                    lg::error("failed to register hotkey {}: {}", combo, registered.error());
                 }
             }
         }
