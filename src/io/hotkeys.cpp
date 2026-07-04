@@ -12,28 +12,18 @@
 
 #include <windows.h>
 
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "io/error.cpp"          // lg:: levels — the shared I/O diagnostic sink
 #include "winspace/config.cpp"   // Bind, Mod, Key, Dispatcher
 #include "winspace/reducer.cpp"  // Event, WorkspaceSwitch, Quit
 
 namespace winspace::io {
-
-// ── diagnostics ──────────────────────────────────────────────────────────────
-// Windowless process (no console) → diagnostics go to the debugger channel
-// (DebugView). Shared I/O sink; task 06 uses it for variant logging.
-inline void emitDiagnostic(const std::wstring& message) {
-    OutputDebugStringW((L"[winspace] " + message + L"\n").c_str());
-}
-
-// Widen an ASCII narrow string (config text and parser diagnostics are ASCII).
-inline void emitDiagnostic(std::string_view message) {
-    emitDiagnostic(std::wstring(message.begin(), message.end()));
-}
 
 // ── Mod/Key → Win32 translation (the sole coupling point) ───────────────────
 
@@ -89,47 +79,47 @@ inline Event toEvent(const Bind& bind) {
 }
 
 // ── human-readable combo naming (for diagnostics) ───────────────────────────
-inline std::wstring describeKey(Key key) {
+inline std::string describeKey(Key key) {
     const auto u = std::to_underlying(key);
     if (u >= std::to_underlying(Key::N0) && u <= std::to_underlying(Key::N9))
-        return std::wstring(1, static_cast<wchar_t>('0' + (u - std::to_underlying(Key::N0))));
+        return std::string(1, static_cast<char>('0' + (u - std::to_underlying(Key::N0))));
     if (u >= std::to_underlying(Key::A) && u <= std::to_underlying(Key::Z))
-        return std::wstring(1, static_cast<wchar_t>('A' + (u - std::to_underlying(Key::A))));
+        return std::string(1, static_cast<char>('A' + (u - std::to_underlying(Key::A))));
     if (u >= std::to_underlying(Key::F1) && u <= std::to_underlying(Key::F24))
-        return L"F" + std::to_wstring(1 + (u - std::to_underlying(Key::F1)));
+        return std::format("F{}", 1 + (u - std::to_underlying(Key::F1)));
     switch (key) {
-        case Key::Left: return L"Left";
-        case Key::Right: return L"Right";
-        case Key::Up: return L"Up";
-        case Key::Down: return L"Down";
-        case Key::Home: return L"Home";
-        case Key::End: return L"End";
-        case Key::PageUp: return L"PageUp";
-        case Key::PageDown: return L"PageDown";
-        case Key::Insert: return L"Insert";
-        case Key::Delete: return L"Delete";
-        case Key::Return: return L"Return";
-        case Key::Space: return L"Space";
-        case Key::Tab: return L"Tab";
-        case Key::Escape: return L"Escape";
-        case Key::Backspace: return L"Backspace";
-        default: return L"?";
+        case Key::Left: return "Left";
+        case Key::Right: return "Right";
+        case Key::Up: return "Up";
+        case Key::Down: return "Down";
+        case Key::Home: return "Home";
+        case Key::End: return "End";
+        case Key::PageUp: return "PageUp";
+        case Key::PageDown: return "PageDown";
+        case Key::Insert: return "Insert";
+        case Key::Delete: return "Delete";
+        case Key::Return: return "Return";
+        case Key::Space: return "Space";
+        case Key::Tab: return "Tab";
+        case Key::Escape: return "Escape";
+        case Key::Backspace: return "Backspace";
+        default: return "?";
     }
 }
 
 // e.g. "SUPER+ALT+2" — names the combo in registration diagnostics.
-inline std::wstring describeCombo(const Bind& bind) {
-    std::wstring out;
-    const auto add = [&](Mod flag, const wchar_t* name) {
+inline std::string describeCombo(const Bind& bind) {
+    std::string out;
+    const auto add = [&](Mod flag, const char* name) {
         if (!contains(bind.mods, flag)) return;
-        if (!out.empty()) out += L"+";
+        if (!out.empty()) out += "+";
         out += name;
     };
-    add(Mod::Super, L"SUPER");
-    add(Mod::Alt, L"ALT");
-    add(Mod::Ctrl, L"CTRL");
-    add(Mod::Shift, L"SHIFT");
-    if (!out.empty()) out += L"+";
+    add(Mod::Super, "SUPER");
+    add(Mod::Alt, "ALT");
+    add(Mod::Ctrl, "CTRL");
+    add(Mod::Shift, "SHIFT");
+    if (!out.empty()) out += "+";
     return out + describeKey(bind.key);
 }
 
@@ -155,13 +145,12 @@ public:
                 m_registered.emplace_back(new int(id));
             } else {
                 const DWORD err = GetLastError();
-                const std::wstring combo = describeCombo(bind);
+                const std::string combo = describeCombo(bind);
                 if (err == ERROR_HOTKEY_ALREADY_REGISTERED) {
-                    emitDiagnostic(L"hotkey " + combo +
-                                   L" is already registered by another app — skipping");
+                    lg::warn(
+                        "hotkey {} is already registered by another app — skipping", combo);
                 } else {
-                    emitDiagnostic(L"failed to register hotkey " + combo + L" (error " +
-                                   std::to_wstring(err) + L")");
+                    lg::error("failed to register hotkey {} (error {})", combo, err);
                 }
             }
         }

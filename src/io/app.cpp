@@ -12,6 +12,7 @@
 
 #include <windows.h>
 
+#include <format>
 #include <functional>
 #include <future>
 #include <thread>
@@ -41,7 +42,7 @@ inline constexpr std::string_view k_bootstrapConfig =
 inline std::vector<Bind> loadBinds() {
     ParseResult parsed = parse(k_bootstrapConfig);
     for (const Diagnostic& d : parsed.diagnostics)
-        emitDiagnostic("config line " + std::to_string(d.line) + ": " + d.message);
+        lg::warn("config line {}: {}", d.line, d.message);
     return std::move(parsed.config.binds);
 }
 

@@ -22,15 +22,20 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdio>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <source_location>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <variant>
+#include <vector>
 
-#include "io/hotkeys.cpp"  // emitDiagnostic — the shared I/O diagnostic sink
+#include <format>
+
+#include "io/error.cpp"  // io::Error vocabulary (ok() wrappers, formatter) + lg:: levels
 
 namespace winspace::io {
 
@@ -162,14 +167,6 @@ inline std::wstring guidToWString(const GUID& g) {
     return buf;
 }
 
-// Format an HRESULT as "0xXXXXXXXX" for diagnostics.
-inline std::wstring hrToWString(HRESULT hr) {
-    std::wstring buf(11, L'\0');  // "0x" + 8 hex digits + null
-    swprintf_s(buf.data(), buf.size(), L"0x%08lX", static_cast<unsigned long>(hr));
-    buf.resize(10);
-    return buf;
-}
-
 // Read HKLM CurrentBuildNumber (e.g. 26100); 0 if unreadable. Diagnostic-only
 // per ADR-0002, plus the build gate that separates 24H2 from 23H2-KB.
 inline DWORD readBuildNumber() {
@@ -227,112 +224,147 @@ public:
     bool switchTo(int logical) override {
         if (!m_manager) return false;
 
-        // Hit: resolve the stored GUID to whatever live desktop now holds it
-        // (survives Task View reorder — we match by identity, not position).
-        if (const auto it = m_logicalToGuid.find(logical); it != m_logicalToGuid.end()) {
-            if (auto desktop = resolveLiveDesktop(it->second)) {
-                return doSwitch(logical, desktop.Get());
-            }
-            // The bound desktop was destroyed out from under us (e.g. via Task
-            // View). Fall through and re-materialize the workspace.
-            emitDiagnostic(L"workspace " + std::to_wstring(logical) +
-                           L": bound desktop no longer exists — recreating");
-        }
+        // Hit path as an and_then chain: resolve the binding to its live desktop
+        // (matched by identity, so it survives a Task View reorder), then switch.
+        // A vanished — or not-yet-created — binding surfaces as NotFound, which the
+        // .or_else recovers by re-materializing the workspace (ADR-0003 sparse
+        // model). Only genuine OS failures reach the terminal consumer, the sole
+        // logging site; NotFound is consumed silently by the recovery.
+        const std::expected<Success, Error> result =
+            resolveBinding(logical)
+                .and_then([&](const Microsoft::WRL::ComPtr<vd::IVirtualDesktop>& desktop) {
+                    return doSwitch(logical, desktop.Get());
+                })
+                .or_else([&](const Error& e) -> std::expected<Success, Error> {
+                    if (!std::holds_alternative<NotFound>(e.code))
+                        return std::unexpected(e);  // real OS failure — let it log
+                    return materialize(logical);
+                });
 
-        // Miss (or stale): create exactly ONE desktop, appended at the tail; bind
-        // logical→GUID; switch. No intermediate filling, no clamp (ADR-0003).
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktop> created;
-        if (FAILED(m_manager->CreateDesktop(created.ReleaseAndGetAddressOf())) || !created) {
-            emitDiagnostic(L"workspace " + std::to_wstring(logical) +
-                           L": CreateDesktop failed");
+        if (!result) {
+            lg::error("{}", result.error());
             return false;
         }
-        GUID id{};
-        if (FAILED(created->GetID(&id))) return false;
-        m_logicalToGuid[logical] = id;
-        return doSwitch(logical, created.Get());
+        return true;
     }
 
     int currentWorkspace() const override { return m_current; }
 
 private:
     // Bind every pre-existing desktop to logical 1..N by GUID and seed the current
-    // workspace from the active desktop (ADR-0003 startup adoption).
+    // workspace from the active desktop (ADR-0003 startup adoption). Best-effort:
+    // an enumeration failure logs once and leaves the bridge with no bindings; a
+    // single unreadable desktop is skipped, as the pre-refactor filtered pipeline did.
     void adopt() {
-        Microsoft::WRL::ComPtr<vd::IObjectArray> desktops;
-        if (FAILED(m_manager->GetDesktops(desktops.ReleaseAndGetAddressOf())) || !desktops)
+        auto desktops = ok(
+            [&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
+        if (!desktops) {
+            lg::error("{}", desktops.error());
             return;
+        }
         UINT count = 0;
-        if (FAILED(desktops->GetCount(&count))) return;
+        if (const auto r = ok((*desktops)->GetCount(&count)); !r) {
+            lg::error("{}", r.error());
+            return;
+        }
 
-        auto bindings =
-            std::views::iota(0u, count) |
-            std::views::transform([&](const UINT i) -> std::optional<std::pair<int, GUID>> {
-                Microsoft::WRL::ComPtr<vd::IVirtualDesktop> desktop;
-                GUID id{};
-                if (FAILED(desktops->GetAt(
-                        i, vd::k_iidVirtualDesktop24H2,
-                        reinterpret_cast<void**>(desktop.ReleaseAndGetAddressOf()))) ||
-                    FAILED(desktop->GetID(&id)))
-                    return std::nullopt;
-                return std::pair{static_cast<int>(i) + 1, id};  // logical is 1-based
-            }) |
-            std::views::filter([](const auto& binding) { return binding.has_value(); });
-
+        // Bind each readable desktop's GUID to its 1-based logical slot.
+        const auto readBinding = [&](UINT i) -> std::optional<std::pair<int, GUID>> {
+            auto desktop = ok([&](vd::IVirtualDesktop** pp) {
+                return (*desktops)->GetAt(i, vd::k_iidVirtualDesktop24H2,
+                                          reinterpret_cast<void**>(pp));
+            });
+            if (!desktop) return std::nullopt;
+            GUID id{};
+            if (!ok((*desktop)->GetID(&id))) return std::nullopt;
+            return std::pair{static_cast<int>(i) + 1, id};
+        };
         std::ranges::for_each(
-            bindings, [&](const auto& binding) { m_logicalToGuid[binding->first] = binding->second; });
+            std::views::iota(0u, count) | std::views::transform(readBinding) |
+                std::views::filter([](const auto& b) { return b.has_value(); }),
+            [&](const auto& b) { m_logicalToGuid[b->first] = b->second; });
 
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktop> active;
+        auto active = ok(
+            [&](vd::IVirtualDesktop** pp) { return m_manager->GetCurrentDesktop(pp); });
         GUID activeId{};
-        if (SUCCEEDED(m_manager->GetCurrentDesktop(active.ReleaseAndGetAddressOf())) &&
-            active && SUCCEEDED(active->GetID(&activeId))) {
+        if (active.has_value() && ok((*active)->GetID(&activeId)).has_value()) {
             const auto match = std::ranges::find_if(
                 m_logicalToGuid,
                 [&](const auto& entry) { return IsEqualGUID(entry.second, activeId); });
             if (match != m_logicalToGuid.end()) m_current = match->first;
         }
 
-        emitDiagnostic(L"virtual desktop bridge: adopted " + std::to_wstring(count) +
-                       L" desktop(s); current workspace = " + std::to_wstring(m_current));
+        lg::info(
+            "virtual desktop bridge: adopted {} desktop(s); current workspace = {}", count,
+            m_current);
     }
 
-    // Resolve a stored GUID to the live IVirtualDesktop that currently holds it,
-    // by identity — not by remembered position. Null if it no longer exists.
-    Microsoft::WRL::ComPtr<vd::IVirtualDesktop> resolveLiveDesktop(const GUID& target) {
-        Microsoft::WRL::ComPtr<vd::IObjectArray> desktops;
-        if (FAILED(m_manager->GetDesktops(desktops.ReleaseAndGetAddressOf())) || !desktops)
-            return nullptr;
+    // Map a logical workspace to its live desktop. A logical with no binding yet,
+    // or one whose bound desktop has vanished, surfaces as NotFound so switchTo's
+    // .or_else re-materializes both cases uniformly.
+    std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> resolveBinding(int logical) {
+        const auto it = m_logicalToGuid.find(logical);
+        if (it == m_logicalToGuid.end())
+            return std::unexpected(Error{NotFound{}, std::source_location::current()});
+        return resolveLiveDesktop(it->second);
+    }
+
+    // Resolve a stored GUID to the live IVirtualDesktop that currently holds it, by
+    // identity — not by remembered position. An enumeration failure is an Hr error;
+    // a GUID that no longer names any live desktop is NotFound (routine, recoverable).
+    std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> resolveLiveDesktop(
+        const GUID& target) {
+        auto desktops = ok(
+            [&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
+        if (!desktops) return std::unexpected(desktops.error());
         UINT count = 0;
-        if (FAILED(desktops->GetCount(&count))) return nullptr;
+        if (const auto r = ok((*desktops)->GetCount(&count)); !r)
+            return std::unexpected(r.error());
 
-        // Lazily turn each index into its live desktop, then find the one that
-        // projects to target's GUID. end() means the target no longer exists.
-        auto liveDesktops = std::views::iota(0u, count) | std::views::transform([&](const UINT i) {
-            Microsoft::WRL::ComPtr<vd::IVirtualDesktop> desktop;
-            if (FAILED(desktops->GetAt(
-                    i, vd::k_iidVirtualDesktop24H2,
-                    reinterpret_cast<void**>(desktop.ReleaseAndGetAddressOf()))))
-                return decltype(desktop){};  // null → projects to a zero GUID, never target
-            return desktop;
-        });
-
-        const auto guidOf = [](const Microsoft::WRL::ComPtr<vd::IVirtualDesktop>& desktop) {
+        // Snapshot each desktop once, then match by identity; a genuine enumeration
+        // error exits early rather than masquerading as the absence that would
+        // spuriously re-materialize.
+        const auto snapshot = std::views::iota(0u, count) |
+                              std::views::transform([&](UINT i) {
+                                  return ok([&](vd::IVirtualDesktop** pp) {
+                                      return (*desktops)->GetAt(
+                                          i, vd::k_iidVirtualDesktop24H2,
+                                          reinterpret_cast<void**>(pp));
+                                  });
+                              }) |
+                              std::ranges::to<std::vector>();
+        for (const auto& desktop : snapshot) {
+            if (!desktop) return std::unexpected(desktop.error());
             GUID id{};
-            return (desktop && SUCCEEDED(desktop->GetID(&id))) ? id : GUID{};
-        };
-        const auto it = std::ranges::find(liveDesktops, target, guidOf);
-        return it != std::ranges::end(liveDesktops) ? *it : nullptr;
+            if (const auto r = ok((*desktop)->GetID(&id)); !r)
+                return std::unexpected(r.error());
+            if (IsEqualGUID(id, target)) return *desktop;
+        }
+        // The target GUID no longer names a live desktop — routine, recoverable.
+        return std::unexpected(Error{NotFound{}, std::source_location::current()});
     }
 
-    // Call SwitchDesktop and, on success, record the new current workspace.
-    bool doSwitch(int logical, vd::IVirtualDesktop* desktop) {
-        if (FAILED(m_manager->SwitchDesktop(desktop))) {
-            emitDiagnostic(L"workspace " + std::to_wstring(logical) +
-                           L": SwitchDesktop failed");
-            return false;
-        }
-        m_current = logical;
-        return true;
+    // Create exactly ONE desktop (appended at the tail), bind logical→GUID, switch.
+    // No intermediate filling, no clamp (ADR-0003). Recovers a NotFound from switchTo.
+    std::expected<Success, Error> materialize(int logical) {
+        auto created = ok(
+            [&](vd::IVirtualDesktop** pp) { return m_manager->CreateDesktop(pp); });
+        if (!created) return std::unexpected(created.error());
+        GUID id{};
+        if (const auto r = ok((*created)->GetID(&id)); !r)
+            return std::unexpected(r.error());
+        m_logicalToGuid[logical] = id;
+        return doSwitch(logical, (*created).Get());
+    }
+
+    // Call SwitchDesktop and, on success, record the new current workspace. The
+    // .transform maps the Success through untouched while letting any Error skip
+    // straight past it to the caller's boundary consumer.
+    std::expected<Success, Error> doSwitch(int logical, vd::IVirtualDesktop* desktop) {
+        return ok(m_manager->SwitchDesktop(desktop)).transform([&](Success s) {
+            m_current = logical;
+            return s;
+        });
     }
 
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> m_manager;
@@ -351,17 +383,16 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
     using bridge_detail::VdVariant;
     const DWORD build = bridge_detail::readBuildNumber();
     const DWORD ubr = bridge_detail::readUbr();
-    const std::wstring buildStr =
-        L"build " + std::to_wstring(build) + L"." + std::to_wstring(ubr);
+    const std::string buildStr = std::format("build {}.{}", build, ubr);
 
-    Microsoft::WRL::ComPtr<IServiceProvider> shell;
-    HRESULT hr = CoCreateInstance(vd::k_clsidImmersiveShell, nullptr,
-                                  CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
-                                  reinterpret_cast<void**>(shell.ReleaseAndGetAddressOf()));
-    if (FAILED(hr) || !shell) {
-        emitDiagnostic(L"virtual desktop bridge: CoCreateInstance(ImmersiveShell) "
-                       L"failed (hr=" +
-                       bridge_detail::hrToWString(hr) + L") — COM VD switching disabled");
+    auto shell = ok([&](IServiceProvider** pp) {
+        return CoCreateInstance(vd::k_clsidImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER,
+                                IID_IServiceProvider, reinterpret_cast<void**>(pp));
+    });
+    if (!shell) {
+        lg::error("virtual desktop bridge: CoCreateInstance(ImmersiveShell) failed — "
+                  "COM VD switching disabled: {}",
+                  shell.error());
         return nullptr;
     }
 
@@ -380,69 +411,75 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
 
     const std::wstring forced = bridge_detail::forcedVariantOverride();
 
-    // Transform each probe into its QI outcome: manager (null if this IID's vtable
-    // is wrong) + concrete variant. The shared 53F5CA0B IID is 24H2 only on build
-    // ≥ 26100; on 22631 it is 23H2-KB with a different vtable — must not drive it
-    // as 24H2. WINSPACE_FORCE_VD_VARIANT overrides the variant to test a stub.
+    // Resolve a probe to its QI result plus the variant it denotes. The shared
+    // 53F5CA0B IID is 24H2 only on build ≥ 26100; on 22631 it is 23H2-KB with a
+    // different vtable and must not drive 24H2. WINSPACE_FORCE_VD_VARIANT overrides
+    // the variant to test a stub.
     struct Resolved {
-        GUID iid;
+        const GUID* iid;
+        std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal>, Error>
+            manager;
         VdVariant variant;
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager;
     };
-    auto resolved = probes | std::views::transform([&](const Probe& probe) {
-        Resolved r{probe.iid, probe.variant, {}};
-        if (FAILED(shell->QueryService(
-                vd::k_clsidVirtualDesktopManagerInternal, probe.iid,
-                reinterpret_cast<void**>(r.manager.ReleaseAndGetAddressOf()))) ||
-            !r.manager) {
-            r.manager.Reset();  // wrong vtable for this IID — null signals "skip"
-            return r;
-        }
+    const auto resolve = [&](const Probe& probe) -> Resolved {
+        auto manager = ok([&](vd::IVirtualDesktopManagerInternal** pp) {
+            return (*shell)->QueryService(vd::k_clsidVirtualDesktopManagerInternal,
+                                          probe.iid, reinterpret_cast<void**>(pp));
+        });
+        VdVariant variant = probe.variant;
         if (IsEqualGUID(probe.iid, vd::k_iidVDMInternal_53F5CA0B))
-            r.variant = (build >= 26100) ? VdVariant::W24H2 : VdVariant::W23H2KB;
-        if (forced == L"21h2") r.variant = VdVariant::W21H2;
-        else if (forced == L"22h2") r.variant = VdVariant::W22H2;
-        else if (forced == L"23h2-kb") r.variant = VdVariant::W23H2KB;
-        return r;
-    });
+            variant = (build >= 26100) ? VdVariant::W24H2 : VdVariant::W23H2KB;
+        if (forced == L"21h2") variant = VdVariant::W21H2;
+        else if (forced == L"22h2") variant = VdVariant::W22H2;
+        else if (forced == L"23h2-kb") variant = VdVariant::W23H2KB;
+        return {&probe.iid, std::move(manager), variant};
+    };
 
-    // First probe with a valid manager wins (newest→oldest); dispatch on variant.
-    for (auto&& [iid, variant, manager] : resolved) {
-        if (!manager) continue;
-        const std::wstring iidName = bridge_detail::guidToWString(iid);
-        switch (variant) {
-            case VdVariant::W24H2:
-                emitDiagnostic(L"virtual desktop bridge: matched IID " + iidName + L" (" +
-                               buildStr + L") — 24H2 variant");
-                return std::make_unique<VirtualDesktop24H2Bridge>(std::move(manager));
-
-            case VdVariant::W23H2KB:
-                emitDiagnostic(L"virtual desktop bridge: IID " + iidName + L" resolved to "
-                               L"23H2-KB5034204 variant (" + buildStr +
-                               L") — NOT YET IMPLEMENTED (its vtable differs from 24H2); "
-                               L"COM VD switching disabled");
-                return nullptr;
-            case VdVariant::W22H2:
-                emitDiagnostic(L"virtual desktop bridge: IID " + iidName + L" resolved to "
-                               L"22H2 / pre-KB 23H2 variant (" + buildStr +
-                               L") — NOT YET IMPLEMENTED; COM VD switching disabled");
-                return nullptr;
-            case VdVariant::W21H2:
-                emitDiagnostic(L"virtual desktop bridge: IID " + iidName + L" resolved to "
-                               L"21H2 variant (" + buildStr +
-                               L") — NOT YET IMPLEMENTED; COM VD switching disabled");
-                return nullptr;
-            case VdVariant::None:
-                break;  // unreachable — a matched probe always names a variant
-        }
-    }
+    // Probe newest→oldest; the first IID whose vtable matches (QI succeeds) wins.
+    auto resolved = probes | std::views::transform(resolve);
+    const auto found = std::ranges::find_if(
+        resolved, [](const Resolved& r) { return r.manager.has_value(); });
 
     // No known IID matched: a newer Windows bumped the interface. Fail LOUDLY
     // (null + diagnostic) — never call through a mismatched vtable (ADR-0002).
-    emitDiagnostic(L"virtual desktop bridge: NO known IVirtualDesktopManagerInternal "
-                   L"IID matched (" + buildStr +
-                   L") — a new OS variant needs capturing; COM VD switching disabled");
-    return nullptr;
+    if (found == std::ranges::end(resolved)) {
+        lg::error(
+            "virtual desktop bridge: NO known IVirtualDesktopManagerInternal IID matched ({}) "
+            "— a new OS variant needs capturing; COM VD switching disabled",
+            buildStr);
+        return nullptr;
+    }
+
+    Resolved winner = *found;
+    const std::string iidName = narrow(bridge_detail::guidToWString(*winner.iid));
+    switch (winner.variant) {
+        case VdVariant::W24H2:
+            lg::info("virtual desktop bridge: matched IID {} ({}) — 24H2 variant", iidName,
+                     buildStr);
+            return std::make_unique<VirtualDesktop24H2Bridge>(std::move(*winner.manager));
+
+        case VdVariant::W23H2KB:
+            lg::warn(
+                "virtual desktop bridge: IID {} resolved to 23H2-KB5034204 variant ({}) — "
+                "NOT YET IMPLEMENTED (its vtable differs from 24H2); COM VD switching disabled",
+                iidName, buildStr);
+            return nullptr;
+        case VdVariant::W22H2:
+            lg::warn(
+                "virtual desktop bridge: IID {} resolved to 22H2 / pre-KB 23H2 variant ({}) — "
+                "NOT YET IMPLEMENTED; COM VD switching disabled",
+                iidName, buildStr);
+            return nullptr;
+        case VdVariant::W21H2:
+            lg::warn(
+                "virtual desktop bridge: IID {} resolved to 21H2 variant ({}) — NOT YET "
+                "IMPLEMENTED; COM VD switching disabled",
+                iidName, buildStr);
+            return nullptr;
+        case VdVariant::None:
+            break;  // unreachable — a matched probe always names a variant
+    }
+    return nullptr;  // unreachable — the None arm never triggers on a matched probe
 }
 
 }  // namespace winspace::io
