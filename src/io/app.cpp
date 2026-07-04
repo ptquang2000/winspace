@@ -12,41 +12,71 @@
 
 #include <windows.h>
 
+#include <functional>
 #include <future>
 #include <thread>
+#include <utility>
+#include <vector>
 
+#include "io/hotkeys.cpp"
 #include "io/worker.cpp"
+#include "winspace/config.cpp"
 #include "winspace/reducer.cpp"
 
 namespace winspace::io {
 
-// TEMPORARY (task 04): with no hotkeys registered yet, opt into a one-shot
-// self-test that drives a Quit through the real transport so the clean-exit
-// spine is provable end-to-end. Set WINSPACE_SELFTEST_QUIT to exercise it; leave
-// it unset to run windowless indefinitely (the manual "visible only in Task
-// Manager" check). Removed once task 05 supplies real hotkey-driven Events.
+// TEMPORARY (task 05): a hardcoded config giving the Hotkey adapter real Binds to
+// register. Task 07 replaces the literal with a file read from a known location.
+inline constexpr std::string_view k_bootstrapConfig =
+    "# winspace bootstrap config (temporary — task 07 loads this from disk)\n"
+    "$mod = SUPER ALT\n"
+    "bind = $mod, 1, workspace, 1\n"
+    "bind = $mod, 2, workspace, 2\n"
+    "bind = $mod, 3, workspace, 3\n"
+    "bind = $mod, 4, workspace, 4\n"
+    "bind = $mod, 5, workspace, 5\n"
+    "bind = $mod, Q, quit\n";
+
+// Parse the bootstrap config, surfacing any parser diagnostics through the I/O sink.
+inline std::vector<Bind> loadBinds() {
+    ParseResult parsed = parse(k_bootstrapConfig);
+    for (const Diagnostic& d : parsed.diagnostics)
+        emitDiagnostic("config line " + std::to_string(d.line) + ": " + d.message);
+    return std::move(parsed.config.binds);
+}
+
+// A non-interactive exit path: setting WINSPACE_SELFTEST_QUIT drives one Quit
+// through the real transport so clean shutdown is provable without a live desktop.
+// Unset (the default), winspace runs windowless until a bound `quit` hotkey.
 inline bool selftestQuitEnabled() {
     return GetEnvironmentVariableW(L"WINSPACE_SELFTEST_QUIT", nullptr, 0) != 0;
 }
 
-// Hotkey thread entry. Owns its own GetMessage loop, ready to receive WM_HOTKEY
-// (RegisterHotKey wiring is task 05). It publishes its thread id so the spine can
-// unwind the loop with a WM_QUIT, then pumps until then.
-inline void hotkeyThreadMain(HWND workerHwnd, std::promise<DWORD> tidReady) {
+// Hotkey thread entry. Registers the Binds on THIS thread (so WM_HOTKEY lands in
+// its queue), publishes its thread id so the spine can unwind it with a WM_QUIT,
+// then pumps: each WM_HOTKEY becomes an Event posted to the Worker.
+inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
+                             std::promise<DWORD> tidReady) {
     MSG msg;
     // Force this thread's message queue into existence before publishing the id,
     // so the spine's later PostThreadMessage can't race queue creation.
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
     tidReady.set_value(GetCurrentThreadId());
 
-    // task 05: RegisterHotKey each parsed Bind here; the loop below then
-    // translates WM_HOTKEY → Event and calls postEvent(workerHwnd, ev).
+    HotkeyTable hotkeys(binds);
 
     if (selftestQuitEnabled()) {
         postEvent(workerHwnd, new Event{Quit{}});
     }
 
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // A hotkey has a null window, so it never dispatches to a WndProc — handle
+        // it here. wParam is the hotkey id, i.e. the Bind's index in the table.
+        if (msg.message == WM_HOTKEY) {
+            if (auto ev = hotkeys.eventFor(static_cast<int>(msg.wParam)))
+                postEvent(workerHwnd, new Event{std::move(*ev)});
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -55,10 +85,15 @@ inline void hotkeyThreadMain(HWND workerHwnd, std::promise<DWORD> tidReady) {
 // Bring up both threads, run until Exit, then tear down cleanly. Returns the
 // process exit code. Called by wWinMain.
 inline int runApp() {
+    // The parsed Binds are owned here and passed to the Hotkey thread by const
+    // reference; this declaration outlives hotkeyThread (which is joined below),
+    // so the reference stays valid for the thread's whole life.
+    const std::vector<Bind> binds = loadBinds();
+
     // Start the Worker and wait for its message-only HWND before anyone posts.
     std::promise<HWND> hwndReady;
     std::future<HWND> hwndFuture = hwndReady.get_future();
-    std::thread workerThread(workerThreadMain, std::move(hwndReady));
+    std::jthread workerThread(workerThreadMain, std::move(hwndReady));
 
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
@@ -66,10 +101,12 @@ inline int runApp() {
         return 1;  // Worker could not create its window — nothing can proceed
     }
 
-    // Start the Hotkey thread once the Worker HWND exists to post to.
+    // Start the Hotkey thread once the Worker HWND exists to post to. It registers
+    // the Binds as OS hotkeys on its own thread.
     std::promise<DWORD> tidReady;
     std::future<DWORD> tidFuture = tidReady.get_future();
-    std::thread hotkeyThread(hotkeyThreadMain, workerHwnd, std::move(tidReady));
+    std::jthread hotkeyThread(hotkeyThreadMain, workerHwnd, std::cref(binds),
+                              std::move(tidReady));
     const DWORD hotkeyTid = tidFuture.get();
 
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.

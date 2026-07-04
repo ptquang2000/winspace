@@ -14,11 +14,11 @@
 #include "winspace/reducer.cpp"
 
 // ── I/O adapters (own all <windows.h> / COM) ────────────────────────────────
-// Task 04 (worker + two-thread spine) landed io/worker.cpp + io/app.cpp.
-// Still to come: 05 (hotkey adapter), 06 (VD bridge):
+// Task 04 landed io/worker.cpp + io/app.cpp; task 05 landed io/hotkeys.cpp
+// (pulled in by io/app.cpp). Still to come: 06 (VD bridge):
+#include "io/hotkeys.cpp"
 #include "io/worker.cpp"
 #include "io/app.cpp"
-//   #include "io/hotkeys.cpp"
 //   #include "io/vd_bridge.cpp"
 
 // ── entry point ─────────────────────────────────────────────────────────────
