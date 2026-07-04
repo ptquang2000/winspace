@@ -12,9 +12,15 @@
 
 #include <windows.h>
 
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -26,10 +32,12 @@
 
 namespace winspace::io {
 
-// TEMPORARY (task 05): a hardcoded config giving the Hotkey adapter real Binds to
-// register. Task 07 replaces the literal with a file read from a known location.
-inline constexpr std::string_view k_bootstrapConfig =
-    "# winspace bootstrap config (temporary — task 07 loads this from disk)\n"
+// The config winspace seeds on first run and falls back to when the on-disk file
+// is unreadable. It is the Hyprland-subset grammar this slice supports; a user who
+// edits the seeded file grows it from here. (Through task 05 this same literal was
+// the only source; task 07 promoted it to the default and added the file read.)
+inline constexpr std::string_view k_defaultConfig =
+    "# winspace config — edit and save; winspace reads this at startup.\n"
     "$mod = SUPER ALT\n"
     "bind = $mod, 1, workspace, 1\n"
     "bind = $mod, 2, workspace, 2\n"
@@ -38,9 +46,81 @@ inline constexpr std::string_view k_bootstrapConfig =
     "bind = $mod, 5, workspace, 5\n"
     "bind = $mod, Q, quit\n";
 
-// Parse the bootstrap config, surfacing any parser diagnostics through the I/O sink.
+// Read an environment variable with the size-then-fill two-call pattern.
+// GetEnvironmentVariableW returns the length INCLUDING the null when probing with
+// a null buffer, EXCLUDING it when filling — so allocate n and fill n. Empty
+// optional means the variable is unset (or unreadable): there is no home to anchor
+// the config path to.
+inline std::optional<std::wstring> envVar(const wchar_t* name) {
+    const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
+    if (n == 0) return std::nullopt;
+    std::wstring value(n - 1, L'\0');  // n counts the terminator; string owns size()+1
+    GetEnvironmentVariableW(name, value.data(), n);
+    return value;
+}
+
+// The known location: %USERPROFILE%\.config\winspace\winspace.conf — the Win32
+// home for the Hyprland-style ~/.config/<app> layout. Empty optional when
+// %USERPROFILE% is unset, which leaves winspace on its built-in defaults.
+inline std::optional<std::filesystem::path> configPath() {
+    const std::optional<std::wstring> home = envVar(L"USERPROFILE");
+    if (!home) return std::nullopt;
+    return std::filesystem::path(*home) / L".config" / L"winspace" / L"winspace.conf";
+}
+
+// Slurp a file's bytes verbatim (the config is UTF-8, which the parser consumes as
+// bytes). Empty optional on any open failure.
+inline std::optional<std::string> readFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    return std::move(buffer).str();
+}
+
+// Resolve the config text for this run. On the happy path: read the file at the
+// known location. On first run (no file): create the directory chain, seed it with
+// the default, and read that back so the source of truth is always the file. Every
+// failure along the way degrades to the built-in default with a diagnostic, so a
+// missing home or an unwritable disk never leaves winspace with no binds.
+inline std::string loadConfigText() {
+    const std::optional<std::filesystem::path> path = configPath();
+    if (!path) {
+        lg::warn("config: %USERPROFILE% is unset; using built-in defaults");
+        return std::string(k_defaultConfig);
+    }
+    const std::string shown = narrow(path->wstring());
+
+    std::error_code ec;
+    if (!std::filesystem::exists(*path, ec)) {
+        std::filesystem::create_directories(path->parent_path(), ec);
+        if (ec) {
+            lg::warn("config: cannot create {}: {}; using built-in defaults",
+                     narrow(path->parent_path().wstring()), ec.message());
+            return std::string(k_defaultConfig);
+        }
+        std::ofstream out(*path, std::ios::binary);
+        out << k_defaultConfig;
+        if (!out) {
+            lg::warn("config: cannot write default {}; using built-in defaults", shown);
+            return std::string(k_defaultConfig);
+        }
+        lg::info("config: seeded default config at {}", shown);
+    }
+
+    if (std::optional<std::string> text = readFile(*path)) {
+        lg::info("config: loaded {}", shown);
+        return std::move(*text);
+    }
+    lg::warn("config: cannot read {}; using built-in defaults", shown);
+    return std::string(k_defaultConfig);
+}
+
+// Parse the config, surfacing any parser diagnostics through the I/O sink. `text`
+// outlives parse(); the returned Binds and Diagnostic messages own their data.
 inline std::vector<Bind> loadBinds() {
-    ParseResult parsed = parse(k_bootstrapConfig);
+    const std::string text = loadConfigText();
+    ParseResult parsed = parse(text);
     for (const Diagnostic& d : parsed.diagnostics)
         lg::warn("config line {}: {}", d.line, d.message);
     return std::move(parsed.config.binds);
