@@ -32,7 +32,7 @@ It depends on 01+11 being landed (the behavior it drives) but blocks nothing.
 |---|-------|-----------|
 | 01 | Walking skeleton: config-driven workspace switch | — |
 | 11 | Win32/COM error handling (`std::expected` + `std::variant`) | 01 |
-| 02 | Window tracking + eligibility + fill-one-window | 01 (idiom: 11) |
+| 02 | [Window tracking + eligibility + fill-one-window](02-window-tracking/) (6 tasks; PRD [0002](../docs/prd/0002-window-tracking.md)) | 01 (idiom: 11) |
 | 03 | BSP tiling on one display (split + reclaim) | 02 |
 | 04 | Multi-display fill order + float overflow | 03 |
 | 05 | Spatial directional focus + move | 03 |
