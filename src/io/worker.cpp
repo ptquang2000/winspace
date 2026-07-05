@@ -17,11 +17,13 @@
 #pragma once
 
 #include <windows.h>
+#include <dwmapi.h>   // DwmGetWindowAttribute / DWMWA_EXTENDED_FRAME_BOUNDS
 #include <objbase.h>  // CoInitializeEx / CoUninitialize (excluded by WIN32_LEAN_AND_MEAN)
 
 #include <future>
 #include <memory>
 #include <thread>
+#include <utility>  // std::to_underlying — WindowId → HWND
 
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
@@ -155,14 +157,65 @@ private:
                     // End run()'s loop; the process then unwinds cleanly.
                     PostQuitMessage(0);
                 },
-                [&](const PositionWindow&) {
-                    // Applying the logical rect (SetWindowPos with the
-                    // DWMWA_EXTENDED_FRAME_BOUNDS + DPI compensation) lands in
-                    // 02.05. Handled here now only so this visitor stays
-                    // exhaustive over Effect; inert until then.
-                },
+                [&](const PositionWindow& p) { positionWindow(p); },
             },
             effect);
+    }
+
+    // Execute a PositionWindow Effect — the sole place a logical rect from the
+    // core becomes real pixels, flush and DPI-correct. Windows draws a resizable
+    // window with an INVISIBLE drop-shadow border that GetWindowRect counts but
+    // the eye does not, so positioning the raw window rect leaves a visible gap
+    // on every side. DWMWA_EXTENDED_FRAME_BOUNDS reports the VISIBLE frame; the
+    // per-side gap between it and GetWindowRect is exactly that shadow border.
+    // Growing the target outward by that gap lands the visible frame flush on
+    // p.rect. Both reads are physical pixels — the process is Per-Monitor-V2 DPI
+    // aware (set in runApp before any window existed), the same coordinate space
+    // as rcWork and SetWindowPos. Neither the delta nor DPI ever enters the core.
+    void positionWindow(const PositionWindow& p) {
+        const HWND h = reinterpret_cast<HWND>(std::to_underlying(p.id));
+
+        // Live read #1: the full window rect, drop-shadow border included.
+        RECT window{};
+        if (const auto got = ok(GetWindowRect(h, &window)); !got) {
+            lg::warn("worker: GetWindowRect failed, skipping position: {}", got.error());
+            return;
+        }
+
+        // Live read #2: the visible frame. If DWM cannot report it (a window
+        // without a DWM frame, or a transient failure), degrade to a zero delta
+        // — position the raw rect uncompensated rather than not at all.
+        RECT frame = window;
+        if (const auto got = ok(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                                      &frame, sizeof(frame)));
+            !got) {
+            lg::warn("worker: extended-frame-bounds read failed, positioning "
+                     "uncompensated: {}",
+                     got.error());
+            frame = window;
+        }
+
+        // Per-side shadow border: how far the visible frame is inset from the
+        // full window rect (non-negative in practice; the arithmetic holds
+        // either way). Grow the target outward by it so the VISIBLE edges — not
+        // the shadow — land on p.rect.
+        const int left = frame.left - window.left;
+        const int top = frame.top - window.top;
+        const int right = window.right - frame.right;
+        const int bottom = window.bottom - frame.bottom;
+
+        const int x = p.rect.left - left;
+        const int y = p.rect.top - top;
+        const int cx = (p.rect.right - p.rect.left) + left + right;
+        const int cy = (p.rect.bottom - p.rect.top) + top + bottom;
+
+        // SWP_NOZORDER preserves stacking; SWP_NOACTIVATE avoids stealing focus
+        // on a mere reposition. (Batched DeferWindowPos + async hardening: 03.)
+        if (const auto moved = ok(SetWindowPos(h, nullptr, x, y, cx, cy,
+                                               SWP_NOZORDER | SWP_NOACTIVATE));
+            !moved) {
+            lg::warn("worker: SetWindowPos failed: {}", moved.error());
+        }
     }
 
     State m_state{};

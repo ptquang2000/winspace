@@ -170,6 +170,18 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
 // Bring up both threads, run until Exit, then tear down cleanly. Returns the
 // process exit code. Called by wWinMain.
 inline int runApp() {
+    // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
+    // message-only HWND included), so it leads runApp. This puts the process,
+    // rcWork, and SetWindowPos in ONE physical-pixel coordinate space — the
+    // precondition for correct positioning on a scaled display (02.05). Best
+    // effort: a failure (an OS predating V2, or awareness already pinned by a
+    // manifest) leaves the prior awareness in place and is logged, never fatal.
+    if (const auto aware =
+            ok(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2));
+        !aware) {
+        lg::warn("app: Per-Monitor-V2 DPI awareness not set: {}", aware.error());
+    }
+
     // The parsed Binds are owned here and passed to the Hotkey thread by const
     // reference; this declaration outlives hotkeyThread (which is joined below),
     // so the reference stays valid for the thread's whole life.
