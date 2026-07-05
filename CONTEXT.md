@@ -76,3 +76,40 @@ The single thread that owns the State, runs the Reducer, executes the emitted Ef
 is the sole owner of the COM Virtual Desktop bridge (STA). All later window-tracking and
 tiling logic lands here.
 _Avoid_: Main thread, UI thread (winspace is windowless — there is no UI thread).
+
+### VM seam testing
+
+Terms for the unattended VM harness that automates the manual smoke scripts. See
+[ADR-0005](docs/adr/0005-vm-seam-test-harness.md). Note: **Seam** (above) is the pure
+interface boundary — a **Smoke seam** is a live behavior tested through it, a different thing.
+
+**Smoke seam**:
+A single live I/O-layer behavior only the running binary can exhibit — adoption,
+create-on-demand, clean quit, the variant diagnostic, degrade-don't-crash — provable by
+driving winspace on a real or virtual desktop, never by a unit test. The unit of a Manual
+smoke script and of the VM harness.
+_Avoid_: Test seam (reads as the core Seam), scenario, case.
+
+**Manual smoke script**:
+The ordered list of Smoke seams that is an I/O-layer slice's definition of done (slice-01's
+six steps, slice-11's parity steps). "Manual" is historical — the VM harness now runs it.
+
+**Trigger**:
+Causing a Dispatcher to fire during a test by synthesizing real keyboard input into the live
+guest session (`SendInput`), so the OS hotkey path runs exactly as under a physical press.
+_Avoid_: Inject, keypress, sendkey.
+
+**Oracle**:
+The independent source of truth a Smoke seam asserts against. OS state (Virtual Desktop
+registry, window enumeration, process list) is the primary Oracle; winspace's own stderr log
+is a secondary one, used only where no external observable exists.
+_Avoid_: Expectation, golden.
+
+**Guest runner**:
+The one interactive process inside the VM that executes the whole harness in a single
+logged-in session and emits the result report.
+_Avoid_: Agent, driver.
+
+**Host orchestrator**:
+The host-side controller that stages the VM around a Guest runner invocation — revert the
+snapshot, deploy the build, launch the runner, collect and summarise its results.

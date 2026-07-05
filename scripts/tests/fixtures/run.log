@@ -1,0 +1,6 @@
+[1m[34m[INFO][0m virtual desktop bridge: matched IID {53F5CA0B-1234-5678-9ABC-DEF012345678} (26100.4652) — 24H2 variant
+[1m[34m[INFO][0m virtual desktop bridge: adopted 3 desktop(s); current workspace = 2
+[1m[33m[WARN][0m hotkey Super+Alt+N is already registered by another app — skipping
+[1m[31m[ERROR][0m failed to register hotkey Super+Alt+Q: hotkeys.cpp:160 (err=5): Access is denied.
+[1m[31m[ERROR][0m switchTo failed: vd_bridge.cpp:340 (hr=0x8001010E): The application called an interface that was marshalled for a different thread.
+[1m[33m[WARN][0m virtual desktop bridge: IID {B2F925B9-1234-5678-9ABC-DEF012345678} resolved to 21H2 variant (22000.2538) — NOT YET IMPLEMENTED; COM VD switching disabled

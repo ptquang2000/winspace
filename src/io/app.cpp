@@ -38,7 +38,10 @@ namespace winspace::io {
 // the only source; task 07 promoted it to the default and added the file read.)
 inline constexpr std::string_view k_defaultConfig =
     "# winspace config — edit and save; winspace reads this at startup.\n"
-    "$mod = SUPER ALT\n"
+    "# $mod = SUPER binds the Windows key. Win+<key> only registers when the\n"
+    "# NoWinKeys policy is on (HKCU\\...\\Policies\\Explorer\\NoWinKeys=1); without\n"
+    "# it Windows reserves these chords and winspace skips-and-logs each bind.\n"
+    "$mod = SUPER\n"
     "bind = $mod, 1, workspace, 1\n"
     "bind = $mod, 2, workspace, 2\n"
     "bind = $mod, 3, workspace, 3\n"
