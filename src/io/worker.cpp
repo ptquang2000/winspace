@@ -155,6 +155,12 @@ private:
                     // End run()'s loop; the process then unwinds cleanly.
                     PostQuitMessage(0);
                 },
+                [&](const PositionWindow&) {
+                    // Applying the logical rect (SetWindowPos with the
+                    // DWMWA_EXTENDED_FRAME_BOUNDS + DPI compensation) lands in
+                    // 02.05. Handled here now only so this visitor stays
+                    // exhaustive over Effect; inert until then.
+                },
             },
             effect);
     }
