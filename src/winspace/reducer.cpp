@@ -132,7 +132,7 @@ constexpr bool operator==(const PositionWindow& a, const PositionWindow& b) {
 // All the Reducer owns. Tiny by design: pass-by-value and return-by-value keep
 // reduce pure and trivially testable.
 struct State {
-    int current_workspace = 1;
+    int currentWorkspace = 1;
     bool running = true;
     // The monitor topology the layout resolves rcWork against; replaced whole on
     // MonitorsChanged (02.03).
@@ -140,7 +140,11 @@ struct State {
     // The Tileable windows as a priority-ordered list, front = most-recently
     // focused; the layout acts on front() (02.02). Still a value: copied whole
     // in and out of reduce.
-    std::vector<WindowId> focus_order;
+    std::vector<WindowId> focusOrder;
+    // Each tracked window's monitor, remembered from its Appeared so the layout
+    // can resolve the head's rcWork without re-probing. Kept in step with
+    // focusOrder: an entry per tracked WindowId, dropped on Vanished.
+    std::map<WindowId, MonitorId> windowMonitor;
 };
 
 struct ReduceResult {
@@ -165,6 +169,32 @@ overload(Fs...) -> overload<Fs...>;
 
 }  // namespace detail
 
+// ── eligibility + layout: the pure heart of the slice ───────────────────────
+
+// The Eligibility gate: a window is Tileable iff every probed fact agrees. A
+// real top-level, visible, resizable, captioned application window that is
+// neither a tool window, cloaked, nor already fullscreen. Any single condition
+// flipping the wrong way drops it out of tracking entirely.
+constexpr bool isTileable(const WindowAttrs& a) {
+    return a.topLevel && a.visible && a.thickFrame && a.caption && !a.toolWindow && !a.cloaked &&
+           !a.fullscreen;
+}
+
+// The layout: the rail 03 later swaps for BSP. This slice fills exactly the
+// head of the Focus order. front() to its monitor's rcWork; empty order or an
+// unresolvable monitor ⇒ no Effect (nothing to place).
+inline std::vector<Effect> layout(const std::vector<WindowId>& focusOrder,
+                                  const std::map<WindowId, MonitorId>& windowMonitor,
+                                  const std::map<MonitorId, Rect>& monitors) {
+    if (focusOrder.empty()) return {};
+    const WindowId head = focusOrder.front();
+    const auto wm = windowMonitor.find(head);
+    if (wm == windowMonitor.end()) return {};
+    const auto mon = monitors.find(wm->second);
+    if (mon == monitors.end()) return {};
+    return {Effect{PositionWindow{head, mon->second}}};
+}
+
 // ── the seam ────────────────────────────────────────────────────────────────
 
 inline ReduceResult reduce(const State& s, const Event& e) {
@@ -172,7 +202,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
         detail::overload{
             [&](const WorkspaceSwitch& ws) -> ReduceResult {
                 State next = s;
-                next.current_workspace = ws.n;
+                next.currentWorkspace = ws.n;
                 return {next, {Effect{SwitchToWorkspace{ws.n}}}};
             },
             [&](const Quit&) -> ReduceResult {
@@ -180,13 +210,30 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.running = false;
                 return {next, {Effect{Exit{}}}};
             },
-            // Window-tracking Events are part of the vocabulary now, but their
-            // behavior (eligibility + Focus order + layout, monitor fold) lands
-            // in 02.02 / 02.03. Until then these are inert: State passes through
-            // unchanged and no Effect fires. They exist here so the visitor is
-            // exhaustive — a real handler simply replaces the stub.
-            [&](const Appeared&) -> ReduceResult { return {s, {}}; },
-            [&](const Vanished&) -> ReduceResult { return {s, {}}; },
+            // A window appeared: classify it. Ineligible ⇒ nothing happens, no
+            // storage, no Effect. Eligible ⇒ it becomes the newest focus, so it
+            // goes to the front of the order (idempotent on WindowId: erase any
+            // existing entry first, so a repeat Appeared moves-to-front, never
+            // duplicates). Then the layout fills the new head.
+            [&](const Appeared& ev) -> ReduceResult {
+                if (!isTileable(ev.attrs)) return {s, {}};
+                State next = s;
+                std::erase(next.focusOrder, ev.attrs.id);
+                next.focusOrder.insert(next.focusOrder.begin(), ev.attrs.id);
+                next.windowMonitor[ev.attrs.id] = ev.attrs.monitor;
+                return {next, layout(next.focusOrder, next.windowMonitor, next.monitors)};
+            },
+            // A window vanished: drop it from the order (no-op if it was never
+            // tracked — an ineligible window's Vanished). Recompute the layout;
+            // if the head changed, the survivor reclaims the fill, and once the
+            // order empties there is nothing left to place.
+            [&](const Vanished& ev) -> ReduceResult {
+                State next = s;
+                std::erase(next.focusOrder, ev.id);
+                next.windowMonitor.erase(ev.id);
+                return {next, layout(next.focusOrder, next.windowMonitor, next.monitors)};
+            },
+            // Monitor topology fold lands in 02.03; inert for now (see 02.01).
             [&](const MonitorsChanged&) -> ReduceResult { return {s, {}}; },
         },
         e);

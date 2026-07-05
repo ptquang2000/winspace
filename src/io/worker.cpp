@@ -83,7 +83,7 @@ public:
         // switch Effects then no-op rather than calling through a wrong vtable.
         // Adoption ran in the factory, so seed State from the active desktop.
         m_bridge = makeVirtualDesktopBridge();
-        if (m_bridge) m_state.current_workspace = m_bridge->currentWorkspace();
+        if (m_bridge) m_state.currentWorkspace = m_bridge->currentWorkspace();
     }
 
     ~Worker() {
