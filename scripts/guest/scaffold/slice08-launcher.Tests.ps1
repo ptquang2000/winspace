@@ -1,6 +1,6 @@
 ﻿<#
     SCAFFOLD — issue 08 (launcher: exec / exec-once with PID-match placement). Unbuilt:
-    `It -Skip` placeholders, surfaced as SKIPPED. See scaffold/slice02-window-tracking.Tests.ps1
+    `It -Skip` placeholders, surfaced as SKIPPED. See scaffold/slice03-bsp-one-display.Tests.ps1
     for the scaffold contract.
 
     Future Oracle probe: Get-Process (the CreateProcess'd child) + GetWindowDesktopId of its

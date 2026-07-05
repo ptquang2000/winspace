@@ -1,7 +1,7 @@
 ﻿<#
     SCAFFOLD — issue 07 (place-once behaviors: togglefloat / drag-pops-to-float /
     fullscreen). Unbuilt: `It -Skip` placeholders, surfaced as SKIPPED. See
-    scaffold/slice02-window-tracking.Tests.ps1 for the scaffold contract.
+    scaffold/slice03-bsp-one-display.Tests.ps1 for the scaffold contract.
 
     Future Oracle probe: Get-WindowRects deltas across a reflow — a floated window's rect
     is proven untouched while the tiled set reflows around it (place-once, not enforce).

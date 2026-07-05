@@ -1,6 +1,6 @@
 ﻿<#
     SCAFFOLD — issue 06 (move-to-workspace + place-once rules with cloak-move). Unbuilt:
-    `It -Skip` placeholders, surfaced as SKIPPED. See scaffold/slice02-window-tracking.Tests.ps1
+    `It -Skip` placeholders, surfaced as SKIPPED. See scaffold/slice03-bsp-one-display.Tests.ps1
     for the scaffold contract.
 
     Future Oracle probe: IVirtualDesktopManager::GetWindowDesktopId per HWND (which desktop

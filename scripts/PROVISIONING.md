@@ -118,10 +118,11 @@ must return `OK` in an interactive (`-it`) session.
 ```
 
 A green run over the real Release binary is the proof the harness works end-to-end — there is no
-unit test for the plumbing (ADR-0005). The suite covers the six workspace-switch Smoke seams and the two
-error-handling runtime seams (`formaterror-quality`, `degrade-dont-crash`), with issues 02–10 reported as
-skipped scaffolds. `results.xml`, `run.log`, and any `failure-*.png` are copied back next to the
-script.
+unit test for the plumbing (ADR-0005). The suite covers the six workspace-switch Smoke seams, the two
+error-handling runtime seams (`formaterror-quality`, `degrade-dont-crash`), and the six window-tracking
+Smoke seams (`fill-one`, `adoption-fill`, `reclaim`, `ineligible`, `cloaked-uwp`, `clean-unhook`), with
+issues 03–10 reported as skipped scaffolds. `results.xml`, `run.log`, and any `failure-*.png` are copied
+back next to the script.
 
 ### Default vs `-Fresh` isolation
 
@@ -130,7 +131,7 @@ script.
   so VD state does not leak between seams. Fast; this is what CI runs.
 - **`-Fresh`** — revert the snapshot **per live seam** and re-invoke the guest runner once per seam
   via its `-Seam` filter, so no seam can inherit dirty state from another. Pays a boot +
-  interactive-logon wait per seam; use it when dirty state is suspected. The skipped 02–10 scaffolds
+  interactive-logon wait per seam; use it when dirty state is suspected. The skipped 03–10 scaffolds
   touch no VM and are collected in one final non-reverting pass; the per-seam JUnit XMLs
   (`results.<seam>.xml`) are merged into `results.xml` for the summary. `-Fresh` discovers the live
   seam set from the guest (Pester discovery), so a newly-dropped seam file needs no orchestrator edit.

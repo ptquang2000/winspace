@@ -1,6 +1,6 @@
 ﻿<#
     SCAFFOLD — issue 10 (autostart via Task Scheduler logon task). Unbuilt: `It -Skip`
-    placeholders, surfaced as SKIPPED. See scaffold/slice02-window-tracking.Tests.ps1 for
+    placeholders, surfaced as SKIPPED. See scaffold/slice03-bsp-one-display.Tests.ps1 for
     the scaffold contract.
 
     Future Oracle probe: Get-ScheduledTask — the Windows-blessed autostart record itself is

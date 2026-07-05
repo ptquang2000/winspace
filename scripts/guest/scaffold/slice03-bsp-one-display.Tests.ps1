@@ -1,7 +1,7 @@
 ﻿<#
     SCAFFOLD — issue 03 (BSP tiling on one display: split + reclaim). Unbuilt: `It -Skip`
-    placeholders, surfaced as SKIPPED. See scaffold/slice02-window-tracking.Tests.ps1 for
-    the scaffold contract.
+    placeholders, surfaced as SKIPPED. See guest/WindowTracking.Tests.ps1 (issue 02) for a
+    built seam, and any sibling scaffold here for the -Skip contract.
 
     Future Oracle probe: Get-WindowRects (GetWindowRect over EnumWindows-by-PID) checked
     for a non-overlapping partition of the work area — the BSP tiling invariant asserted

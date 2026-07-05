@@ -101,8 +101,111 @@ if (-not ([System.Management.Automation.PSTypeName]'Winspace.Native').Type) {
         }, System.IntPtr.Zero);
         return found.ToArray();
     }
+
+    // ── geometry Oracle: raw rect, visible frame, and the monitor work area ──
+    // The fill seams (02) assert winspace lands a window's VISIBLE frame flush on
+    // the monitor work area. These read the same independent OS geometry winspace
+    // itself positions against (GetWindowRect / DWMWA_EXTENDED_FRAME_BOUNDS /
+    // GetMonitorInfo.rcWork) — never winspace's own report.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct RECT { public int left; public int top; public int right; public int bottom; }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT lpRect);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern System.IntPtr MonitorFromWindow(System.IntPtr hWnd, uint dwFlags);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool GetMonitorInfoW(System.IntPtr hMonitor, ref MONITORINFO lpmi);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern System.IntPtr GetAncestor(System.IntPtr hWnd, uint gaFlags);
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(System.IntPtr hWnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    public static extern int DwmGetWindowAttributeI(System.IntPtr hWnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    public static extern bool PostMessageW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern int GetWindowTextW(System.IntPtr hWnd, System.Text.StringBuilder s, int max);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern int GetWindowTextLengthW(System.IntPtr hWnd);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
+
+    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+    private const int DWMWA_CLOAKED = 14;
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
+    private const uint GA_ROOT = 2;
+
+    // The full window rect (drop-shadow border included) — what winspace reads and
+    // grows outward from, so a raw-rect compare proves an untouched window unmoved.
+    public static RECT WindowRect(System.IntPtr h) { RECT r; GetWindowRect(h, out r); return r; }
+
+    // The VISIBLE frame (drop-shadow excluded) — the coordinate space winspace
+    // compensates INTO, so a filled window's frame bounds equal the target rcWork.
+    // Falls back to the raw window rect if DWM has no frame to report.
+    public static RECT FrameBounds(System.IntPtr h) {
+        RECT r;
+        int cb = System.Runtime.InteropServices.Marshal.SizeOf(typeof(RECT));
+        if (DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, out r, cb) == 0) return r;
+        GetWindowRect(h, out r);
+        return r;
+    }
+
+    // The work area (desktop minus taskbar) of the monitor the window sits on —
+    // the same rcWork the pure Reducer resolves the head's fill against.
+    public static RECT WorkAreaForWindow(System.IntPtr h) {
+        var mi = new MONITORINFO();
+        mi.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MONITORINFO));
+        GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi);
+        return mi.rcWork;
+    }
+
+    // DWM cloak state — how a UWP CoreWindow reads as hidden while WS_VISIBLE. The
+    // cloaked-UWP seam asserts winspace excludes the cloaked host (no phantom tile).
+    public static bool IsCloaked(System.IntPtr h) {
+        int c = 0;
+        DwmGetWindowAttributeI(h, DWMWA_CLOAKED, out c, sizeof(int));
+        return c != 0;
+    }
+
+    public static string WindowTitle(System.IntPtr h) {
+        int n = GetWindowTextLengthW(h);
+        if (n <= 0) return "";
+        var sb = new System.Text.StringBuilder(n + 1);
+        GetWindowTextW(h, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    // Visible top-level windows whose title contains `sub` (case-insensitive) —
+    // used to locate a UWP frame window (e.g. Calculator) by caption, since a Store
+    // app's stub launcher owns no window and its real PID is unknowable up front.
+    public static System.IntPtr[] FindVisibleWindowsByTitle(string sub) {
+        var found = new System.Collections.Generic.List<System.IntPtr>();
+        string want = sub.ToLowerInvariant();
+        EnumWindows((h, l) => {
+            if (!IsWindowVisible(h)) return true;
+            if (GetAncestor(h, GA_ROOT) != h) return true;             // top-level only
+            if (WindowTitle(h).ToLowerInvariant().Contains(want)) found.Add(h);
+            return true;
+        }, System.IntPtr.Zero);
+        return found.ToArray();
+    }
+
+    // Best-effort: make THIS runner process Per-Monitor-V2 DPI aware so its
+    // GetWindowRect / GetMonitorInfo reads share the physical-pixel space winspace
+    // (also PMv2) positions in. No-op / harmless if already set or unsupported.
+    public static void MakeDpiAware() {
+        try { SetProcessDpiAwarenessContext((System.IntPtr)(-4)); } catch { }
+    }
 '@
 }
+
+# Match winspace's physical-pixel coordinate space before any geometry read.
+[Winspace.Native]::MakeDpiAware()
 
 # ── deploy layout ────────────────────────────────────────────────────────────
 # The host deploys everything under one root; WINSPACE_E2E_ROOT overrides it.
@@ -452,6 +555,30 @@ function Save-FailureScreenshot {
     }
 }
 
+# ── hide/show the runner's OWN console (the vmctl exec -it window) ─────────────
+# That console is a real WS_THICKFRAME|WS_CAPTION top-level window, i.e. exactly
+# what winspace's Eligibility gate calls Tileable — so if it is visible when a
+# window-tracking seam runs, winspace adopts it and it competes for the head-fill,
+# stealing the fill from (or reordering) the test form the seam actually asserts on
+# (fatal for the adoption seam, whose foreground form would otherwise be the head).
+# The window-tracking Describe hides it for the duration and restores it after, so
+# the test forms are the only Tileable windows on the desktop. SendInput and the
+# interactive-desktop gate are unaffected by a hidden console window.
+function Set-RunnerConsoleVisible {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][bool]$Visible)
+    if (-not ([System.Management.Automation.PSTypeName]'Winspace.Console').Type) {
+        Add-Type -Namespace 'Winspace' -Name 'Console' -MemberDefinition @'
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+    [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n);
+'@
+    }
+    $h = [Winspace.Console]::GetConsoleWindow()
+    if ($h -ne [IntPtr]::Zero) {
+        [void][Winspace.Console]::ShowWindow($h, ($(if ($Visible) { 5 } else { 0 })))  # SW_SHOW / SW_HIDE
+    }
+}
+
 # ── degrade-don't-crash lever: hold a winspace hotkey from another process ────
 # Pre-registers a global hotkey in a SEPARATE process so that when winspace later
 # RegisterHotKey's the same combo it gets ERROR_HOTKEY_ALREADY_REGISTERED — the
@@ -512,11 +639,174 @@ if ([CH.Keys]::RegisterHotKey([System.IntPtr]::Zero, 1, [uint32]$Modifiers, [uin
     return $proc
 }
 
+# ── geometry Oracle wrappers (02 fill seams) ─────────────────────────────────
+# Thin PowerShell faces over the [Winspace.Native] statics: each returns a RECT
+# value type so callers compare fields directly. All read independent OS geometry,
+# never winspace's own log.
+function Get-WindowRect  { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WindowRect($Hwnd) }
+function Get-FrameBounds { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::FrameBounds($Hwnd) }
+function Get-WorkArea    { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WorkAreaForWindow($Hwnd) }
+function Test-WindowCloaked { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::IsCloaked($Hwnd) }
+
+# Visible top-level windows whose caption contains $Substring — the cloaked-UWP
+# seam's only way to reach a Store app's frame window (its stub launcher owns no
+# window and its real PID is unknowable up front). Emits the handles to the
+# pipeline one at a time (NO unary-comma wrap: the callers pipe this into
+# Where-Object, where a `,@(...)`-wrapped result would surface the whole IntPtr[]
+# as a single $_ and fail the [IntPtr] cast — the cloaked-uwp seam's crash).
+function Find-WindowsByTitle {
+    param([Parameter(Mandatory)][string]$Substring)
+    return @([Winspace.Native]::FindVisibleWindowsByTitle($Substring))
+}
+
+# Fills assert on the VISIBLE frame, which winspace lands flush on rcWork by
+# growing the window out past its invisible drop-shadow border — the compensation
+# is integer-exact at 100% DPI, so a couple of pixels covers DWM rounding / the
+# Win11 rounded-corner allowance. "Unchanged" (the ineligible seam) compares the
+# raw rect exactly: winspace never touched it, so it is byte-identical.
+function Test-RectNear {
+    param([Parameter(Mandatory)]$Actual, [Parameter(Mandatory)]$Expected, [int]$Tolerance = 4)
+    return ([math]::Abs($Actual.left - $Expected.left)     -le $Tolerance) -and
+           ([math]::Abs($Actual.top - $Expected.top)       -le $Tolerance) -and
+           ([math]::Abs($Actual.right - $Expected.right)   -le $Tolerance) -and
+           ([math]::Abs($Actual.bottom - $Expected.bottom) -le $Tolerance)
+}
+function Test-RectEqual {
+    param([Parameter(Mandatory)]$A, [Parameter(Mandatory)]$B)
+    return $A.left -eq $B.left -and $A.top -eq $B.top -and $A.right -eq $B.right -and $A.bottom -eq $B.bottom
+}
+function Format-Rect { param($R) "[$($R.left),$($R.top) $($R.right),$($R.bottom)]" }
+
+# ── test-window fixture: a real top-level window winspace tracks (or ignores) ──
+# A genuine Win32 window whose eligibility winspace's own gate (isTileable) decides
+# from live style bits — spawned in a SEPARATE process so its HWND is real to
+# EnumWindows / the win-event hook, exactly like a user's app:
+#   sizable — WS_THICKFRAME|WS_CAPTION, unowned  → Tileable (winspace fills it)
+#   tool    — + WS_EX_TOOLWINDOW                 → Ineligible (left alone)
+#   dialog  — FixedDialog, no WS_THICKFRAME      → Ineligible (left alone)
+# The child writes its own top-level HWND to a ready file once shown, so the seam
+# drives the exact window winspace sees. Returns { Process; Hwnd; ReadyFile; Title }.
+function Start-TestWindow {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('sizable', 'tool', 'dialog')][string]$Style = 'sizable',
+        [int]$X = 80, [int]$Y = 80, [int]$Width = 520, [int]$Height = 360,
+        [string]$Title = 'winspace-test-window',
+        [int]$ReadyTimeoutSec = 12
+    )
+    $border = switch ($Style) {
+        'sizable' { 'Sizable' }
+        'tool'    { 'SizableToolWindow' }   # keeps thickframe+caption but sets WS_EX_TOOLWINDOW
+        'dialog'  { 'FixedDialog' }          # drops WS_THICKFRAME
+    }
+    $readyFile = Join-Path (Get-WinspaceRoot) ("testwindow-{0}.hwnd" -f [guid]::NewGuid().ToString('N'))
+    if (Test-Path $readyFile) { Remove-Item $readyFile -Force }
+
+    # Interpolate geometry + style + ready-file path into the child; `$-escape the
+    # tokens that must survive to it. The child is PMv2 DPI aware so its Bounds land
+    # in the same physical pixels the runner and winspace read. Shipped via
+    # -EncodedCommand so no quoting crosses the boundary (mirrors Register-ConflictingHotkey).
+    # The child hides its OWN console window (ShowWindow SW_HIDE on GetConsoleWindow)
+    # BEFORE it creates the form, so the launcher's console never lingers as a second
+    # eligible (WS_THICKFRAME|WS_CAPTION) top-level window that winspace would track and
+    # fill alongside the test form — which perturbs head-fill ordering. This is done in
+    # the child (an explicit ShowWindow), NOT via Start-Process -WindowStyle Hidden: that
+    # flag sets STARTUPINFO.wShowWindow = SW_HIDE, which Windows applies to the process's
+    # FIRST ShowWindow — i.e. the WinForms form itself — leaving the form invisible and
+    # so ineligible. Hiding the console here lets the process start normally, so the form
+    # shows normally (its ShowWindow is not the first). The child writes its HWND to a
+    # temp file then MOVEs it into place, so the ready file appears atomically (no
+    # partial/locked read races the parent's poll).
+    $helper = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type -Namespace TW -Name Win -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr h, int n);
+'@
+try { [void][TW.Win]::SetProcessDpiAwarenessContext([System.IntPtr](-4)) } catch { }
+try { [void][TW.Win]::ShowWindow([TW.Win]::GetConsoleWindow(), 0) } catch { }   # SW_HIDE
+`$f = New-Object System.Windows.Forms.Form
+`$f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::$border
+`$f.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+`$f.Text = '$Title'
+`$f.Bounds = New-Object System.Drawing.Rectangle($X, $Y, $Width, $Height)
+`$f.Add_Shown({
+    `$tmp = '$readyFile' + '.tmp'
+    Set-Content -LiteralPath `$tmp -Value ([string][int64]`$f.Handle)
+    Move-Item -LiteralPath `$tmp -Destination '$readyFile' -Force
+})
+[System.Windows.Forms.Application]::Run(`$f)
+"@
+    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($helper))
+    $proc = Start-Process -FilePath 'powershell.exe' -PassThru `
+        -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $enc
+
+    # Poll for the ready file AND a readable, non-empty HWND in one condition, so a
+    # transient lock or an empty just-created file simply re-polls rather than throwing.
+    $hwndText = $null
+    try {
+        Wait-Until -TimeoutSec $ReadyTimeoutSec -Because "test window '$Title' to show and report its HWND" -Condition {
+            if (-not (Test-Path $readyFile)) { return $false }
+            try { $t = (Get-Content -LiteralPath $readyFile -Raw -ErrorAction Stop).Trim() } catch { return $false }
+            if ($t) { $script:hwndText = $t; return $true }
+            return $false
+        }
+    } catch {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    $hwnd = [IntPtr][int64]$script:hwndText
+    if ($hwnd -eq [IntPtr]::Zero) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        throw "Start-TestWindow: child reported a null HWND for '$Title'."
+    }
+    return [pscustomobject]@{ Process = $proc; Hwnd = $hwnd; ReadyFile = $readyFile; Title = $Title }
+}
+
+# Graceful close: PostMessage WM_CLOSE so the window crosses a real DESTROY/HIDE
+# edge (the Vanished the reclaim seam depends on), then wait for the process to go.
+function Close-TestWindow {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Window, [int]$TimeoutSec = 8)
+    if ($Window.Hwnd -ne [IntPtr]::Zero) {
+        [void][Winspace.Native]::PostMessageW($Window.Hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CLOSE
+    }
+    if ($Window.Process) {
+        Wait-Until -TimeoutSec $TimeoutSec -Because "test window '$($Window.Title)' to exit after WM_CLOSE" -Condition {
+            $Window.Process.HasExited
+        }
+    }
+}
+
+# finally-block cleanup: force-kill a fixture regardless of state; never throws.
+function Stop-TestWindow {
+    [CmdletBinding()]
+    param($Window)
+    if ($Window -and $Window.Process -and -not $Window.Process.HasExited) {
+        Stop-Process -Id $Window.Process.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Move a window ourselves (SWP_NOZORDER|SWP_NOACTIVATE). winspace is a place-once
+# tiler — it never re-asserts on a move (EVENT_OBJECT_LOCATIONCHANGE is dropped) —
+# so the reclaim seam uses this to shove the survivor OFF rcWork, proving the
+# survivor's fill on the head's close is a genuine, observable reclaim.
+function Move-Window {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][IntPtr]$Hwnd, [int]$X, [int]$Y, [int]$Width, [int]$Height)
+    [void][Winspace.Native]::SetWindowPos($Hwnd, [IntPtr]::Zero, $X, $Y, $Width, $Height, [uint32](0x0004 -bor 0x0010))
+}
+
 # ── Fresh-mode discovery: the live (non-skipped) seam tags ────────────────────
 # The host -Fresh loop reverts the snapshot once per LIVE seam, so it must know the
 # seam set. Discover it here (Pester discovery only, SkipRun) rather than hardcode
 # it host-side, so a newly-dropped seam file is picked up with no orchestrator edit.
-# The 'scaffold' tag (issues 02–10, all -Skip) is excluded — those need no VM and
+# The 'scaffold' tag (issues 03–10, all -Skip) is excluded — those need no VM and
 # are collected in a single non-reverting pass. Emits a `TAGS:a,b,c` line the host
 # greps out of the exec stdout.
 function Get-WinspaceLiveSeamTags {
@@ -570,5 +860,8 @@ Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState
     Get-WinspaceWindows, Set-DesktopCount,
     ConvertFrom-VirtualDesktopIDs, ConvertFrom-CurrentVirtualDesktop, Read-WinspaceLog,
     Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
-    Get-WinspaceLogText, Save-FailureScreenshot, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
-    Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog
+    Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
+    Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog,
+    Get-WindowRect, Get-FrameBounds, Get-WorkArea, Test-WindowCloaked, Find-WindowsByTitle,
+    Test-RectNear, Test-RectEqual, Format-Rect,
+    Start-TestWindow, Close-TestWindow, Stop-TestWindow, Move-Window

@@ -1,6 +1,6 @@
 ﻿<#
     SCAFFOLD — issue 09 (full config grammar + reload). Unbuilt: `It -Skip` placeholders,
-    surfaced as SKIPPED. See scaffold/slice02-window-tracking.Tests.ps1 for the scaffold
+    surfaced as SKIPPED. See scaffold/slice03-bsp-one-display.Tests.ps1 for the scaffold
     contract.
 
     Future Oracle probe: after writing a new config and firing `reload`, a Send-Chord of a

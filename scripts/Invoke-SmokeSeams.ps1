@@ -19,15 +19,16 @@
 
     As of 12.04 it drives all six workspace-switch Smoke seams (create-on-demand, windowless,
     adoption, guid-stability, quit, variant-diagnostic) plus the two error-handling runtime
-    seams (formaterror-quality, degrade-dont-crash), with issues 02–10 present as
-    skipped scaffolds.
+    seams (formaterror-quality, degrade-dont-crash). As of 02.06 it also drives the six
+    window-tracking Smoke seams (fill-one, adoption-fill, reclaim, ineligible, cloaked-uwp,
+    clean-unhook), with issues 03–10 present as skipped scaffolds.
 
     Isolation has two modes (ADR-0005):
       * default  — revert the snapshot ONCE, then run every seam in a single guest
                    session (each seam stages its own precondition in-guest).
       * -Fresh   — bulletproof: revert the snapshot per LIVE seam and re-invoke the
                    guest runner once per seam via its -Seam filter, so no seam can
-                   leak VD state into the next. The skipped 02–10 scaffolds need no VM
+                   leak VD state into the next. The skipped 03–10 scaffolds need no VM
                    and are collected in one final non-reverting pass. The per-seam
                    JUnit XMLs are merged into one results.xml for the summary.
 
@@ -296,7 +297,7 @@ else {
         $perSeam.Add($xml)
     }
 
-    # The 02–10 scaffolds are all -Skip (no VM state), so collect them once on the
+    # The 03–10 scaffolds are all -Skip (no VM state), so collect them once on the
     # last seam's state without another revert. Skipped when a single -Seam is pinned.
     if (-not $Seam) {
         Write-Host '── scaffolds (skipped, no revert) ──' -ForegroundColor Cyan
