@@ -233,8 +233,17 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.windowMonitor.erase(ev.id);
                 return {next, layout(next.focusOrder, next.windowMonitor, next.monitors)};
             },
-            // Monitor topology fold lands in 02.03; inert for now (see 02.01).
-            [&](const MonitorsChanged&) -> ReduceResult { return {s, {}}; },
+            // The monitor topology changed: replace State.monitors wholesale
+            // from the snapshot (later snapshot wins entirely — no incremental
+            // merge). The layout later resolves each head's rcWork against this
+            // map; a window on a MonitorId absent from it is left alone. Emits no
+            // Effect of its own — the re-tile against the new topology is 04.
+            [&](const MonitorsChanged& ev) -> ReduceResult {
+                State next = s;
+                next.monitors.clear();
+                for (const auto& m : ev.monitors) next.monitors[m.id] = m.rcWork;
+                return {next, {}};
+            },
         },
         e);
 }

@@ -173,3 +173,49 @@ TEST_CASE("Vanished of an untracked window is a no-op that still holds the curre
     r = reduce(r.state, Vanished{WindowId{99}});
     REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
 }
+
+// ── monitor model: MonitorsChanged fold + rcWork lookup ──────────────────────
+
+TEST_CASE("MonitorsChanged emits no Effect of its own", "[reducer]") {
+    const auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("after a MonitorsChanged snapshot, an Appeared fills to that monitor's rcWork", "[reducer]") {
+    // No monitors known yet — the snapshot is what makes the fill resolvable.
+    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
+    r = reduce(r.state, Appeared{tileable(WindowId{1}, kMon)});
+
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
+}
+
+TEST_CASE("an Appeared on a MonitorId absent from the topology emits no PositionWindow", "[reducer]") {
+    // The snapshot knows kMon; the window claims a different, unknown monitor.
+    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
+    r = reduce(r.state, Appeared{tileable(WindowId{1}, MonitorId{99})});
+
+    // Defensive: a window on an unknown monitor is left alone (no fill), but
+    // still tracked so a later snapshot can place it.
+    REQUIRE(r.effects.empty());
+    REQUIRE(r.state.focusOrder.size() == 1);
+}
+
+TEST_CASE("MonitorsChanged replaces the topology wholesale — the later snapshot wins entirely", "[reducer]") {
+    constexpr MonitorId kOther{2};
+    constexpr Rect kOtherWork{0, 0, 2560, 1400};
+
+    // First snapshot knows kMon; a window fills there.
+    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
+    r = reduce(r.state, Appeared{tileable(WindowId{1}, kMon)});
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
+
+    // A second snapshot drops kMon entirely and introduces kOther. The head
+    // still sits on the now-vanished kMon, so it no longer resolves.
+    r = reduce(r.state, MonitorsChanged{{{kOther, kOtherWork}}});
+    REQUIRE(r.effects.empty());
+
+    // A window on the new monitor fills to the new work area.
+    r = reduce(r.state, Appeared{tileable(WindowId{2}, kOther)});
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{2}, kOtherWork});
+}
