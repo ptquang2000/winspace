@@ -1,20 +1,26 @@
 # winspace — Project Draft
 
-> A Windows 11 workspace + auto-tiling manager that makes windows easier to use by
+> A Windows 11 workspace + focus manager that makes windows easier to use by
 > leaning on OS-native facilities, staying responsive even under heavy machine load.
 > Inspired by i3/hyprland, but built to work *with* Windows, not fight it.
 
 *Status: concept draft. Implementation & internal architecture intentionally deferred.*
+
+> **Tiling was dropped.** winspace owns **no window geometry** — it never moves or
+> sizes a window. It switches Workspaces and switches keyboard focus. See
+> [ADR-0007](docs/adr/0007-drop-tiling-no-window-geometry.md) for the pivot and its
+> rationale.
 
 ---
 
 ## 1. North stars
 
 1. **Make windows easier — don't replace how Windows works.** Lean on OS-native
-   facilities wherever they exist; only own what Windows won't give us.
-2. **Seamless under load.** Switching workspaces must feel instant even during a
-   heavy compile. Achieved by delegating to the OS and never running on the input
-   critical path (no low-level input hooks, no elevated priority).
+   facilities wherever they exist; only own what Windows won't give us. winspace
+   owns *no* window geometry — windows land where Windows puts them.
+2. **Seamless under load.** Switching workspaces and focus must feel instant even
+   during a heavy compile. Achieved by delegating to the OS and never running on the
+   input critical path (no low-level input hooks, no elevated priority).
 
 ---
 
@@ -25,62 +31,51 @@
 - **Global switch across all monitors.** All displays switch together (native VD
   behavior); each window stays on its own physical monitor across the switch.
 - **Dynamic workspaces** — created on demand.
-- **Place-once auto-tiler.** Windows auto-tile *when they open*; winspace does **not**
-  continuously enforce. Drag a tiled window → it pops to floating. winspace never
-  fights the user after initial placement.
+- **No geometry ownership.** winspace never tiles, moves, or resizes a window. It
+  *reads* window positions (to resolve directional focus) and *assigns* windows to
+  Workspaces (move-to-workspace), but it never writes a window's on-screen rect.
 
 ---
 
-## 3. Tiling
+## 3. Focus
 
-- **BSP / dwindle** layout, like i3/hyprland.
-- winspace **owns geometry** via `SetWindowPos` / `DeferWindowPos`. *(There is no
-  programmatic Snap Layout API in Windows — FancyZones/komorebi/GlazeWM all compute
-  rectangles themselves; winspace does the same.)*
-- **"Stay close to native snap" = visual, not API:** compute the same rectangles native
-  snap would (halves/quarters of `rcWork`), respect per-monitor DPI, `rcWork` (taskbar),
-  rounded corners (`DWMWA_WINDOW_CORNER_PREFERENCE`), and per-window min sizes.
-
-### Multi-display fill / float lifecycle (the Nth new window)
-1. Any display with **zero** tiled windows → place there, fill work area.
-2. All displays occupied → **BSP-split** the focused display's focused tile.
-3. Splitting would drop a tile below its min size → the window **opens floating**.
-
-- **Min-tile floor:** hard constraint from each window's `WM_GETMINMAXINFO`; plus an
-  optional higher global floor (`min_tile_width` / `min_tile_height`).
-- Displays treated as one continuous fill order (fill each display, then split focused,
-  then overflow, then float) — a deliberate single-canvas feel, unlike i3/hyprland's
-  independent-per-monitor model.
+- **Spatial directional focus.** `focus left|right|up|down` moves keyboard focus to the
+  nearest window in that direction, computed from window rectangles in virtual-screen
+  coordinates, so traversal crosses monitors naturally.
+- **Stateless.** Rects are Probed live on the keypress; nothing is persisted between
+  presses, so focus is never resolved against a stale layout. Emits a
+  `SetForegroundWindow` Effect — a read of geometry, never a write.
 
 ---
 
 ## 4. Window eligibility
 
-**Tileable** only if all hold: top-level & unowned · `WS_VISIBLE` · `WS_THICKFRAME` +
-`WS_CAPTION` · not `WS_EX_TOOLWINDOW` · **not DWM-cloaked** (filters UWP ghost windows) ·
-not fullscreen · not excluded by a rule.
+A window is **Eligible** (a focus candidate, and — later — a rule-match target) only if all
+hold: top-level & unowned · `WS_VISIBLE` · `WS_THICKFRAME` + `WS_CAPTION` · not
+`WS_EX_TOOLWINDOW` · **not DWM-cloaked** (filters UWP ghost windows) · not fullscreen · not
+excluded by a rule.
 
-Everything else **floats and is left undisturbed** (dialogs sit on top; tiles unchanged).
-Fullscreen windows (games/video) auto-float and are never touched. A `windowrule` can
-force `float | tile | ignore` per app. *(A bundled default exclusion list is deferred;
-the rule mechanism ships.)*
+Everything else is **Ineligible** — skipped by focus and left entirely undisturbed. A
+`windowrule` can force `ignore` per app. *(The `WS_THICKFRAME` requirement is a hold-over
+from tiling and may be loosened for focus candidacy later.)*
 
 ---
 
-## 5. Rules (app → workspace pinning)
+## 5. Rules (app → workspace pinning) — *future, PRD 06*
 
-- Match order: **exe → class → title (regex)**. **Place-once**, no continuous enforcement.
+- Match order: **exe → class → title (regex)**. **Place-once**, no continuous enforcement;
+  assigns a Workspace only — never geometry.
 - Detect new windows at `EVENT_OBJECT_CREATE`, then **cloak → move → uncloak** (DWM
-  `DWMWA_CLOAK`) to avoid the cross-desktop placement flash. *(Flash only occurs when the
-  target is an inactive desktop; cloaking reduces it to near-zero.)*
+  `DWMWA_CLOAK`) to avoid the cross-desktop placement flash.
+- PRD 06 reintroduces the `SetWinEventHook` adapter removed with tiling.
 
 ---
 
-## 6. Launcher
+## 6. Launcher — *future, PRD 08*
 
 - `exec` (runs on every config reload) and `exec-once` (startup only) — hyprland idiom.
-- An entry can specify a target workspace; winspace launches via `CreateProcess`, so it
-  places the app's first window by **PID match** — cleanest, flash-free placement.
+- An entry can specify a target **workspace**; winspace launches via `CreateProcess` and
+  assigns the app's first window by **PID match**. Workspace assignment only — no geometry.
 
 ---
 
@@ -96,29 +91,31 @@ the rule mechanism ships.)*
 ## 8. Hotkeys & dispatchers
 
 - **`RegisterHotKey` only** (kernel-delivered, survives load). **No `WH_KEYBOARD_LL`,
-  no elevated priority.** Hyprland-style modifier (e.g. `Win+Alt`).
+  no elevated priority.** Hyprland-style modifier.
 - Dispatchers (v1):
   - `workspace N`, `movetoworkspace N`, `movetoworkspacesilent N`
-  - `focus left|right|up|down`, `movewindow left|right|up|down` — **spatial**, computed
-    from window rects, traverse across monitors in virtual-screen coordinates
-  - `movetomonitor` / `focusmonitor`
-  - `maximize` (fill work area), `resizeactive`, `togglefloat`
+  - `focus left|right|up|down` — **spatial**, computed from window rects, traverses across
+    monitors in virtual-screen coordinates
   - `exec` / `exec-once`, `reload`, `quit`
+- **Removed with tiling:** `movewindow`, `movetomonitor`, `focusmonitor`, `maximize`,
+  `resizeactive`, `togglefloat` — all either move/size a window (forbidden) or are
+  redundant with spatial focus.
 
 ---
 
 ## 9. Configuration
 
 - **Hyprland-style DSL**: `key = value`, `section { ... }`, `bind = MODS, KEY, dispatcher, args`,
-  `exec` / `exec-once`, `windowrule`, workspace rules.
+  `exec` / `exec-once`, `windowrule` (workspace assignment / `ignore`), workspace rules.
 - Reloadable via the `reload` dispatcher.
 
 ---
 
-## 10. Deferred (discuss later)
+## 10. Deferred / removed
 
+- **Tiling — removed** (ADR-0007). All BSP/dwindle layout, min-tile floors, drag-to-float,
+  and geometry ownership are gone, not deferred.
 - Internal threading / process architecture (load-resilience mechanics).
 - COM Virtual Desktop bridge versioning across Windows builds.
 - IPC / CLI (`hyprctl`-equivalent) surface.
-- Tech stack, build system, tests.
-- Phase-2 tiling: intra-display custom zones, tile-swap on drag, tabbed/stacked layouts.
+- Loosening the eligibility gate (`WS_THICKFRAME`) for focus candidacy.

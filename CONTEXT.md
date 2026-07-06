@@ -1,8 +1,10 @@
 # winspace
 
-A Windows 11 workspace + auto-tiling window manager that leans on OS-native facilities
-and stays off the input critical path. This glossary fixes the ubiquitous language shared
-by `PRD.md`, `DESIGN.md`, the `issues/`, and the code.
+A Windows 11 workspace + focus manager that leans on OS-native facilities and stays off
+the input critical path. It switches Workspaces and switches keyboard focus between
+windows; it owns **no window geometry** — it never moves or sizes a window (see
+[ADR-0007](docs/adr/0007-drop-tiling-no-window-geometry.md)). This glossary fixes the
+ubiquitous language shared by `PRD.md`, `DESIGN.md`, the `issues/`, and the code.
 
 ## Language
 
@@ -30,7 +32,7 @@ session rather than resetting it.
 
 **Reaping**:
 Destroying an empty, unfocused Workspace so junk desktops don't accumulate. A wanted
-feature, deferred until window tracking can detect "empty" (issue 02); the GUID-anchored
+feature, deferred until window tracking (PRD 06) can detect "empty"; the GUID-anchored
 mapping is what makes it safe.
 
 **Display**:
@@ -50,7 +52,8 @@ window opened, the config reloaded). Named in the past/imperative, never carries
 
 **Effect**:
 A plain-data output from the Reducer describing something the I/O layer must do (switch
-Virtual Desktop, position a window, exit). The Reducer emits Effects; it never performs them.
+Virtual Desktop, set the foreground window, exit). The Reducer emits Effects; it never
+performs them. No Effect ever moves or sizes a window — winspace owns no geometry.
 
 **State**:
 The authoritative in-memory model the Reducer transforms. Rebuilt on start — never persisted.
@@ -65,49 +68,47 @@ A config line mapping a modifier + key to a Dispatcher and its arguments
 (`bind = MODS, KEY, dispatcher, args`).
 _Avoid_: Keybinding, Shortcut, Mapping.
 
-### Window tracking
+### Windows & focus
 
 **Eligibility gate**:
-The rule that decides whether a window is Tileable or Floating: top-level & unowned,
+The rule that decides whether a window is Eligible or Ineligible: top-level & unowned,
 `WS_VISIBLE` + `WS_THICKFRAME` + `WS_CAPTION`, not `WS_EX_TOOLWINDOW`, not DWM-cloaked, not
-fullscreen. The *policy* (the AND of these facts) is a pure predicate in the Reducer; the
-*Probe* that gathers the facts is the adapter's job.
+fullscreen. The *policy* (the AND of these facts, `isEligible`) is a pure predicate in the
+Reducer; the *Probe* that gathers the facts is the adapter's job.
+_Note_: `WS_THICKFRAME` is a hold-over from tiling (only resizable windows could tile) and
+is a candidate to loosen for focus candidacy later; kept as-is for now.
 
-**Tileable window**:
-A window that passes the Eligibility gate and so participates in the layout. winspace owns
-its geometry.
-_Avoid_: Managed, tiled (adjective is fine; the noun for the set is "tileable").
+**Eligible window**:
+A window that passes the Eligibility gate — a real top-level application window winspace
+treats as a focus candidate (and, in PRD 06, a rule-match target). winspace never moves or
+sizes it; "Eligible" is about *whether winspace considers it*, not about geometry.
+_Avoid_: Tileable (dead — nothing is tiled), Managed.
 
 **Ineligible window**:
 A window that fails the Eligibility gate (dialog, tool window, context menu, cloaked UWP
-host, fullscreen). winspace never tiles it and — as of issue 02 — does not store it either;
-it is classified and left alone. "Floating" the noun, when unqualified, means this.
-_Avoid_: Ignored, unmanaged.
+host, fullscreen). The focus sweep skips it; winspace does not track or store it — it is
+classified and left entirely alone.
+_Avoid_: Ignored, unmanaged, Floating.
 
-**Detached window**:
-A window that *passes* the gate (genuinely manageable) but is deliberately outside the
-layout right now — dragged out, matched by a `windowrule float`, or toggled off. Unlike an
-Ineligible window it can be *snapped back* into Focus order. The Detached set is empty until
-06/07 give it content (rules, drag-to-float, a `togglefloat` Dispatcher); do not conflate it
-with Ineligible.
+**Spatial focus**:
+The resolution of a `focus left|right|up|down` Dispatcher. **Stateless**: at keypress the
+adapter enumerates the Eligible windows and Probes their rects, and the pure Reducer picks
+the nearest window in the requested direction across the virtual screen (crossing monitors
+naturally), emitting a `SetForegroundWindow` Effect. No focus order is persisted and no
+geometry is stored — the rects are read fresh each time, so they are never stale.
+_Avoid_: Directional tiling move, `movewindow` (the tile-swap dispatcher died with tiling).
 
 **Probe**:
-A one-shot synchronous read of a single window's live attributes (styles, cloak state, rect)
-taken *reactively* when a hook fires — never on a timer. Push (the hook) says *when*; the
-Probe says *what*, because the win-event callback carries no attributes.
+A one-shot synchronous read of a window's live attributes (styles, cloak state, rect) taken
+*reactively* at the moment they are needed — on a `focus` keypress (Spatial focus), never on
+a timer. In PRD 06 the parked hook adapter will also Probe on a lifecycle edge.
 _Avoid_: Poll, scan, snapshot-loop (there is no interval).
 
-**Appeared / Vanished**:
-The two lifecycle edges the Reducer reacts to. Appeared = `EVENT_OBJECT_SHOW` /
-`EVENT_OBJECT_UNCLOAKED` (probe here); Vanished = `EVENT_OBJECT_DESTROY` / `HIDE` /
-`CLOAKED`. Raw `EVENT_OBJECT_CREATE` is ignored — the window is half-born and misclassifies.
-
-**Focus order**:
-The Tileable windows kept as a priority-ordered list, front = most-recently-focused. The
-layout function acts on the head (the window filled, or in later slices the tile split). Its
-priority signal is focus recency; until foreground tracking lands it is approximated by
-appearance order (a newly shown window takes focus, so it front-inserts).
-_Avoid_: MRU, stack, z-order (z-order is OS stacking — a different thing).
+**Appeared / Vanished** *(parked — PRD 06)*:
+The window-lifecycle edges (`EVENT_OBJECT_SHOW` / `UNCLOAKED` and `DESTROY` / `HIDE` /
+`CLOAKED`) delivered by a `SetWinEventHook` adapter. Removed from master with tiling; PRD 06
+(window rules) — the hook's first genuine consumer — reintroduces them. Defined here only so
+the term is stable when 06 lands; there is no live `Appeared` / `Vanished` today.
 
 ### Threads
 
@@ -117,8 +118,8 @@ Events and hands them to the Worker thread. Does no domain logic.
 
 **Worker thread**:
 The single thread that owns the State, runs the Reducer, executes the emitted Effects, and
-is the sole owner of the COM Virtual Desktop bridge (STA). All later window-tracking and
-tiling logic lands here.
+is the sole owner of the COM Virtual Desktop bridge (STA). It also runs the Spatial focus
+Probe sweep and, in PRD 06, will own the reintroduced hook adapter.
 _Avoid_: Main thread, UI thread (winspace is windowless — there is no UI thread).
 
 ### VM seam testing

@@ -2,6 +2,12 @@
 
 **Labels:** `ready-for-agent`
 
+> **"Placement" = Workspace, not geometry.** Per
+> [ADR-0007](../docs/adr/0007-drop-tiling-no-window-geometry.md), winspace owns no window
+> geometry. A launched app's first window is matched by PID and assigned to a target
+> *Workspace* (via 06's cloak-move path); it is never moved or sized on screen. Depends on the
+> hook adapter that 06 reintroduces.
+
 ## What to build
 
 Launch apps from config and place them cleanly. `exec-once` entries run at startup; `exec`

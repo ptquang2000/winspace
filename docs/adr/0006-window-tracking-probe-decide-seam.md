@@ -1,5 +1,12 @@
 # Window tracking: adapter probes plain-data facts, the pure Reducer decides and computes logical rects
 
+> **Status: partially superseded / parked by [ADR-0007](0007-drop-tiling-no-window-geometry.md).**
+> The Probe/policy split is still the house discipline — the Spatial-focus sweep uses it, and
+> PRD 06 will reuse it for the hook. But its *tiling-specific* conclusions (the Reducer
+> computes **logical rects**, the Worker applies frame/DPI compensation) no longer apply:
+> winspace computes no rects and writes no geometry. The `SetWinEventHook` adapter described
+> below is parked until PRD 06 reintroduces it.
+
 Issue 02 is the first slice that makes the pure core reason about windows and geometry —
 both inherently Windows concepts. We keep the Reducer `windows.h`-free by splitting every
 OS-touching concern into two halves: a **Probe** (adapter side — gathers a window's live

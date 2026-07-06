@@ -1,9 +1,18 @@
 # PRD 0002 — Window tracking + eligibility + fill-one-window
 
-**Labels:** `ready-for-agent`
-**Blocked by:** 01 (idiom from 11)
-**References:** [ADR-0006](../adr/0006-window-tracking-probe-decide-seam.md), `CONTEXT.md`
-(Window tracking), `DESIGN.md`
+> **Superseded in large part by [ADR-0007](../adr/0007-drop-tiling-no-window-geometry.md).**
+> Tiling was dropped, so this PRD's *positioning* half — the `layout()` function, the
+> `PositionWindow` Effect, Worker frame/DPI compensation, `State.focusOrder` /
+> `windowMonitor` / `monitors`, and the `SetWinEventHook` adapter with its `Appeared` /
+> `Vanished` stream — was removed from master. What survives: the **Eligibility gate**
+> (renamed `isTileable` → `isEligible`), the strong `WindowId` / `MonitorId` identities, and
+> the reactive **Probe**. This document is retained as the record of the hook-adapter design
+> that **PRD 06** reintroduces when it needs it.
+
+**Labels:** `superseded`
+**References:** [ADR-0007](../adr/0007-drop-tiling-no-window-geometry.md),
+[ADR-0006](../adr/0006-window-tracking-probe-decide-seam.md), `CONTEXT.md` (Windows & focus),
+`DESIGN.md`
 
 ## Problem Statement
 

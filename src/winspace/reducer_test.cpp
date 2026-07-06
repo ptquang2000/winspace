@@ -74,13 +74,13 @@ TEST_CASE("reduce is pure — same inputs yield same Effects and leave the input
     REQUIRE(s.running);
 }
 
-// ── window tracking: eligibility, focus order, layout ────────────────────────
+// ── eligibility: the pure window gate (substrate for focus + rules) ──────────
 
 namespace {
 
-// A fully-Tileable Probe result: every eligibility fact points the right way.
+// A fully-Eligible Probe result: every eligibility fact points the right way.
 // Individual tests flip exactly one field to prove that field alone decides.
-WindowAttrs tileable(WindowId id, MonitorId monitor) {
+WindowAttrs eligible(WindowId id, MonitorId monitor) {
     return WindowAttrs{.id = id,
                        .monitor = monitor,
                        .topLevel = true,
@@ -92,130 +92,22 @@ WindowAttrs tileable(WindowId id, MonitorId monitor) {
                        .fullscreen = false};
 }
 
-// One monitor whose work area is the rect we expect a fill to land in.
 constexpr MonitorId kMon{1};
-constexpr Rect kWork{0, 0, 1920, 1040};
-
-State with_monitor() {
-    State s{};
-    s.monitors[kMon] = kWork;
-    return s;
-}
 
 }  // namespace
 
-TEST_CASE("isTileable is the AND of the probed facts — each condition alone flips the verdict", "[reducer]") {
-    const WindowAttrs ok = tileable(WindowId{1}, kMon);
-    REQUIRE(isTileable(ok));
+TEST_CASE("isEligible is the AND of the probed facts — each condition alone flips the verdict", "[reducer]") {
+    const WindowAttrs ok = eligible(WindowId{1}, kMon);
+    REQUIRE(isEligible(ok));
 
     // Each required-true fact, cleared, drops it out.
-    auto no_top = ok; no_top.topLevel = false; REQUIRE_FALSE(isTileable(no_top));
-    auto no_vis = ok; no_vis.visible = false; REQUIRE_FALSE(isTileable(no_vis));
-    auto no_thick = ok; no_thick.thickFrame = false; REQUIRE_FALSE(isTileable(no_thick));
-    auto no_cap = ok; no_cap.caption = false; REQUIRE_FALSE(isTileable(no_cap));
+    auto no_top = ok; no_top.topLevel = false; REQUIRE_FALSE(isEligible(no_top));
+    auto no_vis = ok; no_vis.visible = false; REQUIRE_FALSE(isEligible(no_vis));
+    auto no_thick = ok; no_thick.thickFrame = false; REQUIRE_FALSE(isEligible(no_thick));
+    auto no_cap = ok; no_cap.caption = false; REQUIRE_FALSE(isEligible(no_cap));
 
     // Each must-be-false fact, set, drops it out.
-    auto tool = ok; tool.toolWindow = true; REQUIRE_FALSE(isTileable(tool));
-    auto cloaked = ok; cloaked.cloaked = true; REQUIRE_FALSE(isTileable(cloaked));
-    auto fs = ok; fs.fullscreen = true; REQUIRE_FALSE(isTileable(fs));
-}
-
-TEST_CASE("a single eligible Appeared fills the window to its monitor's rcWork", "[reducer]") {
-    const auto r = reduce(with_monitor(), Appeared{tileable(WindowId{1}, kMon)});
-
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-}
-
-TEST_CASE("an ineligible Appeared emits no Effect and does not track the window", "[reducer]") {
-    auto attrs = tileable(WindowId{7}, kMon);
-    attrs.toolWindow = true;  // a palette / tooltip — ignored
-
-    const auto r = reduce(with_monitor(), Appeared{attrs});
-
-    REQUIRE(r.effects.empty());
-    REQUIRE(r.state.focusOrder.empty());
-}
-
-TEST_CASE("a second eligible Appeared fills over the first — head is the newest", "[reducer]") {
-    auto r = reduce(with_monitor(), Appeared{tileable(WindowId{1}, kMon)});
-    r = reduce(r.state, Appeared{tileable(WindowId{2}, kMon)});
-
-    // The newest window owns the head, so it gets the fill.
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{2}, kWork});
-}
-
-TEST_CASE("Vanished of the head re-fills the survivor; the final Vanished emits nothing", "[reducer]") {
-    auto r = reduce(with_monitor(), Appeared{tileable(WindowId{1}, kMon)});
-    r = reduce(r.state, Appeared{tileable(WindowId{2}, kMon)});
-
-    // Kill the head (2): the survivor (1) reclaims the fill.
-    r = reduce(r.state, Vanished{WindowId{2}});
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-
-    // Kill the last one: nothing left to place.
-    r = reduce(r.state, Vanished{WindowId{1}});
-    REQUIRE(r.effects.empty());
-}
-
-TEST_CASE("two Appeared for the same WindowId keep one entry and emit one fill", "[reducer]") {
-    auto r = reduce(with_monitor(), Appeared{tileable(WindowId{1}, kMon)});
-    r = reduce(r.state, Appeared{tileable(WindowId{1}, kMon)});
-
-    // Idempotent: move-to-front, never duplicate.
-    REQUIRE(r.state.focusOrder.size() == 1);
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-}
-
-TEST_CASE("Vanished of an untracked window is a no-op that still holds the current fill", "[reducer]") {
-    auto r = reduce(with_monitor(), Appeared{tileable(WindowId{1}, kMon)});
-
-    // A Vanished for a window we never tracked leaves the head untouched.
-    r = reduce(r.state, Vanished{WindowId{99}});
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-}
-
-// ── monitor model: MonitorsChanged fold + rcWork lookup ──────────────────────
-
-TEST_CASE("MonitorsChanged emits no Effect of its own", "[reducer]") {
-    const auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
-
-    REQUIRE(r.effects.empty());
-}
-
-TEST_CASE("after a MonitorsChanged snapshot, an Appeared fills to that monitor's rcWork", "[reducer]") {
-    // No monitors known yet — the snapshot is what makes the fill resolvable.
-    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
-    r = reduce(r.state, Appeared{tileable(WindowId{1}, kMon)});
-
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-}
-
-TEST_CASE("an Appeared on a MonitorId absent from the topology emits no PositionWindow", "[reducer]") {
-    // The snapshot knows kMon; the window claims a different, unknown monitor.
-    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
-    r = reduce(r.state, Appeared{tileable(WindowId{1}, MonitorId{99})});
-
-    // Defensive: a window on an unknown monitor is left alone (no fill), but
-    // still tracked so a later snapshot can place it.
-    REQUIRE(r.effects.empty());
-    REQUIRE(r.state.focusOrder.size() == 1);
-}
-
-TEST_CASE("MonitorsChanged replaces the topology wholesale — the later snapshot wins entirely", "[reducer]") {
-    constexpr MonitorId kOther{2};
-    constexpr Rect kOtherWork{0, 0, 2560, 1400};
-
-    // First snapshot knows kMon; a window fills there.
-    auto r = reduce(State{}, MonitorsChanged{{{kMon, kWork}}});
-    r = reduce(r.state, Appeared{tileable(WindowId{1}, kMon)});
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{1}, kWork});
-
-    // A second snapshot drops kMon entirely and introduces kOther. The head
-    // still sits on the now-vanished kMon, so it no longer resolves.
-    r = reduce(r.state, MonitorsChanged{{{kOther, kOtherWork}}});
-    REQUIRE(r.effects.empty());
-
-    // A window on the new monitor fills to the new work area.
-    r = reduce(r.state, Appeared{tileable(WindowId{2}, kOther)});
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{2}, kOtherWork});
+    auto tool = ok; tool.toolWindow = true; REQUIRE_FALSE(isEligible(tool));
+    auto cloaked = ok; cloaked.cloaked = true; REQUIRE_FALSE(isEligible(cloaked));
+    auto fs = ok; fs.fullscreen = true; REQUIRE_FALSE(isEligible(fs));
 }

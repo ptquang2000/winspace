@@ -1,13 +1,16 @@
 // Process spine — I/O adapter (owns <windows.h> and thread lifecycle).
 //
-// The backbone the whole product plugs into: it spawns the Worker thread, the
-// Hotkey thread, and the Window-hook thread, wires each producer→Worker transport,
-// and joins all three on a clean exit. No domain logic lives here — behavior is
-// the Reducer's, executed by the Worker. This file carries only the thread wiring.
+// The backbone the whole product plugs into: it spawns the Worker thread and the
+// Hotkey thread, wires the producer→Worker transport, and joins both on a clean
+// exit. No domain logic lives here — behavior is the Reducer's, executed by the
+// Worker. This file carries only the thread wiring.
 //
-//   Hotkey thread      ──PostMessage(Event*)──▶ Worker's message-only HWND
-//   Window-hook thread ──PostMessage(Event*)──▶ Worker: reduce → execute Effects
-//                                               Exit Effect → PostQuitMessage → unwind
+//   Hotkey thread ──PostMessage(Event*)──▶ Worker's message-only HWND
+//                                          Worker: reduce → execute Effects
+//                                          Exit Effect → PostQuitMessage → unwind
+//
+// (The Window-hook thread was removed with tiling — ADR-0007. PRD 06 reintroduces
+// it as the first genuine consumer of the lifecycle event stream.)
 #pragma once
 
 #include <windows.h>
@@ -26,7 +29,6 @@
 #include <vector>
 
 #include "io/hotkeys.cpp"
-#include "io/window_hook.cpp"
 #include "io/worker.cpp"
 #include "winspace/config.cpp"
 #include "winspace/reducer.cpp"
@@ -171,9 +173,9 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
 // process exit code. Called by wWinMain.
 inline int runApp() {
     // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
-    // message-only HWND included), so it leads runApp. This puts the process,
-    // rcWork, and SetWindowPos in ONE physical-pixel coordinate space — the
-    // precondition for correct positioning on a scaled display (02.05). Best
+    // message-only HWND included), so it leads runApp. This puts the process and
+    // every window rect in ONE physical-pixel coordinate space — the precondition
+    // for correct spatial-focus resolution across scaled displays (issue 05). Best
     // effort: a failure (an OS predating V2, or awareness already pinned by a
     // manifest) leaves the prior awareness in place and is logged, never fatal.
     if (const auto aware =
@@ -206,24 +208,14 @@ inline int runApp() {
                               std::move(tidReady));
     const DWORD hotkeyTid = tidFuture.get();
 
-    // Start the Window-hook thread the same way: it arms the WinEvent hook on its
-    // own thread, runs the Adoption sweep, and posts lifecycle/monitor Events to
-    // the Worker HWND. Spawned after the Worker HWND exists to post to.
-    std::promise<DWORD> hookTidReady;
-    std::future<DWORD> hookTidFuture = hookTidReady.get_future();
-    std::jthread windowHookThread(windowHookThreadMain, workerHwnd, std::move(hookTidReady));
-    const DWORD windowHookTid = hookTidFuture.get();
-
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.
     workerThread.join();
 
-    // Worker is down; unwind both producer loops. This WM_QUIT is thread-lifecycle
+    // Worker is down; unwind the Hotkey loop. This WM_QUIT is thread-lifecycle
     // control — NOT the Event transport, which is always a PostMessage to the
-    // Worker's HWND. The Window-hook thread UnhookWinEvents as its loop exits.
+    // Worker's HWND.
     PostThreadMessageW(hotkeyTid, WM_QUIT, 0, 0);
-    PostThreadMessageW(windowHookTid, WM_QUIT, 0, 0);
     hotkeyThread.join();
-    windowHookThread.join();
     return 0;
 }
 

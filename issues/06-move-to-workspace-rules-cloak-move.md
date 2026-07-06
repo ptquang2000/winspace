@@ -2,6 +2,13 @@
 
 **Labels:** `ready-for-agent`
 
+> **Owns the hook adapter.** Per [ADR-0007](../docs/adr/0007-drop-tiling-no-window-geometry.md),
+> the `SetWinEventHook` adapter and the `Appeared` / `Vanished` lifecycle stream were removed
+> from master when tiling was dropped. This PRD — the hook's first real consumer — reintroduces
+> them, so a `windowrule` can react the instant a matching window is created. The prior design
+> lives in git history and in PRD 0002. This remains **place-once**: winspace assigns a window
+> to a Workspace, it never sizes or positions it.
+
 ## What to build
 
 Assign windows to workspaces, by command and by rule, without the cross-desktop placement
