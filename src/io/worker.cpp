@@ -166,7 +166,7 @@ private:
                                                              probeForeground()}});
                 },
                 [&](const SetForegroundWindow& sf) {
-                    // Bare call, degrade-and-log (PRD 0005): a just-fired hotkey
+                    // Bare call, degrade-and-log: a just-fired hotkey
                     // usually satisfies Win32's foreground-lock, so this succeeds;
                     // on failure we log and move on — never crash (null-bridge
                     // precedent). The scoped AttachThreadInput recovery is deferred
