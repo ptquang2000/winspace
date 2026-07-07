@@ -111,3 +111,161 @@ TEST_CASE("isEligible is the AND of the probed facts — each condition alone fl
     auto cloaked = ok; cloaked.cloaked = true; REQUIRE_FALSE(isEligible(cloaked));
     auto fs = ok; fs.fullscreen = true; REQUIRE_FALSE(isEligible(fs));
 }
+
+// ── spatial directional focus: the pure resolution rule (ADR-0008) ───────────
+//
+// These feed a FocusMove / FocusResolve Event and assert on the emitted Effect,
+// exactly as the workspace tests do. Rects are in virtual-screen coordinates
+// (Win32: x grows right, y grows down). Cross-monitor resolution is covered here
+// (the VM is single-display) — it is just a farther rect in the shared space.
+
+namespace {
+
+// A fully-Eligible window at a given rect. Individual tests flip one field to
+// make a Candidate Ineligible, or move the rect to place it in the layout.
+WindowAttrs win(WindowId id, Rect rect) {
+    WindowAttrs a = eligible(id, kMon);
+    a.rect = rect;
+    return a;
+}
+
+using reducer::Direction;
+
+}  // namespace
+
+TEST_CASE("FocusMove emits exactly ResolveFocus for that direction and leaves State untouched", "[reducer][focus]") {
+    const State s{.currentWorkspace = 2, .running = true};
+
+    const auto r = reduce(s, FocusMove{Direction::Right});
+
+    // Phase one asks the Worker to probe; it decides nothing yet and touches no State.
+    REQUIRE(single_effect<ResolveFocus>(r) == ResolveFocus{Direction::Right});
+    REQUIRE(r.state.currentWorkspace == 2);
+    REQUIRE(r.state.running);
+}
+
+TEST_CASE("a neighbor in the direction is focused; the opposite direction with nothing there is a no-op", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto right = win(WindowId{2}, {200, 0, 300, 100});
+    const std::vector<WindowAttrs> candidates{origin, right};
+
+    const auto go = reduce(State{}, FocusResolve{Direction::Right, candidates, origin});
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(go) == winspace::SetForegroundWindow{WindowId{2}});
+
+    // Nothing to the left → no Effect (focus never wraps).
+    const auto nope = reduce(State{}, FocusResolve{Direction::Left, candidates, origin});
+    REQUIRE(nope.effects.empty());
+}
+
+TEST_CASE("an aligned (in-band) window beats a closer diagonal one", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    // Aligned: same row as the Origin, directly right, but farther by center.
+    const auto aligned = win(WindowId{2}, {300, 0, 400, 100});
+    // Diagonal: below-and-right, closer by center distance, but off-band.
+    const auto diagonal = win(WindowId{3}, {200, 200, 300, 300});
+
+    const auto r =
+        reduce(State{}, FocusResolve{Direction::Right, {origin, aligned, diagonal}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{2}});
+}
+
+TEST_CASE("a Candidate overlapping the Origin but center-forward is still reachable", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    // Overlaps the Origin's x-span (left 40 < origin right 100) but its center
+    // (x=140) is past the Origin's (x=50), so an edge-ahead test would drop it and
+    // center-ahead keeps it.
+    const auto overlap = win(WindowId{2}, {40, 0, 240, 100});
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, overlap}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{2}});
+}
+
+TEST_CASE("the geometrically nearest window is skipped when Ineligible; the next Eligible is chosen", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    auto nearer = win(WindowId{2}, {150, 0, 250, 100});
+    nearer.toolWindow = true;  // Ineligible — the gate must skip it inside the Reducer
+    const auto farther = win(WindowId{3}, {300, 0, 400, 100});
+
+    const auto r =
+        reduce(State{}, FocusResolve{Direction::Right, {origin, nearer, farther}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{3}});
+}
+
+TEST_CASE("the Origin is never its own target", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto right = win(WindowId{2}, {200, 0, 300, 100});
+    // The Origin is in the probed set (the sweep always sees the foreground window).
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, right}, origin});
+
+    const auto& chosen = single_effect<winspace::SetForegroundWindow>(r);
+    REQUIRE(chosen == winspace::SetForegroundWindow{WindowId{2}});
+    REQUIRE_FALSE(chosen == winspace::SetForegroundWindow{WindowId{1}});
+}
+
+TEST_CASE("an Ineligible Origin is still a valid reference point", "[reducer][focus]") {
+    auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    origin.toolWindow = true;  // the Origin's own Eligibility is never checked
+    const auto right = win(WindowId{2}, {200, 0, 300, 100});
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, right}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{2}});
+}
+
+TEST_CASE("no Eligible Candidate ahead in the direction is a no-op", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto behind = win(WindowId{2}, {-200, 0, -100, 100});  // to the left
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, behind}, origin});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("no foreground Origin is a no-op", "[reducer][focus]") {
+    const auto a = win(WindowId{2}, {200, 0, 300, 100});
+    const auto b = win(WindowId{3}, {-200, 0, -100, 100});
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {a, b}, std::nullopt});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("traversal crosses monitors via virtual-screen coordinates, no boundary special case", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});  // display 1
+    // A window on the second display is just a far-right rect in the shared space.
+    auto onSecondDisplay = win(WindowId{2}, {2000, 0, 2100, 100});
+    onSecondDisplay.monitor = MonitorId{2};
+
+    const auto r =
+        reduce(State{}, FocusResolve{Direction::Right, {origin, onSecondDisplay}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{2}});
+}
+
+TEST_CASE("two Candidates identical in band and distance break the tie by lowest WindowId", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    // Same rect ⇒ same band and same center distance; only the id differs. The
+    // higher id is listed FIRST to prove the choice is not enumeration order.
+    const auto high = win(WindowId{5}, {200, 0, 300, 100});
+    const auto low = win(WindowId{3}, {200, 0, 300, 100});
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {high, low}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{3}});
+}
+
+TEST_CASE("y-down convention: focus down picks the +y Candidate, focus up the -y", "[reducer][focus]") {
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto below = win(WindowId{2}, {0, 200, 100, 300});    // larger y (down)
+    const auto above = win(WindowId{3}, {0, -200, 100, -100});  // smaller y (up)
+    const std::vector<WindowAttrs> candidates{origin, below, above};
+
+    const auto down = reduce(State{}, FocusResolve{Direction::Down, candidates, origin});
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(down) == winspace::SetForegroundWindow{WindowId{2}});
+
+    const auto up = reduce(State{}, FocusResolve{Direction::Up, candidates, origin});
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(up) == winspace::SetForegroundWindow{WindowId{3}});
+}

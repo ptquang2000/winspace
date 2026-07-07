@@ -19,6 +19,8 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -45,11 +47,14 @@ struct Rect {
 };
 
 // The Probe result: one window's live attributes, read reactively when needed
-// (on a `focus` keypress, issue 05). Just `id`, the monitor it sits on, and the
-// eligibility booleans — the Eligibility gate is the pure AND of these facts.
+// (on a `focus` keypress, issue 05). `id`, the monitor it sits on, its live
+// `rect` in virtual-screen coordinates (the directional resolution reasons over
+// these), and the eligibility booleans — the Eligibility gate is the pure AND of
+// those facts. The rect is probed together with the eligibility facts in one read.
 struct WindowAttrs {
     WindowId id{};
     MonitorId monitor{};
+    Rect rect{};
     bool topLevel = false;
     bool visible = false;
     bool thickFrame = false;
@@ -59,6 +64,16 @@ struct WindowAttrs {
     bool fullscreen = false;
 };
 
+// The four directions a `focus` press can steer keyboard focus. Nested in a
+// namespace so it stays a DISTINCT type from config::Direction — both would
+// otherwise be winspace::Direction and collide in the app/test TUs that include
+// both headers. hotkeys.cpp's toEvent translates config::Direction →
+// reducer::Direction at the seam, mirroring the existing Dispatcher → Event and
+// Mod → MOD_* translations (ADR-0008).
+namespace reducer {
+enum class Direction { Left, Right, Up, Down };
+}
+
 // Events — what the outside world asks the Reducer to do. Produced by the I/O
 // adapters (a WM_HOTKEY becomes one of these) and fed in as plain data.
 struct WorkspaceSwitch {
@@ -66,17 +81,40 @@ struct WorkspaceSwitch {
 };
 struct Quit {};
 
-using Event = std::variant<WorkspaceSwitch, Quit>;
+// Spatial focus is a two-phase probe round-trip (ADR-0008): an Effect cannot hand
+// data back to the pure Reducer, so the Probed rects re-enter as a second Event.
+// FocusMove is what the Hotkey thread posts (it knows only which key fired);
+// FocusResolve is what the Worker posts back to itself after the Probe sweep.
+struct FocusMove {
+    reducer::Direction dir{};
+};
+struct FocusResolve {
+    reducer::Direction dir{};
+    std::vector<WindowAttrs> candidates;    // the full probed set, unfiltered
+    std::optional<WindowAttrs> origin;      // the foreground window; nullopt => no-op
+};
+
+using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
 // Worker thread against the COM bridge; the Reducer itself performs no I/O. No
-// Effect writes window geometry (ADR-0007).
+// Effect writes window geometry (ADR-0007) — `focus` reads rects, never moves a
+// window.
 struct SwitchToWorkspace {
     int logical = 0;  // Logical workspace number — resolved to a GUID in the bridge
 };
 struct Exit {};
 
-using Effect = std::variant<SwitchToWorkspace, Exit>;
+// ResolveFocus asks the Worker to run the Probe sweep and post FocusResolve back;
+// SetForegroundWindow asks it to bring the resolved target to the foreground.
+struct ResolveFocus {
+    reducer::Direction dir{};
+};
+struct SetForegroundWindow {
+    WindowId id{};
+};
+
+using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -86,6 +124,12 @@ constexpr bool operator==(const SwitchToWorkspace& a, const SwitchToWorkspace& b
     return a.logical == b.logical;
 }
 constexpr bool operator==(const Exit&, const Exit&) { return true; }
+constexpr bool operator==(const ResolveFocus& a, const ResolveFocus& b) {
+    return a.dir == b.dir;
+}
+constexpr bool operator==(const SetForegroundWindow& a, const SetForegroundWindow& b) {
+    return a.id == b.id;
+}
 
 // Value equality for the plain-data window types (used by the eligibility tests
 // and, later, issue 05's directional-focus tests).
@@ -93,9 +137,10 @@ constexpr bool operator==(const Rect& a, const Rect& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 constexpr bool operator==(const WindowAttrs& a, const WindowAttrs& b) {
-    return a.id == b.id && a.monitor == b.monitor && a.topLevel == b.topLevel &&
-           a.visible == b.visible && a.thickFrame == b.thickFrame && a.caption == b.caption &&
-           a.toolWindow == b.toolWindow && a.cloaked == b.cloaked && a.fullscreen == b.fullscreen;
+    return a.id == b.id && a.monitor == b.monitor && a.rect == b.rect &&
+           a.topLevel == b.topLevel && a.visible == b.visible && a.thickFrame == b.thickFrame &&
+           a.caption == b.caption && a.toolWindow == b.toolWindow && a.cloaked == b.cloaked &&
+           a.fullscreen == b.fullscreen;
 }
 
 // All the Reducer owns. Tiny by design: pass-by-value and return-by-value keep
@@ -142,6 +187,92 @@ constexpr bool isEligible(const WindowAttrs& a) {
            !a.fullscreen;
 }
 
+// ── directional focus resolution: the pure rule (ADR-0008) ───────────────────
+
+namespace focus_detail {
+
+// A window's center, kept as the DOUBLED sum of opposite edges so it stays exact
+// integer arithmetic (no /2 rounding) and overflow-safe as int64. Distances and
+// forward tests are all comparisons, so the ×2 scale cancels out.
+struct Center {
+    long long x = 0;
+    long long y = 0;
+};
+
+constexpr Center center(const Rect& r) {
+    return {static_cast<long long>(r.left) + r.right, static_cast<long long>(r.top) + r.bottom};
+}
+
+// Is the Candidate's center STRICTLY ahead of the Origin's on the Direction's
+// axis? Win32 y grows down, so `down` is +y and `up` is −y.
+constexpr bool ahead(reducer::Direction dir, const Center& c, const Center& o) {
+    switch (dir) {
+        case reducer::Direction::Left: return c.x < o.x;
+        case reducer::Direction::Right: return c.x > o.x;
+        case reducer::Direction::Up: return c.y < o.y;
+        case reducer::Direction::Down: return c.y > o.y;
+    }
+    return false;
+}
+
+// In-band iff the Candidate's cross-axis span overlaps the Origin's — a window in
+// the same row/column beats a diagonal one. Left/Right travel is horizontal, so
+// the band is the vertical (top..bottom) overlap; Up/Down travel is vertical, so
+// the band is the horizontal (left..right) overlap.
+constexpr bool inBand(reducer::Direction dir, const Rect& c, const Rect& o) {
+    const bool horizontal =
+        dir == reducer::Direction::Left || dir == reducer::Direction::Right;
+    if (horizontal) return c.top < o.bottom && o.top < c.bottom;
+    return c.left < o.right && o.left < c.right;
+}
+
+// Squared center-to-center distance (on the doubled centers — a monotonic proxy
+// for the true distance, so it orders Candidates identically without a sqrt).
+constexpr long long distSq(const Center& a, const Center& b) {
+    const long long dx = a.x - b.x;
+    const long long dy = a.y - b.y;
+    return dx * dx + dy * dy;
+}
+
+}  // namespace focus_detail
+
+// The whole directional-focus brain, pure and stateless (ADR-0008): filter
+// Candidates by isEligible, exclude the Origin by WindowId, keep only those whose
+// center is strictly ahead in the Direction, then pick the argmin of the
+// lexicographic tuple (inBand ? 0 : 1, euclideanCenterDistance, windowId) —
+// same-band before diagonal, nearest by center distance, lowest id to break ties.
+// Nothing ahead, or no Origin, → no target (nullopt). Monitor-crossing needs no
+// special case: the rects are already in one virtual-screen coordinate space.
+inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
+                                            const std::vector<WindowAttrs>& candidates,
+                                            const std::optional<WindowAttrs>& origin) {
+    using namespace focus_detail;
+    if (!origin) return std::nullopt;
+    const Center oc = center(origin->rect);
+
+    struct Score {
+        int band;         // 0 in-band, 1 diagonal
+        long long dist;   // squared center distance
+        WindowId id;      // deterministic final tie-break
+    };
+    std::optional<Score> best;
+    std::optional<WindowId> chosen;
+
+    for (const WindowAttrs& c : candidates) {
+        if (!isEligible(c)) continue;
+        if (c.id == origin->id) continue;  // the Origin is never its own target
+        const Center cc = center(c.rect);
+        if (!ahead(dir, cc, oc)) continue;
+        const Score s{inBand(dir, c.rect, origin->rect) ? 0 : 1, distSq(cc, oc), c.id};
+        if (!best || std::tie(s.band, s.dist, s.id) <
+                         std::tie(best->band, best->dist, best->id)) {
+            best = s;
+            chosen = c.id;
+        }
+    }
+    return chosen;
+}
+
 // ── the seam ────────────────────────────────────────────────────────────────
 
 inline ReduceResult reduce(const State& s, const Event& e) {
@@ -156,6 +287,18 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 State next = s;
                 next.running = false;
                 return {next, {Effect{Exit{}}}};
+            },
+            // Phase one: ask the Worker to run the Probe sweep. State is untouched —
+            // spatial focus persists nothing (ADR-0007).
+            [&](const FocusMove& fm) -> ReduceResult {
+                return {s, {Effect{ResolveFocus{fm.dir}}}};
+            },
+            // Phase two: the probed rects have re-entered as an Event. Run the pure
+            // resolution; emit a single SetForegroundWindow, or nothing.
+            [&](const FocusResolve& fr) -> ReduceResult {
+                if (const auto target = resolveFocus(fr.dir, fr.candidates, fr.origin))
+                    return {s, {Effect{SetForegroundWindow{*target}}}};
+                return {s, {}};
             },
         },
         e);

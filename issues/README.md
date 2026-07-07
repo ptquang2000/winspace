@@ -11,13 +11,13 @@ Win32/COM/DWM/hotkey/event-hook code = thin I/O adapters, verified by manual/smo
 **Tiling was dropped** ([ADR-0007](../docs/adr/0007-drop-tiling-no-window-geometry.md)):
 winspace owns no window geometry. It switches Workspaces and switches focus; it never moves
 or sizes a window. The old tiling slices (03 BSP, 04 multi-display fill, 07
-togglefloat/drag/fullscreen) are deleted; slice 05 is now spatial **focus** only.
+togglefloat/drag/fullscreen) are deleted; slice 05 was reduced to spatial **focus** only,
+and has since landed.
 
 ## Dependency graph
 
 ```
-01 ─┬─ 05  (spatial focus — landed eligibility gate is enough)
-    ├─ 06 ── 08   (rules reintroduce the hook adapter; launcher builds on it)
+01 ─┬─ 06 ── 08   (rules reintroduce the hook adapter; launcher builds on it)
     ├─ 09
     └─ 10
 ```
@@ -27,12 +27,11 @@ were removed from master with tiling — it is the hook's first genuine consumer
 
 | # | Title | Blocked by |
 |---|-------|-----------|
-| 05 | Spatial directional focus (`focus left/right/up/down`) | — (eligibility gate landed) |
 | 06 | Move-to-workspace + place-once rules with cloak-move (reintroduces the hook) | 01 |
 | 08 | Launcher: exec / exec-once with PID-match workspace assignment | 01, 06 |
 | 09 | Full config grammar + reload | 01 |
 | 10 | Autostart via Task Scheduler logon task | 01 |
 
 _Landed and no longer listed: 01 (walking skeleton), 02 (window tracking + eligibility —
-its positioning half is now removed, the eligibility gate survives), 11 (Win32/COM error
-handling), 12 (VM seam-test harness)._
+its positioning half is now removed, the eligibility gate survives), 05 (spatial directional
+focus), 11 (Win32/COM error handling), 12 (VM seam-test harness)._

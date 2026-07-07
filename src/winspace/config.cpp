@@ -9,7 +9,7 @@
 // adds directives, it never reshapes this parser):
 //   * `#` comments (whole-line or trailing)
 //   * `$name = tokens` variable definitions, referenced as `$name`
-//   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit })
+//   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit, focus })
 //
 // A malformed line yields a diagnostic and parsing continues. "Keep last good
 // config" retention and live reload are out of scope (issue 09).
@@ -71,25 +71,37 @@ enum class Key : uint8_t {
     Return, Space, Tab, Escape, Backspace,
 };
 
+// The direction a `focus` bind steers keyboard focus. A peer of Mod/Key/
+// Dispatcher, but nested in a namespace so it stays a DISTINCT type from
+// reducer::Direction (both would otherwise be winspace::Direction and collide in
+// the app/test TUs that include both headers). hotkeys.cpp's toEvent translates
+// this config::Direction → reducer::Direction at the seam.
+namespace config {
+enum class Direction : uint8_t { Left, Right, Up, Down };
+}
+
 // Dispatchers recognized this slice. An unknown name is diagnosed here, not
 // deferred to registration (task 05).
 enum class Dispatcher : uint8_t {
     Workspace,
     Quit,
+    Focus,
 };
 
-// A parsed bind line. `arg` carries the workspace number for Workspace; it is
-// unused (0) for Quit.
+// A parsed bind line. `arg` carries the workspace number for Workspace (unused,
+// 0, otherwise); `dir` carries the direction for Focus (unused, Left, otherwise).
+// A bind's key and its direction are independent fields.
 struct Bind {
     Mod mods = Mod::None;
     Key key{};
     Dispatcher dispatcher{};
     int arg = 0;
+    config::Direction dir{};
 };
 
 constexpr bool operator==(const Bind& a, const Bind& b) {
     return a.mods == b.mods && a.key == b.key &&
-           a.dispatcher == b.dispatcher && a.arg == b.arg;
+           a.dispatcher == b.dispatcher && a.arg == b.arg && a.dir == b.dir;
 }
 
 // A per-line problem. `line` is 1-based. Valid binds on other lines still parse.
@@ -215,6 +227,17 @@ inline std::optional<Key> parse_key(std::string_view t) {
 inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
     if (t == "workspace") return Dispatcher::Workspace;
     if (t == "quit") return Dispatcher::Quit;
+    if (t == "focus") return Dispatcher::Focus;
+    return std::nullopt;
+}
+
+// The four canonical direction words, case-insensitive, no aliases (users bind
+// whatever KEY they like to these — h/j/k/l are keys, not direction words).
+inline std::optional<config::Direction> parse_direction(std::string_view t) {
+    if (iequals(t, "left")) return config::Direction::Left;
+    if (iequals(t, "right")) return config::Direction::Right;
+    if (iequals(t, "up")) return config::Direction::Up;
+    if (iequals(t, "down")) return config::Direction::Down;
     return std::nullopt;
 }
 
@@ -369,6 +392,19 @@ inline ParseResult parse(std::string_view text) {
                     continue;
                 }
                 bind.arg = n;
+            } else if (*disp == Dispatcher::Focus) {
+                if (fields.size() < 4 || fields[3].empty()) {
+                    result.diagnostics.push_back(
+                        {line_no, "focus dispatcher needs a direction (left|right|up|down)"});
+                    continue;
+                }
+                const auto dir = parse_direction(fields[3]);
+                if (!dir) {
+                    result.diagnostics.push_back(
+                        {line_no, "unknown direction '" + std::string(fields[3]) + "'"});
+                    continue;
+                }
+                bind.dir = *dir;
             }
             // quit takes no argument; any extra field is ignored.
 

@@ -135,6 +135,12 @@ if (-not ([System.Management.Automation.PSTypeName]'Winspace.Native').Type) {
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
 
+    // The current foreground window — the independent OS Oracle for the spatial-
+    // focus seam (issue 05). winspace's SetForegroundWindow Effect must move THIS,
+    // asserted as a before/after delta around the `focus` chord.
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern System.IntPtr GetForegroundWindow();
+
     private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
     private const int DWMWA_CLOAKED = 14;
     private const uint MONITOR_DEFAULTTONEAREST = 2;
@@ -643,6 +649,9 @@ if ([CH.Keys]::RegisterHotKey([System.IntPtr]::Zero, 1, [uint32]$Modifiers, [uin
 # Thin PowerShell faces over the [Winspace.Native] statics: each returns a RECT
 # value type so callers compare fields directly. All read independent OS geometry,
 # never winspace's own log.
+# The current foreground window (the spatial-focus Oracle). Returns the top-level
+# HWND that owns the keyboard — compared against a test window's Hwnd as a delta.
+function Get-ForegroundWindow { [Winspace.Native]::GetForegroundWindow() }
 function Get-WindowRect  { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WindowRect($Hwnd) }
 function Get-FrameBounds { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::FrameBounds($Hwnd) }
 function Get-WorkArea    { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WorkAreaForWindow($Hwnd) }
@@ -862,6 +871,7 @@ Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState
     Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
     Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
     Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog,
+    Get-ForegroundWindow,
     Get-WindowRect, Get-FrameBounds, Get-WorkArea, Test-WindowCloaked, Find-WindowsByTitle,
     Test-RectNear, Test-RectEqual, Format-Rect,
     Start-TestWindow, Close-TestWindow, Stop-TestWindow, Move-Window

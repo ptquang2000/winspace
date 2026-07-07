@@ -21,8 +21,8 @@
 #include <vector>
 
 #include "io/error.cpp"          // lg:: levels — the shared I/O diagnostic sink
-#include "winspace/config.cpp"   // Bind, Mod, Key, Dispatcher
-#include "winspace/reducer.cpp"  // Event, WorkspaceSwitch, Quit
+#include "winspace/config.cpp"   // Bind, Mod, Key, Dispatcher, config::Direction
+#include "winspace/reducer.cpp"  // Event, WorkspaceSwitch, Quit, FocusMove, reducer::Direction
 
 namespace winspace::io {
 
@@ -69,12 +69,27 @@ inline UINT toWin32Vk(Key key) {
     }
 }
 
+// Translate the config semantic Direction to the reducer's own Direction — the
+// one place the two distinct-but-mirrored enums meet, exactly like the Mod→MOD_*
+// and Dispatcher→Event translations above/below (ADR-0008).
+inline reducer::Direction toReducerDir(config::Direction d) {
+    switch (d) {
+        case config::Direction::Left: return reducer::Direction::Left;
+        case config::Direction::Right: return reducer::Direction::Right;
+        case config::Direction::Up: return reducer::Direction::Up;
+        case config::Direction::Down: return reducer::Direction::Down;
+    }
+    return reducer::Direction::Left;  // unreachable for a parsed Direction
+}
+
 // ── Bind → Event ─────────────────────────────────────────────────────────────
-// The dispatcher picks the alternative; a workspace Bind's target is in arg.
+// The dispatcher picks the alternative; a workspace Bind's target is in arg, a
+// focus Bind's direction is in dir.
 inline Event toEvent(const Bind& bind) {
     switch (bind.dispatcher) {
         case Dispatcher::Workspace: return WorkspaceSwitch{bind.arg};
         case Dispatcher::Quit: return Quit{};
+        case Dispatcher::Focus: return FocusMove{toReducerDir(bind.dir)};
     }
     return Quit{};  // unreachable
 }

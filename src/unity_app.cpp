@@ -16,11 +16,14 @@
 // ── I/O adapters (own all <windows.h> / COM) ────────────────────────────────
 // Task 04 landed io/worker.cpp + io/app.cpp; task 05 landed io/hotkeys.cpp
 // (pulled in by io/app.cpp); task 06 landed io/vd_bridge.cpp (pulled in by
-// io/worker.cpp, which owns the bridge on its STA thread). io/window_hook.cpp
-// was removed with tiling (ADR-0007) — PRD 06 reintroduces it. io/error.cpp
-// holds the shared error vocabulary + diagnostic sink, so it precedes the adapters.
+// io/worker.cpp, which owns the bridge on its STA thread). issue 05 landed
+// io/probe.cpp — the reactive window sweep behind the `focus` dispatcher (pulled
+// in by io/worker.cpp). io/window_hook.cpp was removed with tiling (ADR-0007) —
+// PRD 06 reintroduces it. io/error.cpp holds the shared error vocabulary +
+// diagnostic sink, so it precedes the adapters.
 #include "io/error.cpp"
 #include "io/hotkeys.cpp"
+#include "io/probe.cpp"
 #include "io/vd_bridge.cpp"
 #include "io/worker.cpp"
 #include "io/app.cpp"

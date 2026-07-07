@@ -50,7 +50,16 @@ inline constexpr std::string_view k_defaultConfig =
     "bind = $mod, 3, workspace, 3\n"
     "bind = $mod, 4, workspace, 4\n"
     "bind = $mod, 5, workspace, 5\n"
-    "bind = $mod, Q, quit\n";
+    "bind = $mod, Q, quit\n"
+    "# Spatial focus: vim-style Win+h/j/k/l steer the keyboard to the nearest\n"
+    "# window in a direction. The bound key and the direction are independent\n"
+    "# fields, so rebind freely (e.g. to the arrow keys). NOTE: Win+L is reserved\n"
+    "# by Windows for Lock Workstation and cannot be captured — so `focus right`\n"
+    "# on it will skip-and-log; bind right to another key if you need it.\n"
+    "bind = $mod, H, focus, left\n"
+    "bind = $mod, J, focus, down\n"
+    "bind = $mod, K, focus, up\n"
+    "bind = $mod, L, focus, right\n";
 
 // Read an environment variable with the size-then-fill two-call pattern.
 // GetEnvironmentVariableW returns the length INCLUDING the null when probing with

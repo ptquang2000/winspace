@@ -92,11 +92,31 @@ _Avoid_: Ignored, unmanaged, Floating.
 
 **Spatial focus**:
 The resolution of a `focus left|right|up|down` Dispatcher. **Stateless**: at keypress the
-adapter enumerates the Eligible windows and Probes their rects, and the pure Reducer picks
-the nearest window in the requested direction across the virtual screen (crossing monitors
-naturally), emitting a `SetForegroundWindow` Effect. No focus order is persisted and no
-geometry is stored — the rects are read fresh each time, so they are never stale.
+adapter enumerates the windows and Probes their rects, and the pure Reducer picks the
+nearest Candidate in the requested Direction from the Origin across the virtual screen
+(crossing monitors naturally), emitting a `SetForegroundWindow` Effect. No focus order is
+persisted and no geometry is stored — the rects are read fresh each time, so they are never
+stale.
 _Avoid_: Directional tiling move, `movewindow` (the tile-swap dispatcher died with tiling).
+
+**Direction**:
+The `left | right | up | down` argument of a `focus` request — the axis and sense the
+resolution travels. Reasoned about in virtual-screen coordinates (Win32 convention: x grows
+right, y grows **down**, so `down` is +y and `up` is −y).
+_Avoid_: Arrow, way, side.
+
+**Origin**:
+The current foreground window at the moment a `focus` fires — the reference point the
+resolution measures *from*. Its Eligibility is irrelevant (an Ineligible window can still be
+an Origin) and it is never its own target. No Origin (nothing focused) → the request is a
+no-op.
+_Avoid_: Source, current, active.
+
+**Candidate**:
+An Eligible window, other than the Origin, that the resolution considers as a focus target.
+The Reducer keeps only Candidates lying ahead in the requested Direction; of those it prefers
+ones sharing the Origin's cross-axis band, then the nearest by centre distance.
+_Avoid_: Target (that's the single chosen one), option.
 
 **Probe**:
 A one-shot synchronous read of a window's live attributes (styles, cloak state, rect) taken

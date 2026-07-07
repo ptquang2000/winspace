@@ -118,6 +118,54 @@ TEST_CASE("a reference to an undefined variable is diagnosed", "[config]") {
     REQUIRE(result.diagnostics.size() == 1);
 }
 
+TEST_CASE("a focus bind parses to Bind{Focus, dir}, with key and direction independent", "[config]") {
+    // The bound KEY (Left arrow) and the DIRECTION word (right) are separate
+    // fields — pressing Super+Left here focuses to the right.
+    const auto result = parse("bind = SUPER, Left, focus, right\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.binds[0] ==
+            Bind{Mod::Super, Key::Left, Dispatcher::Focus, 0, config::Direction::Right});
+}
+
+TEST_CASE("all four focus directions parse, case-insensitively", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, H, focus, left\n"
+        "bind = SUPER, L, focus, RIGHT\n"    // upper-case
+        "bind = SUPER, K, focus, Up\n"       // mixed-case
+        "bind = SUPER, J, focus, down\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 4);
+    REQUIRE(result.config.binds[0].dir == config::Direction::Left);
+    REQUIRE(result.config.binds[1].dir == config::Direction::Right);
+    REQUIRE(result.config.binds[2].dir == config::Direction::Up);
+    REQUIRE(result.config.binds[3].dir == config::Direction::Down);
+}
+
+TEST_CASE("a focus bind with a missing direction is diagnosed while valid binds still load", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, 1, workspace, 1\n"
+        "bind = SUPER, Left, focus\n"       // no direction argument
+        "bind = SUPER, 2, workspace, 2\n");
+
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 2);
+    // The two valid binds on the other lines are unaffected.
+    REQUIRE(result.config.binds.size() == 2);
+    REQUIRE(result.config.binds[0] == Bind{Mod::Super, Key::N1, Dispatcher::Workspace, 1});
+    REQUIRE(result.config.binds[1] == Bind{Mod::Super, Key::N2, Dispatcher::Workspace, 2});
+}
+
+TEST_CASE("a focus bind with an unknown direction is diagnosed per-line", "[config]") {
+    const auto result = parse("bind = SUPER, Left, focus, sideways\n");
+
+    REQUIRE(result.config.binds.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+}
+
 TEST_CASE("changing $mod in one place re-modifies every bind that references it", "[config]") {
     const auto result = parse(
         "$mod = SUPER SHIFT\n"

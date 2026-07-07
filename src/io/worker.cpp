@@ -25,6 +25,7 @@
 #include <utility>  // std::move
 
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
+#include "io/probe.cpp"      // window Probe sweep + WindowId ⇄ HWND mint (focus)
 #include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
 #include "winspace/reducer.cpp"
 
@@ -155,6 +156,23 @@ private:
                 [&](const Exit&) {
                     // End run()'s loop; the process then unwinds cleanly.
                     PostQuitMessage(0);
+                },
+                [&](const ResolveFocus& rf) {
+                    // Phase one of the focus round-trip (ADR-0008): run the Probe
+                    // sweep and post the rects back to ourselves as a FocusResolve
+                    // Event, which the Reducer then resolves. The Worker stays a
+                    // mechanical executor — it never decides which window to focus.
+                    postEvent(m_hwnd, new Event{FocusResolve{rf.dir, probeTopLevelWindows(),
+                                                             probeForeground()}});
+                },
+                [&](const SetForegroundWindow& sf) {
+                    // Bare call, degrade-and-log (PRD 0005): a just-fired hotkey
+                    // usually satisfies Win32's foreground-lock, so this succeeds;
+                    // on failure we log and move on — never crash (null-bridge
+                    // precedent). The scoped AttachThreadInput recovery is deferred
+                    // until the Smoke seam proves the bare call insufficient.
+                    if (const auto set = ok(::SetForegroundWindow(toHwnd(sf.id))); !set)
+                        lg::warn("focus: SetForegroundWindow failed: {}", set.error());
                 },
             },
             effect);
