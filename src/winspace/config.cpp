@@ -9,7 +9,8 @@
 // adds directives, it never reshapes this parser):
 //   * `#` comments (whole-line or trailing)
 //   * `$name = tokens` variable definitions, referenced as `$name`
-//   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit, focus })
+//   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit,
+//     focus, movetoworkspace, movetoworkspacesilent })
 //
 // A malformed line yields a diagnostic and parsing continues. "Keep last good
 // config" retention and live reload are out of scope (issue 09).
@@ -86,11 +87,13 @@ enum class Dispatcher : uint8_t {
     Workspace,
     Quit,
     Focus,
+    MoveToWorkspace,        // movetoworkspace N — move + follow (switch to N)
+    MoveToWorkspaceSilent,  // movetoworkspacesilent N — move, stay on current
 };
 
-// A parsed bind line. `arg` carries the workspace number for Workspace (unused,
-// 0, otherwise); `dir` carries the direction for Focus (unused, Left, otherwise).
-// A bind's key and its direction are independent fields.
+// A parsed bind line. `arg` carries the workspace number for Workspace and the two
+// MoveToWorkspace forms (unused, 0, otherwise); `dir` carries the direction for
+// Focus (unused, Left, otherwise). A bind's key and its direction are independent fields.
 struct Bind {
     Mod mods = Mod::None;
     Key key{};
@@ -228,6 +231,8 @@ inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
     if (t == "workspace") return Dispatcher::Workspace;
     if (t == "quit") return Dispatcher::Quit;
     if (t == "focus") return Dispatcher::Focus;
+    if (t == "movetoworkspace") return Dispatcher::MoveToWorkspace;
+    if (t == "movetoworkspacesilent") return Dispatcher::MoveToWorkspaceSilent;
     return std::nullopt;
 }
 
@@ -376,7 +381,12 @@ inline ParseResult parse(std::string_view text) {
             bind.key = *key;
             bind.dispatcher = *disp;
 
-            if (*disp == Dispatcher::Workspace) {
+            // workspace and both movetoworkspace forms take a Logical workspace
+            // number in the same arg slot, parsed identically.
+            const bool needsWorkspaceArg = *disp == Dispatcher::Workspace ||
+                                           *disp == Dispatcher::MoveToWorkspace ||
+                                           *disp == Dispatcher::MoveToWorkspaceSilent;
+            if (needsWorkspaceArg) {
                 if (fields.size() < 4 || fields[3].empty()) {
                     result.diagnostics.push_back(
                         {line_no, "workspace dispatcher needs a workspace number"});

@@ -141,6 +141,24 @@ if (-not ([System.Management.Automation.PSTypeName]'Winspace.Native').Type) {
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern System.IntPtr GetForegroundWindow();
 
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, System.IntPtr dwExtraInfo);
+
+    // Make `h` the foreground window the legitimate way: a synthesized hardware
+    // click at its centre. Real input is exempt from focus-stealing prevention, so
+    // this reliably activates a window that a BACKGROUND process cannot bring
+    // forward with SetForegroundWindow — the cross-process cold-guest Origin problem,
+    // where the last-shown test window (a separate process) fails to take foreground.
+    public static void ClickToForeground(System.IntPtr h) {
+        RECT r; GetWindowRect(h, out r);
+        SetCursorPos((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
+        mouse_event(LEFTDOWN, 0, 0, 0, System.IntPtr.Zero);
+        mouse_event(LEFTUP, 0, 0, 0, System.IntPtr.Zero);
+    }
+
     private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
     private const int DWMWA_CLOAKED = 14;
     private const uint MONITOR_DEFAULTTONEAREST = 2;
@@ -213,6 +231,51 @@ if (-not ([System.Management.Automation.PSTypeName]'Winspace.Native').Type) {
 # Match winspace's physical-pixel coordinate space before any geometry read.
 [Winspace.Native]::MakeDpiAware()
 
+# ── Oracle: which Virtual Desktop a window lives on ──────────────────────────
+# The move-to-workspace seam (issue 06) needs independent truth for "which desktop
+# is this HWND on" — the same PUBLIC, documented IVirtualDesktopManager winspace
+# itself moves through (ADR-0010), but used here only to READ (GetWindowDesktopId),
+# never to move. Declared as a ComImport interface so PowerShell can cast the
+# CLSID_VirtualDesktopManager object to it; the returned GUID compares against
+# Get-VdState.Guids for a by-GUID membership assertion, never winspace's own log.
+if (-not ([System.Management.Automation.PSTypeName]'Winspace.Vdm').Type) {
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Winspace {
+    [ComImport, Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IVirtualDesktopManager {
+        [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, out int onCurrentDesktop);
+        [PreserveSig] int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+        [PreserveSig] int MoveWindowToDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.LPStruct)] Guid desktopId);
+    }
+    public static class Vdm {
+        // {aa509086-5ca9-4c25-8f95-589d3c07b48a} — CLSID_VirtualDesktopManager.
+        private static IVirtualDesktopManager Create() {
+            var t = Type.GetTypeFromCLSID(new Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a"));
+            return (IVirtualDesktopManager)Activator.CreateInstance(t);
+        }
+        public static Guid GetWindowDesktopId(IntPtr h) {
+            Guid id;
+            int hr = Create().GetWindowDesktopId(h, out id);
+            if (hr != 0) throw new Exception("GetWindowDesktopId hr=0x" + hr.ToString("X8"));
+            return id;
+        }
+    }
+}
+'@
+}
+
+# The desktop GUID a top-level window currently lives on — the move seam's Oracle.
+# Compared (by value) against Get-VdState.Guids[N-1] to prove a move landed on
+# workspace N, and against the unchanged CurrentGuid to prove a silent move stayed.
+function Get-WindowDesktopId {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][IntPtr]$Hwnd)
+    return [Winspace.Vdm]::GetWindowDesktopId($Hwnd)
+}
+
 # ── deploy layout ────────────────────────────────────────────────────────────
 # The host deploys everything under one root; WINSPACE_E2E_ROOT overrides it.
 function Get-WinspaceRoot {
@@ -246,11 +309,15 @@ function Assert-InteractiveSession {
 # reverse, in a single atomic SendInput batch — exactly how the OS sees a real
 # press, so RegisterHotKey (winspace) and the native VD hotkeys both fire.
 $script:ModVk = @{ 'WIN' = 0x5B; 'SUPER' = 0x5B; 'ALT' = 0x12; 'CTRL' = 0x11; 'CONTROL' = 0x11; 'SHIFT' = 0x10 }
+# Named (non-alphanumeric) keys a chord can end on — the arrow keys are what the
+# default `focus` binds use (Alt+Left/Right/Up/Down); extend as new binds need them.
+$script:NamedVk = @{ 'LEFT' = 0x25; 'UP' = 0x26; 'RIGHT' = 0x27; 'DOWN' = 0x28 }
 
 function Resolve-ChordVk {
     param([string]$Token)
     $u = $Token.ToUpperInvariant()
     if ($script:ModVk.ContainsKey($u)) { return $script:ModVk[$u] }
+    if ($script:NamedVk.ContainsKey($u)) { return $script:NamedVk[$u] }
     if ($u.Length -eq 1) {
         $c = $u[0]
         # '0'..'9' and 'A'..'Z' virtual-key codes equal their ASCII code points.
@@ -652,6 +719,10 @@ if ([CH.Keys]::RegisterHotKey([System.IntPtr]::Zero, 1, [uint32]$Modifiers, [uin
 # The current foreground window (the spatial-focus Oracle). Returns the top-level
 # HWND that owns the keyboard — compared against a test window's Hwnd as a delta.
 function Get-ForegroundWindow { [Winspace.Native]::GetForegroundWindow() }
+# Pin a window as the foreground Origin via a synthesized centre click. Real input
+# bypasses focus-stealing prevention, which a background process's SetForegroundWindow
+# does not — so this makes the Origin deterministic even on a cold guest.
+function Set-ForegroundByClick { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::ClickToForeground($Hwnd) }
 function Get-WindowRect  { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WindowRect($Hwnd) }
 function Get-FrameBounds { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::FrameBounds($Hwnd) }
 function Get-WorkArea    { param([Parameter(Mandatory)][IntPtr]$Hwnd) [Winspace.Native]::WorkAreaForWindow($Hwnd) }
@@ -701,7 +772,12 @@ function Start-TestWindow {
         [ValidateSet('sizable', 'tool', 'dialog')][string]$Style = 'sizable',
         [int]$X = 80, [int]$Y = 80, [int]$Width = 520, [int]$Height = 360,
         [string]$Title = 'winspace-test-window',
-        [int]$ReadyTimeoutSec = 12
+        # 30s (was 12): on a COLD, freshly-reverted guest, spawning a powershell +
+        # WinForms child — especially the 2nd in a seam — can exceed 12s just in
+        # process/JIT/assembly-load startup, timing out in setup before any Trigger
+        # fires. The generous ceiling only bites on a genuine hang; a healthy window
+        # still reports its HWND in ~1-2s (Wait-Until returns the instant it appears).
+        [int]$ReadyTimeoutSec = 30
     )
     $border = switch ($Style) {
         'sizable' { 'Sizable' }
@@ -871,7 +947,7 @@ Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState
     Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
     Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
     Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog,
-    Get-ForegroundWindow,
+    Get-ForegroundWindow, Set-ForegroundByClick, Get-WindowDesktopId,
     Get-WindowRect, Get-FrameBounds, Get-WorkArea, Test-WindowCloaked, Find-WindowsByTitle,
     Test-RectNear, Test-RectEqual, Format-Rect,
     Start-TestWindow, Close-TestWindow, Stop-TestWindow, Move-Window

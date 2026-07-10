@@ -63,11 +63,18 @@ from tiling and may be loosened for focus candidacy later.)*
 
 ## 5. Rules (app → workspace pinning) — *future, PRD 06*
 
-- Match order: **exe → class → title (regex)**. **Place-once**, no continuous enforcement;
-  assigns a Workspace only — never geometry.
-- Detect new windows at `EVENT_OBJECT_CREATE`, then **cloak → move → uncloak** (DWM
-  `DWMWA_CLOAK`) to avoid the cross-desktop placement flash.
-- PRD 06 reintroduces the `SetWinEventHook` adapter removed with tiling.
+- Match order: fixed field precedence **exe → class → title (regex)**, first match wins.
+  **Place-once**, no continuous enforcement; assigns a Workspace only — never geometry.
+- Detect new windows on the **`Appeared` edge** (`EVENT_OBJECT_SHOW` / `UNCLOAKED`, never raw
+  `CREATE` — the window is half-born there, per ADR-0006/0009), then move them to the target
+  Workspace. The internal move reassigns a window's desktop without painting it on the current
+  one, so there is no cross-desktop placement flash (an earlier DWM `DWMWA_CLOAK` wrap was
+  dropped — `DWMWA_CLOAK` is same-process-only and `E_ACCESSDENIED` on a foreign window).
+- The move uses the *internal* `IApplicationViewCollection::GetViewForHwnd` +
+  `IVirtualDesktopManagerInternal::MoveViewToDesktop` — see ADR-0010 — because the public
+  `IVirtualDesktopManager::MoveWindowToDesktop` returns `E_ACCESSDENIED` for windows winspace
+  does not own (proven on the VM), which is every window it actually moves.
+- PRD 06 reintroduces the `SetWinEventHook` adapter removed with tiling, on its own thread.
 
 ---
 

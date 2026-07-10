@@ -6,7 +6,7 @@
 > [ADR-0007](../docs/adr/0007-drop-tiling-no-window-geometry.md), winspace owns no window
 > geometry. A launched app's first window is matched by PID and assigned to a target
 > *Workspace* (via 06's cloak-move path); it is never moved or sized on screen. Depends on the
-> hook adapter that 06 reintroduces.
+> hook adapter that 07 reintroduces (to catch the app's first window on `Appeared`).
 
 ## What to build
 
@@ -27,4 +27,5 @@ on reload (does not relaunch an already-running app).
 ## Blocked by
 
 - 01
-- 06
+- 06 (the cloak-move / VD move path)
+- 07 (the hook adapter + `Appeared` stream, to catch the first window by PID)

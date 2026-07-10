@@ -51,15 +51,24 @@ inline constexpr std::string_view k_defaultConfig =
     "bind = $mod, 4, workspace, 4\n"
     "bind = $mod, 5, workspace, 5\n"
     "bind = $mod, Q, quit\n"
-    "# Spatial focus: vim-style Win+h/j/k/l steer the keyboard to the nearest\n"
-    "# window in a direction. The bound key and the direction are independent\n"
-    "# fields, so rebind freely (e.g. to the arrow keys). NOTE: Win+L is reserved\n"
-    "# by Windows for Lock Workstation and cannot be captured — so `focus right`\n"
-    "# on it will skip-and-log; bind right to another key if you need it.\n"
-    "bind = $mod, H, focus, left\n"
-    "bind = $mod, J, focus, down\n"
-    "bind = $mod, K, focus, up\n"
-    "bind = $mod, L, focus, right\n";
+    "# Spatial focus: vim-style Alt + h/j/k/l steer the keyboard to the nearest window\n"
+    "# in a direction. Alt (not $mod) because Windows reserves the whole Win+h/j/k/l set\n"
+    "# even under NoWinKeys (Win+J is Explorer's, Win+K/L are system-reserved), while\n"
+    "# Alt+h/j/k/l registers cleanly. The bound key and the direction are independent\n"
+    "# fields, so rebind freely (e.g. to the arrow keys).\n"
+    "bind = ALT, H, focus, left\n"
+    "bind = ALT, J, focus, down\n"
+    "bind = ALT, K, focus, up\n"
+    "bind = ALT, L, focus, right\n"
+    "# Move the focused window to a workspace (Super+Shift+<n>, the hyprland idiom).\n"
+    "# `movetoworkspacesilent` moves it but leaves you where you are; the plain\n"
+    "# `movetoworkspace` would also follow the window (switch the active desktop to N).\n"
+    "# A cross-desktop move is cloaked (DWM) around the move so it never flashes here.\n"
+    "bind = $mod SHIFT, 1, movetoworkspacesilent, 1\n"
+    "bind = $mod SHIFT, 2, movetoworkspacesilent, 2\n"
+    "bind = $mod SHIFT, 3, movetoworkspacesilent, 3\n"
+    "bind = $mod SHIFT, 4, movetoworkspacesilent, 4\n"
+    "bind = $mod SHIFT, 5, movetoworkspacesilent, 5\n";
 
 // Read an environment variable with the size-then-fill two-call pattern.
 // GetEnvironmentVariableW returns the length INCLUDING the null when probing with

@@ -94,7 +94,18 @@ struct FocusResolve {
     std::optional<WindowAttrs> origin;      // the foreground window; nullopt => no-op
 };
 
-using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve>;
+// movetoworkspace / movetoworkspacesilent (issue 06): move the FOREGROUND window
+// to a Logical workspace. `follow` = the plain form (the active desktop also
+// becomes N); the silent form stays put. Ungated by Eligibility — the user aimed
+// at the foreground window explicitly. Unlike focus (ADR-0008) there is no pure
+// decision to make, so no probe round-trip: the Worker resolves the foreground
+// window inline at execute time (degrade-and-log if there is none).
+struct MoveToWorkspace {
+    int logical = 0;    // target Logical workspace number
+    bool follow = false;
+};
+
+using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
 // Worker thread against the COM bridge; the Reducer itself performs no I/O. No
@@ -114,7 +125,17 @@ struct SetForegroundWindow {
     WindowId id{};
 };
 
-using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow>;
+// Move the foreground window to a Logical workspace (resolved to a GUID in the
+// bridge, ADR-0010; the target is materialized on demand WITHOUT switching). The
+// Worker wraps the DWM cloak/uncloak around the bridge call. Assigns a Workspace
+// only — never geometry (ADR-0007). The plain (follow) form additionally emits a
+// SwitchToWorkspace; the silent form does not.
+struct MoveForegroundWindowToWorkspace {
+    int logical = 0;
+};
+
+using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
+                            MoveForegroundWindowToWorkspace>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -129,6 +150,13 @@ constexpr bool operator==(const ResolveFocus& a, const ResolveFocus& b) {
 }
 constexpr bool operator==(const SetForegroundWindow& a, const SetForegroundWindow& b) {
     return a.id == b.id;
+}
+constexpr bool operator==(const MoveToWorkspace& a, const MoveToWorkspace& b) {
+    return a.logical == b.logical && a.follow == b.follow;
+}
+constexpr bool operator==(const MoveForegroundWindowToWorkspace& a,
+                          const MoveForegroundWindowToWorkspace& b) {
+    return a.logical == b.logical;
 }
 
 // Value equality for the plain-data window types (used by the eligibility tests
@@ -299,6 +327,18 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 if (const auto target = resolveFocus(fr.dir, fr.candidates, fr.origin))
                     return {s, {Effect{SetForegroundWindow{*target}}}};
                 return {s, {}};
+            },
+            // Always move the foreground window to N; the plain (follow) form ALSO
+            // switches the active desktop to N, the silent form does not. The move
+            // Effect is emitted FIRST so the Worker reads the still-current active
+            // desktop for its cloak decision before any follow-on switch lands.
+            [&](const MoveToWorkspace& m) -> ReduceResult {
+                std::vector<Effect> effects{Effect{MoveForegroundWindowToWorkspace{m.logical}}};
+                if (!m.follow) return {s, std::move(effects)};
+                State next = s;
+                next.currentWorkspace = m.logical;
+                effects.push_back(Effect{SwitchToWorkspace{m.logical}});
+                return {next, std::move(effects)};
             },
         },
         e);

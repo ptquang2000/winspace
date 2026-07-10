@@ -118,6 +118,48 @@ TEST_CASE("a reference to an undefined variable is diagnosed", "[config]") {
     REQUIRE(result.diagnostics.size() == 1);
 }
 
+TEST_CASE("movetoworkspace and movetoworkspacesilent bind with a workspace number", "[config]") {
+    const auto result = parse(
+        "bind = SUPER SHIFT, 3, movetoworkspace, 3\n"
+        "bind = SUPER SHIFT, 4, movetoworkspacesilent, 4\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 2);
+    REQUIRE(result.config.binds[0] ==
+            Bind{Mod::Super | Mod::Shift, Key::N3, Dispatcher::MoveToWorkspace, 3});
+    REQUIRE(result.config.binds[1] ==
+            Bind{Mod::Super | Mod::Shift, Key::N4, Dispatcher::MoveToWorkspaceSilent, 4});
+}
+
+TEST_CASE("the move-to-workspace target is independent of the bound key", "[config]") {
+    // Super+Shift+1 moves the window to workspace 6 — arg is not derived from the key.
+    const auto result = parse("bind = SUPER SHIFT, 1, movetoworkspacesilent, 6\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.binds[0] ==
+            Bind{Mod::Super | Mod::Shift, Key::N1, Dispatcher::MoveToWorkspaceSilent, 6});
+}
+
+TEST_CASE("a movetoworkspace with a malformed number is diagnosed while valid binds still parse", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, 1, movetoworkspace, two\n"   // malformed N
+        "bind = SUPER, 2, movetoworkspace, 2\n");
+
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);  // collect-and-continue, mirroring workspace
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.binds[0] == Bind{Mod::Super, Key::N2, Dispatcher::MoveToWorkspace, 2});
+}
+
+TEST_CASE("a movetoworkspace with a missing number is diagnosed", "[config]") {
+    const auto result = parse("bind = SUPER, 1, movetoworkspacesilent\n");
+
+    REQUIRE(result.config.binds.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+}
+
 TEST_CASE("a focus bind parses to Bind{Focus, dir}, with key and direction independent", "[config]") {
     // The bound KEY (Left arrow) and the DIRECTION word (right) are separate
     // fields — pressing Super+Left here focuses to the right.

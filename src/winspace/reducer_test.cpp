@@ -74,6 +74,45 @@ TEST_CASE("reduce is pure — same inputs yield same Effects and leave the input
     REQUIRE(s.running);
 }
 
+// ── move-to-workspace: the move Effect, and follow vs. silent (issue 06) ──────
+
+TEST_CASE("movetoworkspace (follow) emits the move then the switch", "[reducer]") {
+    const auto r = reduce(State{.currentWorkspace = 1, .running = true},
+                          MoveToWorkspace{3, true});
+
+    // Two Effects, in order: move the foreground window, THEN follow it to N.
+    REQUIRE(r.effects.size() == 2);
+    REQUIRE(std::holds_alternative<MoveForegroundWindowToWorkspace>(r.effects[0]));
+    REQUIRE(std::get<MoveForegroundWindowToWorkspace>(r.effects[0]) ==
+            MoveForegroundWindowToWorkspace{3});
+    REQUIRE(std::holds_alternative<SwitchToWorkspace>(r.effects[1]));
+    REQUIRE(std::get<SwitchToWorkspace>(r.effects[1]) == SwitchToWorkspace{3});
+    // Following advances the active workspace, exactly as a bare WorkspaceSwitch would.
+    REQUIRE(r.state.currentWorkspace == 3);
+}
+
+TEST_CASE("movetoworkspacesilent emits only the move and stays on the current workspace", "[reducer]") {
+    const auto r = reduce(State{.currentWorkspace = 2, .running = true},
+                          MoveToWorkspace{5, false});
+
+    // Exactly one Effect — the move; no switch.
+    REQUIRE(single_effect<MoveForegroundWindowToWorkspace>(r) ==
+            MoveForegroundWindowToWorkspace{5});
+    // Silent leaves the active workspace where it was.
+    REQUIRE(r.state.currentWorkspace == 2);
+}
+
+TEST_CASE("a silent move to the workspace already current still emits the move", "[reducer]") {
+    // Same-desktop is not the Reducer's call — it emits the move unconditionally and
+    // lets the Worker decide the cloak is unnecessary (target == current).
+    const auto r = reduce(State{.currentWorkspace = 3, .running = true},
+                          MoveToWorkspace{3, false});
+
+    REQUIRE(single_effect<MoveForegroundWindowToWorkspace>(r) ==
+            MoveForegroundWindowToWorkspace{3});
+    REQUIRE(r.state.currentWorkspace == 3);
+}
+
 // ── eligibility: the pure window gate (substrate for focus + rules) ──────────
 
 namespace {

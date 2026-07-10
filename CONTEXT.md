@@ -124,11 +124,39 @@ A one-shot synchronous read of a window's live attributes (styles, cloak state, 
 a timer. In PRD 06 the parked hook adapter will also Probe on a lifecycle edge.
 _Avoid_: Poll, scan, snapshot-loop (there is no interval).
 
-**Appeared / Vanished** *(parked — PRD 06)*:
-The window-lifecycle edges (`EVENT_OBJECT_SHOW` / `UNCLOAKED` and `DESTROY` / `HIDE` /
-`CLOAKED`) delivered by a `SetWinEventHook` adapter. Removed from master with tiling; PRD 06
-(window rules) — the hook's first genuine consumer — reintroduces them. Defined here only so
-the term is stable when 06 lands; there is no live `Appeared` / `Vanished` today.
+**Appeared / Vanished** *(PRD 06)*:
+The window-lifecycle edges delivered by a `SetWinEventHook` adapter. **Appeared** =
+`EVENT_OBJECT_SHOW` / `EVENT_OBJECT_UNCLOAKED` (never raw `CREATE` — the window is half-born
+there and misclassifies, per [ADR-0006](docs/adr/0006-window-tracking-probe-decide-seam.md));
+**Vanished** = `EVENT_OBJECT_DESTROY` / `HIDE` / `CLOAKED`. Removed from master with tiling;
+PRD 06 (window rules) — the hook's first genuine consumer — reintroduces them. `Appeared`
+carries a Probed `WindowAttrs` (the Eligibility facts) **and** a `WindowIdentity` (exe / class
+/ title for matching); `Vanished` carries just a `WindowId`. Not yet in master — the code
+lands with PRD 06.
+
+**WindowRule**:
+A parsed `windowrule` that pins a matching app to a target Workspace on `Appeared`. One rule
+names **one** match field and a pattern (`exe:…`, `class:…`, or `title:…`); `exe`/`class`
+match case-insensitively and exactly, `title` is a regex. Rules are evaluated in the fixed
+field precedence **exe → class → title** (config order breaks within-field ties), first match
+wins. **Place-once** (see below) and Workspace-only — never geometry.
+_Avoid_: windowrulev2, layer rule.
+
+**WindowIdentity**:
+The string half of a window Probe — `exe` (process image basename), `windowClass`, `title` —
+gathered only on the `Appeared` path (rules need it; the focus sweep never does, so it stays
+off that hot path). Plain UTF-8 `std::string`, narrowed at the adapter so the core stays
+`wchar_t`-free. Distinct from `WindowAttrs`, which carries the Eligibility bools + rect.
+_Avoid_: WindowInfo, metadata.
+
+**Place-once**:
+The rule that a `WindowRule` assigns a window a Workspace **exactly once in its lifetime** and
+never re-asserts it — a window the user later moves is not yanked back. Enforced by a bounded
+`placed` set of `WindowId` in `State`: an id is inserted on its first `Appeared` (matched or
+not) and erased on `Vanished`. This is the deliberate, bounded reintroduction of window state
+that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md) records against ADR-0007's
+otherwise stateless window side.
+_Avoid_: continuous enforcement, pinning-forever.
 
 ### Threads
 
@@ -139,8 +167,17 @@ Events and hands them to the Worker thread. Does no domain logic.
 **Worker thread**:
 The single thread that owns the State, runs the Reducer, executes the emitted Effects, and
 is the sole owner of the COM Virtual Desktop bridge (STA). It also runs the Spatial focus
-Probe sweep and, in PRD 06, will own the reintroduced hook adapter.
+Probe sweep. It does **not** own the hook adapter — that is its own thread (below), which only
+produces `Appeared` / `Vanished` Events for the Worker to reduce.
 _Avoid_: Main thread, UI thread (winspace is windowless — there is no UI thread).
+
+**Hook thread** *(PRD 06)*:
+The dedicated thread that owns the `SetWinEventHook` adapter (`WINEVENT_OUTOFCONTEXT`),
+mirroring the Hotkey thread: its callback runs the noise gate, Probes the window, and posts an
+`Appeared` / `Vanished` Event to the Worker — no domain logic, no State. Kept off the Worker
+thread so hook delivery never queues behind a blocking Effect (a `SwitchDesktop` or the
+cloak-move round-trip). Reintroduced with PRD 06; removed from master with tiling.
+_Avoid_: Event thread, watcher thread.
 
 ### VM seam testing
 

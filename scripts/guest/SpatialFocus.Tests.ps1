@@ -24,6 +24,14 @@ BeforeAll {
     # top-level window, so leaving it visible would make it a stray focus Candidate.
     # Hide it for the duration; restored in AfterAll.
     Set-RunnerConsoleVisible $false
+    # A cold, freshly-reverted guest can auto-open the Widgets board — a full-height
+    # left-side flyout that HOLDS the foreground and covers where the test windows
+    # open, so the left window can never become the foreground Origin (confirmed by a
+    # failure screenshot). Kill its host so the desktop is clear before staging windows;
+    # it does not reopen without a user trigger. This was the real cause of the
+    # intermittent cold-guest failure, not the Start-TestWindow / Origin timeouts.
+    Get-Process -Name 'Widgets' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 AfterAll {
@@ -32,12 +40,11 @@ AfterAll {
 
 Describe 'spatial-focus' {
 
-    # The seeded default config (src/io/app.cpp) binds vim-style Win+L to `focus
-    # right` (Win+<letter> registers under the same NoWinKeys policy baked into the
-    # winspace-e2e-nowinkeys snapshot as the Win+<n> workspace chords). On stock
-    # Windows, Win+L is reserved for Lock Workstation and can't be captured — the
-    # snapshot disables that (DisableLockWorkstation), so the chord reaches
-    # winspace and this seam can drive the real default `focus right` binding.
+    # The seeded default config (src/io/app.cpp) binds vim-style Alt + h/j/k/l to
+    # `focus` (Alt+L → focus right). Alt (not Win) because Windows reserves the whole
+    # Win+h/j/k/l set even under NoWinKeys, whereas Alt+<letter> registers cleanly —
+    # verified by direct RegisterHotKey probe on this guest. This seam drives the real
+    # default `focus right` binding.
     It 'focus-right: a "focus right" chord moves the foreground to the window on the right' -Tag 'spatial-focus' {
         $winspace = $null
         $left = $null
@@ -52,14 +59,18 @@ Describe 'spatial-focus' {
             $right = Start-TestWindow -Style sizable -X 520 -Y 120 -Width 360 -Height 300 -Title 'winspace-focus-right'
             $left = Start-TestWindow -Style sizable -X 80 -Y 120 -Width 360 -Height 300 -Title 'winspace-focus-left'
 
-            # Confirm the Origin: the left window holds the keyboard before the press.
-            Wait-Until -Because 'the left window to be the foreground Origin' -Condition {
+            # Pin the Origin deterministically: on a cold guest the last-shown window
+            # (a separate process) is NOT guaranteed the foreground — focus-stealing
+            # prevention blocks a background process's activation. A synthesized click
+            # is real input, so it legitimately brings the left window forward.
+            Set-ForegroundByClick -Hwnd $left.Hwnd
+            Wait-Until -TimeoutSec 15 -Because 'the left window to be the foreground Origin' -Condition {
                 (Get-ForegroundWindow) -eq $left.Hwnd
             }
 
-            # Act: Win+L → focus right. winspace probes live rects, resolves the right
-            # window as the nearest Eligible Candidate ahead, and brings it foreground.
-            Send-Chord 'Win+L'
+            # Act: Alt+L → focus right. winspace probes live rects, resolves the right
+            # window as the nearest Eligible Candidate ahead, brings it foreground.
+            Send-Chord 'Alt+L'
 
             Wait-Until -Because 'the foreground to move to the right window' -Condition {
                 (Get-ForegroundWindow) -eq $right.Hwnd

@@ -83,13 +83,16 @@ inline reducer::Direction toReducerDir(config::Direction d) {
 }
 
 // ── Bind → Event ─────────────────────────────────────────────────────────────
-// The dispatcher picks the alternative; a workspace Bind's target is in arg, a
-// focus Bind's direction is in dir.
+// The dispatcher picks the alternative; a workspace / move Bind's target is in
+// arg, a focus Bind's direction is in dir. The two move forms differ only in the
+// follow bit (plain → follow, silent → stay).
 inline Event toEvent(const Bind& bind) {
     switch (bind.dispatcher) {
         case Dispatcher::Workspace: return WorkspaceSwitch{bind.arg};
         case Dispatcher::Quit: return Quit{};
         case Dispatcher::Focus: return FocusMove{toReducerDir(bind.dir)};
+        case Dispatcher::MoveToWorkspace: return MoveToWorkspace{bind.arg, true};
+        case Dispatcher::MoveToWorkspaceSilent: return MoveToWorkspace{bind.arg, false};
     }
     return Quit{};  // unreachable
 }

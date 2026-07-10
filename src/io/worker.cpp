@@ -174,6 +174,23 @@ private:
                     if (const auto set = ok(::SetForegroundWindow(toHwnd(sf.id))); !set)
                         lg::warn("focus: SetForegroundWindow failed: {}", set.error());
                 },
+                [&](const MoveForegroundWindowToWorkspace& m) {
+                    // Ungated by Eligibility (issue 06): the user aimed at the
+                    // foreground window explicitly. Resolve it inline — no probe
+                    // round-trip, since there is no pure decision to make. No bridge
+                    // or no foreground window → degrade-and-log, never crash. The
+                    // internal MoveViewToDesktop reassigns the window's desktop
+                    // without ever painting it on the current one, so no DWM cloak
+                    // is needed (and DWMWA_CLOAK is same-process-only anyway — it
+                    // returns E_ACCESSDENIED on a foreign window; ADR-0010 revised).
+                    if (!m_bridge) return;
+                    const HWND fg = GetForegroundWindow();
+                    if (!fg) {
+                        lg::warn("move to workspace {}: no foreground window", m.logical);
+                        return;
+                    }
+                    m_bridge->moveWindowToWorkspace(toWindowId(fg), m.logical);
+                },
             },
             effect);
     }

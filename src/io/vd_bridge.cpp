@@ -36,6 +36,7 @@
 #include <format>
 
 #include "io/error.cpp"  // io::Error vocabulary (ok() wrappers, formatter) + lg:: levels
+#include "io/probe.cpp"  // toHwnd — the WindowId → HWND reverse-mint for the move call
 
 namespace winspace::io {
 
@@ -56,6 +57,14 @@ public:
     // The Logical workspace active at startup, seeded from the OS active desktop
     // during adoption. Lets the Worker align its State with reality on boot.
     virtual int currentWorkspace() const = 0;
+
+    // Move a window to the Logical workspace, materializing the target on demand
+    // WITHOUT switching to it (ADR-0010, revised). Implemented with the INTERNAL
+    // IApplicationViewCollection::GetViewForHwnd + MoveViewToDesktop — the public
+    // IVirtualDesktopManager::MoveWindowToDesktop returns E_ACCESSDENIED for windows
+    // the caller does not own, which is precisely winspace's case (a foreground app
+    // window from another process). Returns true iff the move landed.
+    virtual bool moveWindowToWorkspace(WindowId window, int logical) = 0;
 };
 
 // ── hand-declared undocumented COM ABI (RE lineage; see file header) ─────────
@@ -71,6 +80,14 @@ inline constexpr GUID k_clsidImmersiveShell = {
     0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
 inline constexpr GUID k_clsidVirtualDesktopManagerInternal = {
     0xC5E0CDCA, 0x7B6E, 0x41B2, {0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B}};
+
+// IID_IApplicationViewCollection — the service id AND interface id (QueryService
+// uses the same GUID for both). Stable across Win10/11 builds. GetViewForHwnd on
+// this turns an HWND into the IApplicationView that MoveViewToDesktop consumes,
+// which is how a FOREIGN window is moved (the public MoveWindowToDesktop returns
+// E_ACCESSDENIED for windows the caller does not own — see ADR-0010 revision).
+inline constexpr GUID k_iidApplicationViewCollection = {
+    0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
 
 // IID_IVirtualDesktop — 24H2 / build 26100 (VirtualDesktop11-24H2.cs). Passed to
 // IObjectArray::GetAt to fetch each desktop as this element type.
@@ -144,6 +161,20 @@ IVirtualDesktopManagerInternal : public IUnknown {
     STDMETHOD(WaitForAnimationToComplete)() = 0;                                 // 24
 };
 
+// IApplicationViewCollection — the undocumented HWND→IApplicationView resolver
+// (MScholtes lineage). Only GetViewForHwnd (slot 6) is called; slots 3–5 are
+// declared solely to fix its vtable offset (params we never pass are void*,
+// ABI-identical). This is the second internal interface ADR-0010 was revised to
+// re-admit: MoveViewToDesktop needs an IApplicationView, and only this yields one
+// from an HWND — the price of moving windows the caller does not own.
+MIDL_INTERFACE("1841C6D7-4F9D-42C0-AF41-8747538F10E5")
+IApplicationViewCollection : public IUnknown {
+    STDMETHOD(GetViews)(IObjectArray** ppViews) = 0;                             // 3
+    STDMETHOD(GetViewsByZOrder)(IObjectArray** ppViews) = 0;                     // 4
+    STDMETHOD(GetViewsByAppUserModelId)(void* id, IObjectArray** ppViews) = 0;   // 5
+    STDMETHOD(GetViewForHwnd)(void* hwnd, IApplicationView** ppView) = 0;        // 6
+};
+
 }  // namespace vd
 
 // ── variant identity + diagnostics ──────────────────────────────────────────
@@ -215,10 +246,32 @@ class VirtualDesktop24H2Bridge final : public IVirtualDesktopBridge {
 public:
     // Takes the already-QI'd manager (its S_OK proved the vtable) and runs
     // adoption immediately, binding pre-existing desktops to logical 1..N by GUID.
-    explicit VirtualDesktop24H2Bridge(
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager)
+    // Takes the already-QI'd internal manager (its S_OK proved the vtable) plus the
+    // ImmersiveShell service provider used to acquire the view collection. Runs
+    // adoption immediately, binding pre-existing desktops to logical 1..N by GUID.
+    VirtualDesktop24H2Bridge(
+        Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager,
+        Microsoft::WRL::ComPtr<IServiceProvider> shell)
         : m_manager(std::move(manager)) {
         adopt();
+
+        // Acquire the internal IApplicationViewCollection (ADR-0010, revised): the
+        // move path needs an IApplicationView for the target HWND, and only
+        // GetViewForHwnd yields one. QueryService takes the same GUID for the service
+        // and the interface. A failure degrades move-to-workspace to a no-op (loud
+        // diagnostic); switch / enumerate are unaffected.
+        auto views = ok([&](vd::IApplicationViewCollection** pp) {
+            return shell->QueryService(vd::k_iidApplicationViewCollection,
+                                       vd::k_iidApplicationViewCollection,
+                                       reinterpret_cast<void**>(pp));
+        });
+        if (views) {
+            m_viewCollection = std::move(*views);
+        } else {
+            lg::error("virtual desktop bridge: QueryService(IApplicationViewCollection) failed "
+                      "— move-to-workspace disabled: {}",
+                      views.error());
+        }
     }
 
     bool switchTo(int logical) override {
@@ -249,6 +302,35 @@ public:
     }
 
     int currentWorkspace() const override { return m_current; }
+
+    // Move `window` to Logical workspace `logical` (ADR-0010, revised): resolve the
+    // HWND to its IApplicationView, resolve the target desktop — materializing
+    // (create + bind, NO switch) on a miss — then MoveViewToDesktop. The internal
+    // path is what moves a FOREIGN window; the public HWND API cannot. Null view
+    // collection (acquisition failed) → no-op.
+    bool moveWindowToWorkspace(WindowId window, int logical) override {
+        if (!m_manager || !m_viewCollection) return false;
+
+        auto view = ok([&](vd::IApplicationView** pp) {
+            return m_viewCollection->GetViewForHwnd(toHwnd(window), pp);
+        });
+        if (!view) {
+            lg::error("move window to workspace {}: GetViewForHwnd: {}", logical, view.error());
+            return false;
+        }
+        const std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> desktop =
+            resolveMoveTarget(logical);
+        if (!desktop) {
+            lg::error("{}", desktop.error());
+            return false;
+        }
+        if (const auto moved = ok(m_manager->MoveViewToDesktop((*view).Get(), (*desktop).Get()));
+            !moved) {
+            lg::error("move window to workspace {}: {}", logical, moved.error());
+            return false;
+        }
+        return true;
+    }
 
 private:
     // Bind every pre-existing desktop to logical 1..N by GUID and seed the current
@@ -344,9 +426,11 @@ private:
         return std::unexpected(Error{NotFound{}, std::source_location::current()});
     }
 
-    // Create exactly ONE desktop (appended at the tail), bind logical→GUID, switch.
-    // No intermediate filling, no clamp (ADR-0003). Recovers a NotFound from switchTo.
-    std::expected<Success, Error> materialize(int logical) {
+    // Create exactly ONE desktop (appended at the tail) and bind logical→GUID,
+    // WITHOUT switching. No intermediate filling, no clamp (ADR-0003). The shared
+    // root of materialize (which then switches) and the move path (which needs the
+    // target to exist but must not steal focus unless following) — ADR-0010.
+    std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> createAndBind(int logical) {
         auto created = ok(
             [&](vd::IVirtualDesktop** pp) { return m_manager->CreateDesktop(pp); });
         if (!created) return std::unexpected(created.error());
@@ -354,7 +438,30 @@ private:
         if (const auto r = ok((*created)->GetID(&id)); !r)
             return std::unexpected(r.error());
         m_logicalToGuid[logical] = id;
-        return doSwitch(logical, (*created).Get());
+        return *created;
+    }
+
+    // Create-and-bind, then switch — the switchTo recovery path. Recovers a NotFound
+    // from switchTo by materializing the workspace and landing on it.
+    std::expected<Success, Error> materialize(int logical) {
+        return createAndBind(logical).and_then(
+            [&](const Microsoft::WRL::ComPtr<vd::IVirtualDesktop>& desktop) {
+                return doSwitch(logical, desktop.Get());
+            });
+    }
+
+    // Resolve the live target desktop for a move: a live binding hands back its
+    // desktop; a missing or vanished one is re-materialized (create + bind, no
+    // switch). A genuine OS/enumeration error propagates unchanged.
+    std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> resolveMoveTarget(
+        int logical) {
+        return resolveBinding(logical).or_else(
+            [&](const Error& e) -> std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>,
+                                                 Error> {
+                if (!std::holds_alternative<NotFound>(e.code))
+                    return std::unexpected(e);
+                return createAndBind(logical);
+            });
     }
 
     // Call SwitchDesktop and, on success, record the new current workspace. The
@@ -368,6 +475,7 @@ private:
     }
 
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> m_manager;
+    Microsoft::WRL::ComPtr<vd::IApplicationViewCollection> m_viewCollection;  // HWND→view (move)
     std::unordered_map<int, GUID> m_logicalToGuid;  // logical workspace → desktop identity
     int m_current = 1;
 };
@@ -456,7 +564,10 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
         case VdVariant::W24H2:
             lg::info("virtual desktop bridge: matched IID {} ({}) — 24H2 variant", iidName,
                      buildStr);
-            return std::make_unique<VirtualDesktop24H2Bridge>(std::move(*winner.manager));
+            // The bridge needs the shell service provider too, to QueryService the
+            // IApplicationViewCollection for the move path (ADR-0010, revised).
+            return std::make_unique<VirtualDesktop24H2Bridge>(std::move(*winner.manager),
+                                                              std::move(*shell));
 
         case VdVariant::W23H2KB:
             lg::warn(
