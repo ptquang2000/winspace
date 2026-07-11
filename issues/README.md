@@ -17,24 +17,23 @@ has since landed. The number **07** is now reused for the windowrule slice.
 ## Dependency graph
 
 ```
-01 ─┬─ 06 ── 07 ── 08   (06 builds the VD move + cloak-move; 07 reintroduces the
-    │                    hook for rules; 08's launcher builds on both)
+01 ─┬─ 08   (08's launcher builds on the VD move (06) and the hook/rules (07),
+    │        both now landed)
     ├─ 09
     └─ 10
 ```
 
-`07` reintroduces the `SetWinEventHook` adapter and the `Appeared` / `Vanished` stream that
-were removed from master with tiling — it is the hook's first genuine consumer. `06` builds the
-Virtual Desktop move path + cloak-move that `07` and `08` reuse, and needs no hook itself.
+`08`'s launcher reuses the Virtual Desktop move path from `06` and the `SetWinEventHook`
+adapter / `Appeared` / `Vanished` stream reintroduced by `07` — both landed, so `08` is
+unblocked.
 
 | # | Title | Blocked by |
 |---|-------|-----------|
-| 06 | Move-to-workspace command with cloak-move (public VD move path) | 01 |
-| 07 | windowrule place-once rules (reintroduces the hook) | 06 |
 | 08 | Launcher: exec / exec-once with PID-match workspace assignment | 01, 06, 07 |
 | 09 | Full config grammar + reload | 01 |
 | 10 | Autostart via Task Scheduler logon task | 01 |
 
 _Landed and no longer listed: 01 (walking skeleton), 02 (window tracking + eligibility —
 its positioning half is now removed, the eligibility gate survives), 05 (spatial directional
-focus), 11 (Win32/COM error handling), 12 (VM seam-test harness)._
+focus), 06 (move-to-workspace via internal VD move), 07 (windowrule place-once rules —
+reintroduced the hook), 11 (Win32/COM error handling), 12 (VM seam-test harness)._
