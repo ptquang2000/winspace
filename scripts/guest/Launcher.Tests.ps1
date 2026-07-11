@@ -46,6 +46,7 @@ BeforeAll {
     $script:LauncherConfig = @"
 `$mod = SUPER
 bind = `$mod, Q, quit
+bind = `$mod SHIFT, R, reload
 exec-once = $script:LaunchExe
 windowrule = workspace 1, exe:$script:LaunchExe.exe
 "@
@@ -127,12 +128,43 @@ Describe 'launcher' {
 
     # exec-once idempotency across a reload: the reducer emits LaunchApp for exec-once
     # ONLY on Started{}, never on Reloaded{}, so a reload must not spawn a second copy.
-    # This is fully asserted at the pure Reducer seam (reducer_test.cpp). It stays a
-    # -Skip here because the reload TRIGGER (file watch / `reload` dispatcher) is not
-    # wired in this slice — only Started{} is posted (ADR-0011 / PRD 08). Once PRD 09
-    # lands a reload event source, promote this to a live Get-Process-count-unchanged
-    # assertion across a reload.
-    It 'exec-once: a reload does not relaunch an already-running app' -Skip -Tag 'launcher' {
-        Set-ItResult -Skipped -Because 'the reload trigger lands with PRD 09; only Started{} is wired this slice'
+    # The pure half is reducer-tested (reducer_test.cpp); PRD 09 landed the reload
+    # TRIGGER (the `reload` dispatcher), so this is now a live Get-Process-count seam:
+    # boot with an exec-once app, fire `reload`, and assert exactly one copy survives.
+    It 'exec-once: a reload does not relaunch an already-running app' -Tag 'launcher' {
+        $winspace = $null
+        try {
+            Set-DesktopCount 1
+            # No msinfo32 may pre-exist, or a stale window spoofs the count Oracle.
+            Get-Process $script:LaunchExe -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty -Because 'the seam counts the copies winspace itself launched'
+
+            Set-WinspaceConfig -Content $script:LauncherConfig | Out-Null
+            $winspace = Start-Winspace
+
+            # Started{} fires the exec-once launch — exactly one msinfo32 comes up.
+            Wait-Until -Because 'winspace to launch the single exec-once msinfo32' -Condition {
+                @(Get-Process $script:LaunchExe -ErrorAction SilentlyContinue).Count -eq 1
+            }
+
+            # Fire `reload` on the SAME (unchanged) config. Reloaded{} re-launches only
+            # `exec` entries, never `exec-once`, so the count must stay at one.
+            Send-Chord 'Win+Shift+R'
+            Wait-Until -Because 'the Worker to apply the reload' -Condition {
+                (Get-WinspaceLogText) -match 'reload: applied new config'
+            }
+
+            # Give any (erroneous) relaunch a bounded window to surface, then assert
+            # the count is unchanged — exec-once did not spawn a second copy.
+            Start-Sleep -Milliseconds 600
+            @(Get-Process $script:LaunchExe -ErrorAction SilentlyContinue).Count | Should -Be 1 `
+                -Because 'exec-once is launched on Started{} only, never re-launched on reload'
+        } catch {
+            Save-FailureScreenshot -Name 'launcher-reload-idempotent'
+            throw
+        } finally {
+            Get-Process $script:LaunchExe -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Winspace -Process $winspace
+        }
     }
 }

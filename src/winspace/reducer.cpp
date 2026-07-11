@@ -85,15 +85,22 @@ struct WindowIdentity {
 // ASCII-case-insensitive; title is a std::regex_search (substring, case-sensitive).
 enum class Field { Exe, Class, Title };
 
-// A parsed `windowrule = workspace N, <field>:<pattern>` (PRD 06). Lives in the
-// core next to WindowAttrs; the parser (Seam 2) compiles these and the reducer
-// matches against them. For Exe/Class, `pattern` is the (lowercased, trimmed)
-// literal to compare; for Title, `regex` is the compiled pattern and `pattern`
-// keeps the source text (diagnostics only). `workspace` is the target Logical
-// number. std::regex makes this copyable-but-not-cheap, which is why State holds
-// the rule list behind a shared_ptr (PRD: O(1) per-event State copies).
+// The action a matching WindowRule applies (ADR-0009 extension, issue 09):
+// Place pins the window to a target Workspace on Appeared (the original behavior);
+// Ignore excludes the window from Spatial focus (it is never a focus target).
+enum class RuleAction { Place, Ignore };
+
+// A parsed `windowrule = <action>, <field>:<pattern>` (PRD 06; the Ignore action
+// added in issue 09). Lives in the core next to WindowAttrs; the parser (Seam 2)
+// compiles these and the reducer matches against them. For Exe/Class, `pattern` is
+// the (lowercased, trimmed) literal to compare; for Title, `regex` is the compiled
+// pattern and `pattern` keeps the source text (diagnostics only). `workspace` is
+// the target Logical number for a Place rule (unused for Ignore). std::regex makes
+// this copyable-but-not-cheap, which is why State holds the rule list behind a
+// shared_ptr (PRD: O(1) per-event State copies).
 struct WindowRule {
     Field field{};
+    RuleAction action = RuleAction::Place;
     int workspace = 0;
     std::string pattern;
     std::regex regex;
@@ -178,8 +185,15 @@ struct Vanished {
 struct Started {};
 struct Reloaded {};
 
+// The `reload` hotkey trigger (issue 09, ADR-0012). Posted by the Hotkey thread
+// when a bound `reload` dispatcher fires. The Reducer is pure and cannot read a
+// file, so it only ASKS: reduce(state, Reload{}) emits a single ReloadConfig{}
+// Effect and touches no State. Distinct from Reloaded{} (above), the POST-parse
+// Event the Worker posts to itself once the new file has parsed cleanly.
+struct Reload {};
+
 using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
-                           Appeared, Vanished, Started, Reloaded>;
+                           Appeared, Vanished, Started, Reloaded, Reload>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
 // Worker thread against the COM bridge; the Reducer itself performs no I/O. No
@@ -227,8 +241,17 @@ struct LaunchApp {
     std::string command;
 };
 
+// Re-read and re-apply the config file live (issue 09, ADR-0012). Emitted by the
+// Reducer in response to a Reload{} Event; executed by the Worker on its own
+// thread — it re-resolves the config path, re-reads and re-parses the file, and
+// (only on a clean parse) reseeds config-derived State, hands the new Binds to the
+// Hotkey thread, and posts Reloaded{} to itself. Carries no data: the Reducer
+// reads no file, so everything the reload needs is discovered by the Worker.
+struct ReloadConfig {};
+
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
-                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, LaunchApp>;
+                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, LaunchApp,
+                            ReloadConfig>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -257,6 +280,7 @@ constexpr bool operator==(const MoveWindowToWorkspace& a, const MoveWindowToWork
 inline bool operator==(const LaunchApp& a, const LaunchApp& b) {
     return a.command == b.command;
 }
+constexpr bool operator==(const ReloadConfig&, const ReloadConfig&) { return true; }
 
 // Value equality for the plain-data window types (used by the eligibility tests
 // and, later, issue 05's directional-focus tests).
@@ -288,11 +312,26 @@ struct State {
     std::shared_ptr<const std::vector<WindowRule>> rules;
     std::unordered_set<WindowId> placed;
 
+    // The Ignore-set (ADR-0009 extension, issue 09): the bounded set of ids a
+    // matching Ignore WindowRule has excluded from Spatial focus. Mirrors `placed`
+    // — an id enters on its first Eligible Appeared whose first match is an Ignore
+    // rule (and enters `placed` too, since it has been evaluated), and is erased on
+    // Vanished. `resolveFocus` drops any Candidate in this set, so an Ignored window
+    // is never a focus target while remaining otherwise untouched (still Eligible,
+    // never moved or sized, still Alt-Tab reachable).
+    std::unordered_set<WindowId> ignored;
+
     // Launch entries (PRD 08), seeded once at Worker construction behind the same
     // O(1)-copy shared handle as `rules`. Read only by the Started/Reloaded
     // handlers, which turn each into a LaunchApp; never mutated by a reduce. No
     // per-window launch state exists — exec-once idempotency is stateless.
     std::shared_ptr<const std::vector<ExecEntry>> execs;
+
+    // The parsed `start_at_login` flag (issue 09), seeded at Worker construction
+    // beside `rules`/`execs` and reseeded on reload. Slice 09 only carries it into
+    // State — no Effect derives from it here; the slice-10 logon task reads it and
+    // emits its own Effect. Every reduce preserves it unchanged.
+    bool startAtLogin = false;
 };
 
 struct ReduceResult {
@@ -388,7 +427,8 @@ constexpr long long distSq(const Center& a, const Center& b) {
 // special case: the rects are already in one virtual-screen coordinate space.
 inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
                                             const std::vector<WindowAttrs>& candidates,
-                                            const std::optional<WindowAttrs>& origin) {
+                                            const std::optional<WindowAttrs>& origin,
+                                            const std::unordered_set<WindowId>& ignored) {
     using namespace focus_detail;
     if (!origin) return std::nullopt;
     const Center oc = center(origin->rect);
@@ -403,7 +443,8 @@ inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
 
     for (const WindowAttrs& c : candidates) {
         if (!isEligible(c)) continue;
-        if (c.id == origin->id) continue;  // the Origin is never its own target
+        if (c.id == origin->id) continue;   // the Origin is never its own target
+        if (ignored.contains(c.id)) continue;  // an Ignore-rule window is no focus target
         const Center cc = center(c.rect);
         if (!ahead(dir, cc, oc)) continue;
         const Score s{inBand(dir, c.rect, origin->rect) ? 0 : 1, distSq(cc, oc), c.id};
@@ -445,16 +486,19 @@ inline bool matchesField(const WindowRule& r, const WindowIdentity& id) {
 }  // namespace rule_detail
 
 // The matcher: three sequential passes over the rule list — all `exe` rules
-// (config order), then all `class`, then all `title` — first match wins, and its
-// target workspace is returned. The fixed field precedence exe→class→title makes
-// overlapping rules resolve the same way every time; config order breaks
-// within-field ties. Pure: a function of (rules, identity) only.
-inline std::optional<int> matchRule(const std::vector<WindowRule>& rules,
-                                    const WindowIdentity& id) {
+// (config order), then all `class`, then all `title` — first match wins, and the
+// winning rule is returned (its `action` decides Place vs Ignore, its `workspace`
+// the Place target). The fixed field precedence exe→class→title makes overlapping
+// rules resolve the same way every time; config order breaks within-field ties. A
+// window matching both an Ignore and a Place rule thus resolves by that same
+// first-match order. nullptr means nothing matched. Pure: a function of
+// (rules, identity) only.
+inline const WindowRule* matchRule(const std::vector<WindowRule>& rules,
+                                   const WindowIdentity& id) {
     for (const Field pass : {Field::Exe, Field::Class, Field::Title})
         for (const WindowRule& r : rules)
-            if (r.field == pass && rule_detail::matchesField(r, id)) return r.workspace;
-    return std::nullopt;
+            if (r.field == pass && rule_detail::matchesField(r, id)) return &r;
+    return nullptr;
 }
 
 // ── the seam ────────────────────────────────────────────────────────────────
@@ -480,7 +524,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             // Phase two: the probed rects have re-entered as an Event. Run the pure
             // resolution; emit a single SetForegroundWindow, or nothing.
             [&](const FocusResolve& fr) -> ReduceResult {
-                if (const auto target = resolveFocus(fr.dir, fr.candidates, fr.origin))
+                if (const auto target = resolveFocus(fr.dir, fr.candidates, fr.origin, s.ignored))
                     return {s, {Effect{SetForegroundWindow{*target}}}};
                 return {s, {}};
             },
@@ -505,12 +549,21 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             [&](const Appeared& a) -> ReduceResult {
                 if (s.placed.contains(a.attrs.id)) return {s, {}};
                 if (!isEligible(a.attrs)) return {s, {}};
-                std::vector<Effect> effects;
-                if (s.rules)
-                    if (const auto logical = matchRule(*s.rules, a.identity))
-                        effects.push_back(Effect{MoveWindowToWorkspace{a.attrs.id, *logical}});
                 State next = s;
                 next.placed.insert(a.attrs.id);
+                std::vector<Effect> effects;
+                // The window has been evaluated, so it is now `placed` regardless of
+                // match. If its first match is an Ignore rule, record the id in
+                // `ignored` (no move Effect — winspace never acts on it); if a Place
+                // rule, emit the move. A non-match does neither.
+                if (s.rules)
+                    if (const WindowRule* rule = matchRule(*s.rules, a.identity)) {
+                        if (rule->action == RuleAction::Ignore)
+                            next.ignored.insert(a.attrs.id);
+                        else
+                            effects.push_back(
+                                Effect{MoveWindowToWorkspace{a.attrs.id, rule->workspace}});
+                    }
                 return {next, std::move(effects)};
             },
             // A window vanished (DESTROY / HIDE / CLOAKED). Erase the id: this bounds
@@ -520,6 +573,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             [&](const Vanished& v) -> ReduceResult {
                 State next = s;
                 next.placed.erase(v.id);
+                next.ignored.erase(v.id);
                 return {next, {}};
             },
             // Startup (PRD 08): emit a LaunchApp for EVERY exec entry, in config
@@ -541,6 +595,14 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                     for (const ExecEntry& e : *s.execs)
                         if (!e.once) effects.push_back(Effect{LaunchApp{e.command}});
                 return {s, std::move(effects)};
+            },
+            // The `reload` hotkey fired (issue 09, ADR-0012). The Reducer is pure —
+            // it cannot read the file — so it only ASKS: emit one ReloadConfig{}
+            // Effect and touch no State. The Worker executes the re-read/re-parse and
+            // (on a clean parse) reseeds State, re-registers hotkeys, and posts
+            // Reloaded{} to itself. Not to be confused with Reloaded{} above.
+            [&](const Reload&) -> ReduceResult {
+                return {s, {Effect{ReloadConfig{}}}};
             },
         },
         e);

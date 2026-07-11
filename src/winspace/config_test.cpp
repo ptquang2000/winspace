@@ -274,8 +274,9 @@ TEST_CASE("a windowrule with a non-integer workspace is diagnosed", "[config]") 
 }
 
 TEST_CASE("an unsupported windowrule action is diagnosed and the file continues", "[config]") {
+    // `float` is a Hyprland action winspace does not support (only workspace/ignore).
     const auto result = parse(
-        "windowrule = ignore, exe:foo.exe\n"
+        "windowrule = float, exe:foo.exe\n"
         "windowrule = workspace 2, exe:bar.exe\n");
 
     REQUIRE(result.diagnostics.size() == 1);
@@ -335,6 +336,128 @@ TEST_CASE("one parse returns both binds and rules", "[config]") {
     REQUIRE(result.diagnostics.empty());
     REQUIRE(result.config.binds.size() == 1);
     REQUIRE(result.config.rules.size() == 1);
+}
+
+// ── windowrule ignore action (issue 09) ──────────────────────────────────────
+
+TEST_CASE("windowrule ignore parses to an Ignore-action rule for each match field", "[config]") {
+    const auto result = parse(
+        "windowrule = ignore, exe:Dock.exe\n"
+        "windowrule = ignore, class:Shell_TrayWnd\n"
+        "windowrule = ignore, title:^Widget\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 3);
+
+    REQUIRE(result.config.rules[0].action == RuleAction::Ignore);
+    REQUIRE(result.config.rules[0].field == Field::Exe);
+    REQUIRE(result.config.rules[0].pattern == "dock.exe");  // lowercased like a Place exe rule
+
+    REQUIRE(result.config.rules[1].action == RuleAction::Ignore);
+    REQUIRE(result.config.rules[1].field == Field::Class);
+    REQUIRE(result.config.rules[1].pattern == "shell_traywnd");
+
+    REQUIRE(result.config.rules[2].action == RuleAction::Ignore);
+    REQUIRE(result.config.rules[2].field == Field::Title);
+    REQUIRE(std::regex_search(std::string("Widget"), result.config.rules[2].regex));
+}
+
+TEST_CASE("a workspace windowrule still parses with the Place action", "[config]") {
+    // The existing action keeps its tag — Place is not silently turned into Ignore.
+    const auto result = parse("windowrule = workspace 2, exe:slack.exe\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].action == RuleAction::Place);
+    REQUIRE(result.config.rules[0].workspace == 2);
+}
+
+TEST_CASE("a windowrule ignore with a missing or empty pattern is diagnosed", "[config]") {
+    // Missing field colon.
+    const auto noColon = parse("windowrule = ignore, dock.exe\n");
+    REQUIRE(noColon.config.rules.empty());
+    REQUIRE(noColon.diagnostics.size() == 1);
+
+    // Empty exe pattern.
+    const auto emptyExe = parse("windowrule = ignore, exe:\n");
+    REQUIRE(emptyExe.config.rules.empty());
+    REQUIRE(emptyExe.diagnostics.size() == 1);
+
+    // Empty title pattern.
+    const auto emptyTitle = parse("windowrule = ignore, title:\n");
+    REQUIRE(emptyTitle.config.rules.empty());
+    REQUIRE(emptyTitle.diagnostics.size() == 1);
+}
+
+// ── start_at_login setting (issue 09) ────────────────────────────────────────
+
+TEST_CASE("start_at_login parses true and false case-insensitively", "[config]") {
+    REQUIRE(parse("start_at_login = true\n").config.startAtLogin == true);
+    REQUIRE(parse("start_at_login = TRUE\n").config.startAtLogin == true);
+    REQUIRE(parse("start_at_login = False\n").config.startAtLogin == false);
+
+    const auto t = parse("start_at_login = true\n");
+    REQUIRE(t.diagnostics.empty());
+}
+
+TEST_CASE("start_at_login absent defaults to false with no diagnostic", "[config]") {
+    const auto result = parse("bind = SUPER, 1, workspace, 1\n");
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.startAtLogin == false);
+}
+
+TEST_CASE("a non-bool start_at_login value is diagnosed", "[config]") {
+    const auto result = parse("start_at_login = maybe\n");
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+    REQUIRE(result.config.startAtLogin == false);
+}
+
+// ── reload dispatcher (issue 09) ─────────────────────────────────────────────
+
+TEST_CASE("the reload dispatcher parses as a zero-argument bind", "[config]") {
+    const auto result = parse("bind = SUPER SHIFT, R, reload\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.binds[0] ==
+            Bind{Mod::Super | Mod::Shift, Key::R, Dispatcher::Reload, 0});
+}
+
+// ── removed-with-tiling diagnostics (issue 09) ───────────────────────────────
+
+TEST_CASE("a bind to each removed tiling dispatcher yields a targeted removed-with-tiling diagnostic", "[config]") {
+    for (const std::string disp :
+         {"movewindow", "maximize", "resizeactive", "togglefloat", "movetomonitor"}) {
+        const auto result = parse("bind = SUPER, X, " + disp + "\n");
+        REQUIRE(result.config.binds.empty());
+        REQUIRE(result.diagnostics.size() == 1);
+        REQUIRE(result.diagnostics[0].message.find("removed with tiling") != std::string::npos);
+        REQUIRE(result.diagnostics[0].message.find(disp) != std::string::npos);
+    }
+}
+
+TEST_CASE("the removed tiling settings yield the same targeted diagnostic", "[config]") {
+    for (const std::string setting : {"min_tile_width", "min_tile_height"}) {
+        const auto result = parse(setting + " = 100\n");
+        REQUIRE(result.diagnostics.size() == 1);
+        REQUIRE(result.diagnostics[0].message.find("removed with tiling") != std::string::npos);
+        REQUIRE(result.diagnostics[0].message.find(setting) != std::string::npos);
+    }
+}
+
+TEST_CASE("an unknown name that is NOT a removed tiling one keeps the generic diagnostic", "[config]") {
+    // Unknown dispatcher.
+    const auto disp = parse("bind = SUPER, X, teleport\n");
+    REQUIRE(disp.diagnostics.size() == 1);
+    REQUIRE(disp.diagnostics[0].message.find("unknown dispatcher") != std::string::npos);
+    REQUIRE(disp.diagnostics[0].message.find("removed with tiling") == std::string::npos);
+
+    // Unknown directive.
+    const auto dir = parse("frobnicate = 1\n");
+    REQUIRE(dir.diagnostics.size() == 1);
+    REQUIRE(dir.diagnostics[0].message.find("unknown directive") != std::string::npos);
+    REQUIRE(dir.diagnostics[0].message.find("removed with tiling") == std::string::npos);
 }
 
 // ── exec / exec-once directive (PRD 08) ──────────────────────────────────────

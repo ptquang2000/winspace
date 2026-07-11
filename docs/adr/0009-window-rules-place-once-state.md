@@ -55,6 +55,31 @@ place-once forbids.
 - On `Vanished` (`DESTROY` / `HIDE` / `CLOAKED`): erase `id` from `placed`. This
   bounds the set to live windows and — because Windows recycles `HWND`s — stops a
   reused handle from being wrongly treated as already-placed.
+
+  > **Extension (2026-07-11, issue 09) — the `ignore` action and the `ignored`
+  > set.** A `WindowRule` gains an **action**: **Place** (`workspace N`, the
+  > original behavior) or **Ignore** (exclude the window from Spatial focus). The
+  > matcher still runs the exe→class→title precedence and returns the **first
+  > matching rule's action** — a window matching both an Ignore and a Place rule
+  > resolves by that same first-match order. `State` gains a second bounded set,
+  > **`std::unordered_set<WindowId> ignored`**: on an Eligible `Appeared` whose
+  > first match is an Ignore rule, the id is inserted into `ignored` (and, as
+  > before, into `placed`, since it has been evaluated); on `Vanished` it is erased
+  > from both. Spatial focus consults it — `resolveFocus` drops any Candidate whose
+  > id ∈ `ignored`, so an Ignored window is never a focus target. An Ignored window
+  > **is still `isEligible`** — it is excluded by *rule*, not by the Eligibility
+  > gate; nothing else about it changes (it is not tracked, moved, or sized).
+  >
+  > *Why a set, not a live match on the focus path.* Focus resolution is otherwise
+  > a pure geometry sweep over rects (ADR-0008) and deliberately never gathers
+  > `WindowIdentity` (see `CONTEXT.md`). Matching Ignore rules live at each keypress
+  > would drag identity onto that hot path — including a `title` match's
+  > `GetWindowText` → `WM_GETTEXT`, which **blocks on a hung window** and would
+  > freeze Alt+h/j/k/l navigation. Populating `ignored` at `Appeared` keeps that
+  > read on the hook thread, so focus stays a non-blocking geometry sweep. The cost
+  > is that `ignored` — like `placed` — is **not re-asserted on reload**: an Ignore
+  > rule added at reload only takes effect for a matching window when it next
+  > `Appears`. Accepted as consistent with place-once's non-re-assertion.
 - Rules **place on startup adoption**: the hook adapter's `EnumWindows` sweep posts
   synthetic `Appeared`s through the same path, so already-open matching apps are
   pinned exactly as newly-opened ones (consistent with Virtual Desktop Adoption's

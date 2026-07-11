@@ -25,6 +25,7 @@
 #include <utility>  // std::move
 #include <vector>
 
+#include "io/config_io.cpp"  // readAndParseConfig — the shared reload read+parse (issue 09)
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/probe.cpp"      // window Probe sweep + WindowId ⇄ HWND mint (focus)
 #include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
@@ -36,6 +37,19 @@ namespace winspace::io {
 // first id reserved for private application use, so it never collides with
 // system or common-control messages.
 inline constexpr UINT k_wmEvent = WM_APP + 0;
+
+// Tells the Worker the Hotkey thread's id (WPARAM), so a live reload can hand that
+// thread the new Binds. Posted to the Worker's HWND once by the spine after the
+// Hotkey thread publishes its id (the Worker is constructed first, so it cannot
+// know the id at construction). Issue 09 / ADR-0012.
+inline constexpr UINT k_wmSetHotkeyThread = WM_APP + 1;
+
+// Carries a freshly-parsed std::vector<Bind>* to the HOTKEY thread's queue on a
+// reload (PostThreadMessage, so it has no HWND and is handled inline in that
+// thread's loop, like WM_HOTKEY). The Hotkey thread takes ownership and rebuilds
+// its HotkeyTable; on a failed post the sender deletes the vector (mirroring
+// postEvent's delete-on-failure ownership). Issue 09 / ADR-0012.
+inline constexpr UINT k_wmReloadBinds = WM_APP + 2;
 
 // Hand an Event to the Worker across threads. Ownership transfers to the Worker
 // on a successful post (it deletes after reducing); on failure — a full queue
@@ -57,12 +71,16 @@ public:
     // so rules are in place before any Appeared (synthetic-adoption or live) can
     // arrive (PRD 06 ordering). The rule list is wrapped in a shared handle so the
     // per-event State copy stays O(1) (ADR-0009 / PRD deviation).
-    explicit Worker(std::vector<WindowRule> rules, std::vector<ExecEntry> execs) {
+    explicit Worker(std::vector<WindowRule> rules, std::vector<ExecEntry> execs,
+                    bool startAtLogin) {
         m_state.rules = std::make_shared<const std::vector<WindowRule>>(std::move(rules));
         // Launch entries are seeded alongside rules and behind the same O(1)-copy
         // handle, so they precede the Started{} the spine posts right after the
         // HWND publishes (PRD 08).
         m_state.execs = std::make_shared<const std::vector<ExecEntry>>(std::move(execs));
+        // The start_at_login flag is seeded here beside rules/execs (issue 09);
+        // slice 10 will read it. It emits no Effect and is reseeded on reload.
+        m_state.startAtLogin = startAtLogin;
 
         // This thread is the single STA that will own the COM bridge (task 06).
         // COINIT_APARTMENTTHREADED demands a message loop, which run() supplies.
@@ -141,6 +159,10 @@ private:
         auto* self = reinterpret_cast<Worker*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self && msg == k_wmEvent) {
             return self->onEvent(reinterpret_cast<Event*>(lparam));
+        }
+        if (self && msg == k_wmSetHotkeyThread) {
+            self->m_hotkeyThreadId = static_cast<DWORD>(wparam);
+            return 0;
         }
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
@@ -235,6 +257,55 @@ private:
                                  launched.error());
                     }
                 },
+                [&](const ReloadConfig&) {
+                    // Live reload (issue 09, ADR-0012), executed on THIS thread. Re-read
+                    // + re-parse via the shared helper, then apply ATOMICALLY: any
+                    // Diagnostic — or an unreadable file — keeps the currently-running
+                    // config live and changes nothing (the fallback is the user's own
+                    // working config, so reload can afford to reject the whole file).
+                    ConfigReadResult load = readAndParseConfig();
+                    if (!load.read) {
+                        lg::warn("reload: config unreadable; keeping the running config");
+                        return;
+                    }
+                    if (!load.parsed.diagnostics.empty()) {
+                        for (const Diagnostic& d : load.parsed.diagnostics)
+                            lg::warn("reload: config line {}: {}", d.line, d.message);
+                        lg::warn("reload: {} diagnostic(s); keeping the running config",
+                                 load.parsed.diagnostics.size());
+                        return;
+                    }
+
+                    // Clean parse — fan out to the three owners of config-derived state
+                    // (ADR-0012). (1) Reseed the Worker's own State behind fresh O(1)-copy
+                    // handles; the flag is a plain reseed.
+                    Config& cfg = load.parsed.config;
+                    m_state.rules =
+                        std::make_shared<const std::vector<WindowRule>>(std::move(cfg.rules));
+                    m_state.execs =
+                        std::make_shared<const std::vector<ExecEntry>>(std::move(cfg.execs));
+                    m_state.startAtLogin = cfg.startAtLogin;
+
+                    // (2) Hand the new Binds to the Hotkey thread to rebuild its
+                    // HotkeyTable on that thread (RegisterHotKey is thread-affine). Heap
+                    // pointer with delete-on-failed-post ownership, mirroring postEvent.
+                    if (m_hotkeyThreadId != 0) {
+                        auto* binds = new std::vector<Bind>(std::move(cfg.binds));
+                        if (!PostThreadMessageW(m_hotkeyThreadId, k_wmReloadBinds, 0,
+                                                reinterpret_cast<LPARAM>(binds))) {
+                            delete binds;
+                            lg::warn("reload: could not hand new binds to the hotkey thread; "
+                                     "hotkeys unchanged");
+                        }
+                    } else {
+                        lg::warn("reload: hotkey thread id unknown; hotkeys unchanged");
+                    }
+
+                    // (3) Post Reloaded{} to ourselves so the existing exec-relaunch path
+                    // runs unchanged — `exec` entries re-launch, `exec-once` do not.
+                    postEvent(m_hwnd, new Event{Reloaded{}});
+                    lg::info("reload: applied new config");
+                },
             },
             effect);
     }
@@ -242,6 +313,7 @@ private:
     State m_state{};
     HWND m_hwnd = nullptr;
     bool m_comInitialized = false;
+    DWORD m_hotkeyThreadId = 0;  // set by k_wmSetHotkeyThread; target of reload's new Binds
     std::unique_ptr<IVirtualDesktopBridge> m_bridge;  // COM VD bridge; null if unsupported
 };
 
@@ -250,8 +322,8 @@ private:
 // tears COM and the window down on this same thread. A null published HWND
 // signals a construction failure the spine treats as fatal.
 inline void workerThreadMain(std::promise<HWND> ready, std::vector<WindowRule> rules,
-                             std::vector<ExecEntry> execs) {
-    Worker worker(std::move(rules), std::move(execs));
+                             std::vector<ExecEntry> execs, bool startAtLogin) {
+    Worker worker(std::move(rules), std::move(execs), startAtLogin);
     const HWND hwnd = worker.hwnd();
     ready.set_value(hwnd);
     if (hwnd) worker.run();

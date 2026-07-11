@@ -15,19 +15,14 @@
 
 #include <windows.h>
 
-#include <filesystem>
-#include <format>
-#include <fstream>
 #include <functional>
 #include <future>
-#include <optional>
-#include <sstream>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "io/config_io.cpp"  // config load/parse helpers + LoadedConfig (issue 09 prefactor)
 #include "io/hotkeys.cpp"
 #include "io/window_hook.cpp"
 #include "io/worker.cpp"
@@ -36,138 +31,23 @@
 
 namespace winspace::io {
 
-// The config winspace seeds on first run and falls back to when the on-disk file
-// is unreadable. It is the Hyprland-subset grammar this slice supports; a user who
-// edits the seeded file grows it from here. (Through task 05 this same literal was
-// the only source; task 07 promoted it to the default and added the file read.)
-inline constexpr std::string_view k_defaultConfig =
-    "# winspace config — edit and save; winspace reads this at startup.\n"
-    "# $mod = SUPER binds the Windows key. Win+<key> only registers when the\n"
-    "# NoWinKeys policy is on (HKCU\\...\\Policies\\Explorer\\NoWinKeys=1); without\n"
-    "# it Windows reserves these chords and winspace skips-and-logs each bind.\n"
-    "$mod = SUPER\n"
-    "bind = $mod, 1, workspace, 1\n"
-    "bind = $mod, 2, workspace, 2\n"
-    "bind = $mod, 3, workspace, 3\n"
-    "bind = $mod, 4, workspace, 4\n"
-    "bind = $mod, 5, workspace, 5\n"
-    "bind = $mod, Q, quit\n"
-    "# Spatial focus: vim-style Alt + h/j/k/l steer the keyboard to the nearest window\n"
-    "# in a direction. Alt (not $mod) because Windows reserves the whole Win+h/j/k/l set\n"
-    "# even under NoWinKeys (Win+J is Explorer's, Win+K/L are system-reserved), while\n"
-    "# Alt+h/j/k/l registers cleanly. The bound key and the direction are independent\n"
-    "# fields, so rebind freely (e.g. to the arrow keys).\n"
-    "bind = ALT, H, focus, left\n"
-    "bind = ALT, J, focus, down\n"
-    "bind = ALT, K, focus, up\n"
-    "bind = ALT, L, focus, right\n"
-    "# Move the focused window to a workspace (Super+Shift+<n>, the hyprland idiom).\n"
-    "# `movetoworkspacesilent` moves it but leaves you where you are; the plain\n"
-    "# `movetoworkspace` would also follow the window (switch the active desktop to N).\n"
-    "# A cross-desktop move is cloaked (DWM) around the move so it never flashes here.\n"
-    "bind = $mod SHIFT, 1, movetoworkspacesilent, 1\n"
-    "bind = $mod SHIFT, 2, movetoworkspacesilent, 2\n"
-    "bind = $mod SHIFT, 3, movetoworkspacesilent, 3\n"
-    "bind = $mod SHIFT, 4, movetoworkspacesilent, 4\n"
-    "bind = $mod SHIFT, 5, movetoworkspacesilent, 5\n"
-    "# Launch apps at startup. `exec-once` runs once when winspace starts; `exec`\n"
-    "# runs at startup and again on every config reload. Each line is a verbatim\n"
-    "# command (exe + args, quoted paths for spaces), started detached — it keeps\n"
-    "# running after winspace exits. The launcher only STARTS apps; it never places\n"
-    "# them. To put a launched app on a workspace, pair it with a `windowrule` that\n"
-    "# matches the window by exe. Example: start Firefox and pin it to workspace 2.\n"
-    "# exec-once = firefox\n"
-    "# windowrule = workspace 2, exe:firefox.exe\n";
-
-// Read an environment variable with the size-then-fill two-call pattern.
-// GetEnvironmentVariableW returns the length INCLUDING the null when probing with
-// a null buffer, EXCLUDING it when filling — so allocate n and fill n. Empty
-// optional means the variable is unset (or unreadable): there is no home to anchor
-// the config path to.
-inline std::optional<std::wstring> envVar(const wchar_t* name) {
-    const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
-    if (n == 0) return std::nullopt;
-    std::wstring value(n - 1, L'\0');  // n counts the terminator; string owns size()+1
-    GetEnvironmentVariableW(name, value.data(), n);
-    return value;
-}
-
-// The known location: %USERPROFILE%\.config\winspace\winspace.conf — the Win32
-// home for the Hyprland-style ~/.config/<app> layout. Empty optional when
-// %USERPROFILE% is unset, which leaves winspace on its built-in defaults.
-inline std::optional<std::filesystem::path> configPath() {
-    const std::optional<std::wstring> home = envVar(L"USERPROFILE");
-    if (!home) return std::nullopt;
-    return std::filesystem::path(*home) / L".config" / L"winspace" / L"winspace.conf";
-}
-
-// Slurp a file's bytes verbatim (the config is UTF-8, which the parser consumes as
-// bytes). Empty optional on any open failure.
-inline std::optional<std::string> readFile(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    return std::move(buffer).str();
-}
-
-// Resolve the config text for this run. On the happy path: read the file at the
-// known location. On first run (no file): create the directory chain, seed it with
-// the default, and read that back so the source of truth is always the file. Every
-// failure along the way degrades to the built-in default with a diagnostic, so a
-// missing home or an unwritable disk never leaves winspace with no binds.
-inline std::string loadConfigText() {
-    const std::optional<std::filesystem::path> path = configPath();
-    if (!path) {
-        lg::warn("config: %USERPROFILE% is unset; using built-in defaults");
-        return std::string(k_defaultConfig);
-    }
-    const std::string shown = narrow(path->wstring());
-
-    std::error_code ec;
-    if (!std::filesystem::exists(*path, ec)) {
-        std::filesystem::create_directories(path->parent_path(), ec);
-        if (ec) {
-            lg::warn("config: cannot create {}: {}; using built-in defaults",
-                     narrow(path->parent_path().wstring()), ec.message());
-            return std::string(k_defaultConfig);
-        }
-        std::ofstream out(*path, std::ios::binary);
-        out << k_defaultConfig;
-        if (!out) {
-            lg::warn("config: cannot write default {}; using built-in defaults", shown);
-            return std::string(k_defaultConfig);
-        }
-        lg::info("config: seeded default config at {}", shown);
-    }
-
-    if (std::optional<std::string> text = readFile(*path)) {
-        lg::info("config: loaded {}", shown);
-        return std::move(*text);
-    }
-    lg::warn("config: cannot read {}; using built-in defaults", shown);
-    return std::string(k_defaultConfig);
-}
-
-// Both halves of one parse: the Binds the Hotkey thread registers and the
-// WindowRules the Worker seeds into State (PRD 06). Owned by runApp for the
-// lifetime of the threads that borrow them.
-struct LoadedConfig {
-    std::vector<Bind> binds;
-    std::vector<WindowRule> rules;
-    std::vector<ExecEntry> execs;
-};
-
-// Parse the config once, surfacing any parser diagnostics through the I/O sink,
-// and return both binds and rules. `text` outlives parse(); the returned data owns
-// itself. (Replaces the former loadBinds — one parse, both halves; PRD 06.)
+// Load the config for STARTUP (issue 09). Shares the read+parse mechanism with the
+// Worker's reload path (io/config_io.cpp: seedDefaultConfigIfMissing +
+// readAndParseConfig) but layers startup's own fallback policy on top: seed the
+// built-in default on first run, and if the file is unreadable fall back to the
+// built-in default text. Startup degrades PER-LINE (each diagnostic is logged and
+// the good lines still apply) because its only fallback is the destructive built-in
+// default — the deliberate asymmetry with reload's atomic keep-last-good (ADR-0012).
 inline LoadedConfig loadConfig() {
-    const std::string text = loadConfigText();
-    ParseResult parsed = parse(text);
+    seedDefaultConfigIfMissing();
+    ConfigReadResult load = readAndParseConfig();
+    ParseResult parsed =
+        load.read ? std::move(load.parsed) : parse(std::string(k_defaultConfig));
+    if (!load.read)
+        lg::warn("config: file unreadable at startup; using built-in defaults");
     for (const Diagnostic& d : parsed.diagnostics)
         lg::warn("config line {}: {}", d.line, d.message);
-    return {std::move(parsed.config.binds), std::move(parsed.config.rules),
-            std::move(parsed.config.execs)};
+    return toLoaded(std::move(parsed.config));
 }
 
 // A non-interactive exit path: setting WINSPACE_SELFTEST_QUIT drives one Quit
@@ -188,7 +68,12 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
     tidReady.set_value(GetCurrentThreadId());
 
-    HotkeyTable hotkeys(binds);
+    // The live table, held in an optional so a reload can tear it down (destroying
+    // it unregisters every hotkey on THIS thread) BEFORE building the new one —
+    // registering the new set first would collide with a still-registered old combo
+    // (ERROR_HOTKEY_ALREADY_REGISTERED) and silently drop the re-bound hotkey.
+    std::optional<HotkeyTable> hotkeys;
+    hotkeys.emplace(binds);
 
     if (selftestQuitEnabled()) {
         postEvent(workerHwnd, new Event{Quit{}});
@@ -198,8 +83,19 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
         // A hotkey has a null window, so it never dispatches to a WndProc — handle
         // it here. wParam is the hotkey id, i.e. the Bind's index in the table.
         if (msg.message == WM_HOTKEY) {
-            if (auto ev = hotkeys.eventFor(static_cast<int>(msg.wParam)))
-                postEvent(workerHwnd, new Event{std::move(*ev)});
+            if (hotkeys)
+                if (auto ev = hotkeys->eventFor(static_cast<int>(msg.wParam)))
+                    postEvent(workerHwnd, new Event{std::move(*ev)});
+            continue;
+        }
+        // A live reload (issue 09): the Worker handed us a heap-allocated Bind
+        // vector to re-register. Take ownership, drop the old table (unregister-all),
+        // then build the new one (register-all) — in that order (see above).
+        if (msg.message == k_wmReloadBinds) {
+            const std::unique_ptr<std::vector<Bind>> newBinds(
+                reinterpret_cast<std::vector<Bind>*>(msg.lParam));
+            hotkeys.reset();
+            hotkeys.emplace(*newBinds);
             continue;
         }
         TranslateMessage(&msg);
@@ -228,14 +124,15 @@ inline int runApp() {
     // Worker thread, which seeds both into State before publishing its HWND.
     LoadedConfig cfg = loadConfig();
     const std::vector<Bind> binds = std::move(cfg.binds);
+    const bool startAtLogin = cfg.startAtLogin;
 
     // Start the Worker and wait for its message-only HWND before anyone posts. The
-    // rules and execs are seeded in the Worker ctor, so they precede any Appeared
-    // and the Started{} below.
+    // rules, execs, and start_at_login flag are seeded in the Worker ctor, so they
+    // precede any Appeared and the Started{} below.
     std::promise<HWND> hwndReady;
     std::future<HWND> hwndFuture = hwndReady.get_future();
     std::jthread workerThread(workerThreadMain, std::move(hwndReady), std::move(cfg.rules),
-                              std::move(cfg.execs));
+                              std::move(cfg.execs), startAtLogin);
 
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
@@ -258,6 +155,11 @@ inline int runApp() {
     std::jthread hotkeyThread(hotkeyThreadMain, workerHwnd, std::cref(binds),
                               std::move(tidReady));
     const DWORD hotkeyTid = tidFuture.get();
+
+    // Tell the Worker the Hotkey thread's id so a live `reload` can hand that thread
+    // the freshly-parsed Binds to re-register (issue 09, ADR-0012). Posted after the
+    // id is known — the Worker was constructed before this thread existed.
+    PostMessageW(workerHwnd, k_wmSetHotkeyThread, static_cast<WPARAM>(hotkeyTid), 0);
 
     // Start the Hook thread (third jthread, mirroring the Hotkey thread). It owns
     // the SetWinEventHook adapter, registers its hooks then runs startup adoption,

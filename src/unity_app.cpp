@@ -23,6 +23,7 @@
 // io/app.cpp, which spawns its thread. io/error.cpp holds the shared error
 // vocabulary + diagnostic sink, so it precedes the adapters.
 #include "io/error.cpp"
+#include "io/config_io.cpp"
 #include "io/hotkeys.cpp"
 #include "io/probe.cpp"
 #include "io/vd_bridge.cpp"

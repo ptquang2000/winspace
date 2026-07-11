@@ -323,13 +323,21 @@ std::shared_ptr<const std::vector<WindowRule>> ruleList(std::vector<WindowRule> 
 }
 
 WindowRule exeRule(int ws, std::string exe) {
-    return WindowRule{Field::Exe, ws, std::move(exe), std::regex{}};
+    return WindowRule{Field::Exe, RuleAction::Place, ws, std::move(exe), std::regex{}};
 }
 WindowRule classRule(int ws, std::string cls) {
-    return WindowRule{Field::Class, ws, std::move(cls), std::regex{}};
+    return WindowRule{Field::Class, RuleAction::Place, ws, std::move(cls), std::regex{}};
 }
 WindowRule titleRule(int ws, const std::string& pattern) {
-    return WindowRule{Field::Title, ws, pattern, std::regex(pattern)};
+    return WindowRule{Field::Title, RuleAction::Place, ws, pattern, std::regex(pattern)};
+}
+
+// An Ignore-action rule (issue 09). workspace is unused for Ignore, so 0.
+WindowRule ignoreExeRule(std::string exe) {
+    return WindowRule{Field::Exe, RuleAction::Ignore, 0, std::move(exe), std::regex{}};
+}
+WindowRule ignoreTitleRule(const std::string& pattern) {
+    return WindowRule{Field::Title, RuleAction::Ignore, 0, pattern, std::regex(pattern)};
 }
 
 State stateWith(std::vector<WindowRule> rs) {
@@ -463,6 +471,71 @@ TEST_CASE("an Appeared with no rules seeded emits nothing but still places the i
     REQUIRE(second.effects.empty());
 }
 
+// ── windowrule ignore action + the ignored set (issue 09) ────────────────────
+
+TEST_CASE("an Appeared matching an Ignore rule emits no move — the id is recorded, not placed elsewhere", "[reducer][rules]") {
+    // Ignore never moves the window (winspace acts on it in no way), yet the window
+    // is Eligible and evaluated, so a repeat Appeared is not re-matched.
+    const State s = stateWith({ignoreExeRule("dock.exe")});
+
+    const auto first = reduce(s, appeared(WindowId{2}, "dock.exe", "cls", "Dock"));
+    REQUIRE(first.effects.empty());
+
+    const auto second = reduce(first.state, appeared(WindowId{2}, "dock.exe", "cls", "Dock"));
+    REQUIRE(second.effects.empty());
+}
+
+TEST_CASE("resolveFocus never returns an ignored window and still selects the next-best candidate", "[reducer][rules][focus]") {
+    const State base = stateWith({ignoreExeRule("dock.exe")});
+    // The dock Appears and is recorded in `ignored` (no move Effect emitted).
+    const auto afterIgnore = reduce(base, appeared(WindowId{2}, "dock.exe", "cls", "Dock"));
+    REQUIRE(afterIgnore.effects.empty());
+
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto dock = win(WindowId{2}, {150, 0, 250, 100});   // nearer — but ignored
+    const auto other = win(WindowId{3}, {300, 0, 400, 100});  // farther — Eligible target
+
+    const auto r = reduce(afterIgnore.state,
+                          FocusResolve{Direction::Right, {origin, dock, other}, origin});
+
+    // The nearer window is Eligible yet skipped by id; focus lands on the next-best.
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) ==
+            winspace::SetForegroundWindow{WindowId{3}});
+}
+
+TEST_CASE("a window matching both an Ignore and a Place rule resolves by exe→class→title precedence", "[reducer][rules]") {
+    // exe:ignore vs title:place — exe precedes title, so Ignore wins → no move.
+    {
+        const State s = stateWith({titleRule(3, "Term"), ignoreExeRule("wt.exe")});
+        const auto r = reduce(s, appeared(WindowId{1}, "wt.exe", "cls", "Terminal"));
+        REQUIRE(r.effects.empty());
+    }
+    // title:ignore vs exe:place — exe precedes title, so Place wins → move emitted.
+    {
+        const State s = stateWith({ignoreTitleRule("Term"), exeRule(3, "wt.exe")});
+        const auto r = reduce(s, appeared(WindowId{2}, "wt.exe", "cls", "Terminal"));
+        REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{2}, 3});
+    }
+}
+
+TEST_CASE("Vanished clears an ignored id so the window becomes a focus target again", "[reducer][rules][focus]") {
+    const State base = stateWith({ignoreExeRule("dock.exe")});
+    const auto ignored = reduce(base, appeared(WindowId{2}, "dock.exe", "cls", "Dock"));
+
+    const auto origin = win(WindowId{1}, {0, 0, 100, 100});
+    const auto dock = win(WindowId{2}, {150, 0, 250, 100});
+
+    // While ignored, focus skips it and (nothing else ahead) is a no-op.
+    const auto skip = reduce(ignored.state, FocusResolve{Direction::Right, {origin, dock}, origin});
+    REQUIRE(skip.effects.empty());
+
+    // After Vanished the id is cleared, so a candidate with that id is focusable again.
+    const auto gone = reduce(ignored.state, Vanished{WindowId{2}});
+    const auto after = reduce(gone.state, FocusResolve{Direction::Right, {origin, dock}, origin});
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(after) ==
+            winspace::SetForegroundWindow{WindowId{2}});
+}
+
 // ── launcher: Started / Reloaded → LaunchApp (PRD 08) ────────────────────────
 //
 // A State seeded with a synthetic exec list; assert the LaunchApp Effects. Started
@@ -535,4 +608,45 @@ TEST_CASE("the launch command is passed through verbatim, including a literal $"
     const auto r = reduce(s, Started{});
 
     REQUIRE(launched(r, 0) == "C:\\Program Files\\App\\app.exe --flag $HOME");
+}
+
+// ── reload trigger: Reload → ReloadConfig (issue 09, ADR-0012) ───────────────
+//
+// The Reducer is pure and cannot read a file, so a Reload{} only ASKS: it emits a
+// single ReloadConfig{} Effect and mutates no State. The Worker does the re-read /
+// re-parse / fan-out; that I/O is verified by the VM Smoke seam, not here.
+
+TEST_CASE("a Reload Event emits exactly one ReloadConfig and changes no State", "[reducer][reload]") {
+    State s{.currentWorkspace = 3, .running = true};
+    s.startAtLogin = true;
+    s.placed.insert(WindowId{7});
+
+    const auto r = reduce(s, Reload{});
+
+    REQUIRE(single_effect<ReloadConfig>(r) == ReloadConfig{});
+    // Nothing about State moves — the Reducer neither reads a file nor reseeds here.
+    REQUIRE(r.state.currentWorkspace == 3);
+    REQUIRE(r.state.running);
+    REQUIRE(r.state.startAtLogin);
+    REQUIRE(r.state.placed.contains(WindowId{7}));
+}
+
+// ── start_at_login carried through State (issue 09) ──────────────────────────
+//
+// The flag is seeded at Worker construction and reseeded on reload; the Reducer
+// only carries it — no Event derives an Effect from it, and every reduce preserves
+// it unchanged (the slice-10 logon task is what acts on it).
+
+TEST_CASE("startAtLogin round-trips through State and no Event emits an Effect for it", "[reducer]") {
+    State on;
+    on.startAtLogin = true;
+
+    // An Event that DOES change State still leaves startAtLogin untouched, and the
+    // only Effect is that Event's own — never one derived from the flag.
+    const auto sw = reduce(on, WorkspaceSwitch{4});
+    REQUIRE(sw.state.startAtLogin);
+    REQUIRE(single_effect<SwitchToWorkspace>(sw) == SwitchToWorkspace{4});
+
+    // A default State carries false through unchanged.
+    REQUIRE_FALSE(reduce(State{}, WorkspaceSwitch{1}).state.startAtLogin);
 }

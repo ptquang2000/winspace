@@ -10,10 +10,17 @@
 //   * `#` comments (whole-line or trailing)
 //   * `$name = tokens` variable definitions, referenced as `$name`
 //   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit,
-//     focus, movetoworkspace, movetoworkspacesilent })
+//     focus, movetoworkspace, movetoworkspacesilent, reload })
+//   * `windowrule = <action>, <field>:<pattern>`  (action in { workspace N, ignore })
+//   * `exec` / `exec-once = <verbatim command>`
+//   * `start_at_login = <bool>`
+// A name removed when tiling was dropped (ADR-0007) — a dispatcher such as
+// movewindow, or a setting such as min_tile_width — earns a targeted "removed with
+// tiling" Diagnostic rather than the generic unknown-name one.
 //
-// A malformed line yields a diagnostic and parsing continues. "Keep last good
-// config" retention and live reload are out of scope (issue 09).
+// A malformed line yields a diagnostic and parsing continues. The parse() seam is
+// pure and never reads a file; "keep last good config" retention and the live
+// reload orchestration live in the I/O layer (io/config_io.cpp + the Worker).
 #pragma once
 
 #include <algorithm>
@@ -91,6 +98,7 @@ enum class Dispatcher : uint8_t {
     Focus,
     MoveToWorkspace,        // movetoworkspace N — move + follow (switch to N)
     MoveToWorkspaceSilent,  // movetoworkspacesilent N — move, stay on current
+    Reload,                 // reload — re-read + re-apply the config file (issue 09)
 };
 
 // A parsed bind line. `arg` carries the workspace number for Workspace and the two
@@ -119,6 +127,9 @@ struct Config {
     std::vector<Bind> binds;
     std::vector<WindowRule> rules;
     std::vector<ExecEntry> execs;
+    // The flat `start_at_login` setting (issue 09); false when absent or set to
+    // `false`. Carried into State; the slice-10 logon task consumes it.
+    bool startAtLogin = false;
 };
 
 // Both halves of the return tuple exist from day one.
@@ -244,7 +255,30 @@ inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
     if (t == "focus") return Dispatcher::Focus;
     if (t == "movetoworkspace") return Dispatcher::MoveToWorkspace;
     if (t == "movetoworkspacesilent") return Dispatcher::MoveToWorkspaceSilent;
+    if (t == "reload") return Dispatcher::Reload;
     return std::nullopt;
+}
+
+// Names removed when tiling was dropped (ADR-0007) — dispatchers a `bind` might
+// still target and settings a ported Hyprland config might still carry. A match
+// earns a TARGETED "removed with tiling" Diagnostic (so a porting user reads it as
+// scoped, not mistyped); every other unknown name keeps the generic message, so a
+// real typo is still caught. One combined list: the message is identical and no
+// removed dispatcher name collides with a removed setting name.
+inline bool is_removed_tiling_name(std::string_view name) {
+    static constexpr std::string_view removed[] = {
+        // dispatchers
+        "movewindow", "maximize", "resizeactive", "togglefloat", "movetomonitor",
+        // settings
+        "min_tile_width", "min_tile_height"};
+    for (const std::string_view r : removed)
+        if (name == r) return true;
+    return false;
+}
+
+inline std::string removed_tiling_message(std::string_view name) {
+    return "'" + std::string(name) +
+           "' was removed with tiling (winspace owns no window geometry)";
 }
 
 // The four canonical direction words, case-insensitive, no aliases (users bind
@@ -383,7 +417,9 @@ inline ParseResult parse(std::string_view text) {
             const auto disp = parse_dispatcher(fields[2]);
             if (!disp) {
                 result.diagnostics.push_back(
-                    {line_no, "unknown dispatcher '" + std::string(fields[2]) + "'"});
+                    {line_no, is_removed_tiling_name(fields[2])
+                                  ? removed_tiling_message(fields[2])
+                                  : "unknown dispatcher '" + std::string(fields[2]) + "'"});
                 continue;
             }
 
@@ -433,9 +469,11 @@ inline ParseResult parse(std::string_view text) {
             continue;
         }
 
-        // `windowrule = workspace N, <field>:<pattern>` — pin a matching app to a
-        // Workspace on Appeared (PRD 06). NO $var expansion: a title regex may end
-        // in `$` (the end-anchor), which expand_vars would misread as a reference.
+        // `windowrule = <action>, <field>:<pattern>` — where <action> is
+        // `workspace N` (Place a matching app on a Workspace on Appeared, PRD 06) or
+        // `ignore` (exclude it from Spatial focus, issue 09). NO $var expansion: a
+        // title regex may end in `$` (the end-anchor), which expand_vars would
+        // misread as a reference.
         if (lhs == "windowrule") {
             // Split the RHS on the FIRST comma (action vs. match spec) so a title
             // regex may contain commas. rhs is already trimmed, so the spec's
@@ -443,38 +481,46 @@ inline ParseResult parse(std::string_view text) {
             const size_t comma = rhs.find(',');
             if (comma == std::string_view::npos) {
                 result.diagnostics.push_back(
-                    {line_no, "windowrule needs 'workspace N, <field>:<pattern>'"});
+                    {line_no, "windowrule needs '<action>, <field>:<pattern>'"});
                 continue;
             }
             const std::string_view action = trim(rhs.substr(0, comma));
             const std::string_view spec = rhs.substr(comma + 1);
 
-            // Action must be `workspace N`; `ignore` and other Hyprland forms are
+            // Action is `workspace N` (Place) or `ignore`; any other Hyprland form is
             // unsupported this slice (diagnosed, not aborting the file).
             const auto atoks = split_ws(action);
-            if (atoks.empty() || atoks[0] != "workspace") {
+            WindowRule rule;
+            if (!atoks.empty() && atoks[0] == "workspace") {
+                rule.action = RuleAction::Place;
+                if (atoks.size() < 2) {
+                    result.diagnostics.push_back(
+                        {line_no, "windowrule workspace needs a number"});
+                    continue;
+                }
+                int n = 0;
+                const std::string_view narg = atoks[1];
+                const auto [ptr, ec] =
+                    std::from_chars(narg.data(), narg.data() + narg.size(), n);
+                if (ec != std::errc{} || ptr != narg.data() + narg.size()) {
+                    result.diagnostics.push_back(
+                        {line_no, "windowrule workspace must be an integer: '" +
+                                      std::string(narg) + "'"});
+                    continue;
+                }
+                rule.workspace = n;
+            } else if (!atoks.empty() && atoks[0] == "ignore") {
+                rule.action = RuleAction::Ignore;  // no workspace number
+            } else {
                 result.diagnostics.push_back(
                     {line_no, "unsupported windowrule action '" + std::string(action) +
-                                  "' (only 'workspace N')"});
-                continue;
-            }
-            if (atoks.size() < 2) {
-                result.diagnostics.push_back(
-                    {line_no, "windowrule workspace needs a number"});
-                continue;
-            }
-            int n = 0;
-            const std::string_view narg = atoks[1];
-            const auto [ptr, ec] = std::from_chars(narg.data(), narg.data() + narg.size(), n);
-            if (ec != std::errc{} || ptr != narg.data() + narg.size()) {
-                result.diagnostics.push_back(
-                    {line_no, "windowrule workspace must be an integer: '" +
-                                  std::string(narg) + "'"});
+                                  "' (only 'workspace N' or 'ignore')"});
                 continue;
             }
 
             // Split the spec on the FIRST colon (field vs. verbatim pattern) so a
-            // title regex may contain colons.
+            // title regex may contain colons. Shared by both actions — an `ignore`
+            // rule names its match field exactly like a `workspace` rule.
             const size_t colon = spec.find(':');
             if (colon == std::string_view::npos) {
                 result.diagnostics.push_back(
@@ -484,8 +530,6 @@ inline ParseResult parse(std::string_view text) {
             const std::string_view fieldStr = trim(spec.substr(0, colon));
             const std::string_view pattern = spec.substr(colon + 1);  // verbatim tail
 
-            WindowRule rule;
-            rule.workspace = n;
             if (iequals(fieldStr, "exe")) rule.field = Field::Exe;
             else if (iequals(fieldStr, "class")) rule.field = Field::Class;
             else if (iequals(fieldStr, "title")) rule.field = Field::Title;
@@ -545,8 +589,30 @@ inline ParseResult parse(std::string_view text) {
             continue;
         }
 
+        // `start_at_login = <bool>` — the lone flat setting (issue 09). true/false,
+        // case-insensitive; anything else is a Diagnostic. Absent behaves as false.
+        // No section{} grammar and no workspace rules (both geometry-only, ADR-0007).
+        if (lhs == "start_at_login") {
+            if (iequals(rhs, "true")) {
+                result.config.startAtLogin = true;
+            } else if (iequals(rhs, "false")) {
+                result.config.startAtLogin = false;
+            } else {
+                result.diagnostics.push_back(
+                    {line_no, "start_at_login must be true or false: '" +
+                                  std::string(rhs) + "'"});
+            }
+            continue;
+        }
+
+        // A genuinely unknown directive — but if it names something removed with
+        // tiling (a dropped setting like min_tile_width, or a dispatcher used as a
+        // bare directive), give the targeted message so a ported config reads as
+        // scoped, not mistyped.
         result.diagnostics.push_back(
-            {line_no, "unknown directive '" + std::string(lhs) + "'"});
+            {line_no, is_removed_tiling_name(lhs)
+                          ? removed_tiling_message(lhs)
+                          : "unknown directive '" + std::string(lhs) + "'"});
     }
 
     return result;

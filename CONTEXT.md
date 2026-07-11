@@ -135,11 +135,14 @@ carries a Probed `WindowAttrs` (the Eligibility facts) **and** a `WindowIdentity
 lands with PRD 06.
 
 **WindowRule**:
-A parsed `windowrule` that pins a matching app to a target Workspace on `Appeared`. One rule
-names **one** match field and a pattern (`exe:…`, `class:…`, or `title:…`); `exe`/`class`
+A parsed `windowrule` carrying one **action** — **Place** (`workspace N`, pin a matching app to
+a target Workspace on `Appeared`) or **Ignore** (exclude a matching window from Spatial focus).
+One rule names **one** match field and a pattern (`exe:…`, `class:…`, or `title:…`); `exe`/`class`
 match case-insensitively and exactly, `title` is a regex. Rules are evaluated in the fixed
 field precedence **exe → class → title** (config order breaks within-field ties), first match
-wins. **Place-once** (see below) and Workspace-only — never geometry.
+wins — and the winning rule's *action* is what applies (a window matching both an Ignore and a
+Place rule resolves by that same first-match order). **Place-once** / **Ignore-set** (see below)
+and Workspace-or-focus only — never geometry.
 _Avoid_: windowrulev2, layer rule.
 
 **WindowIdentity**:
@@ -158,6 +161,18 @@ later becomes Eligible) and erased on `Vanished`. This is the deliberate, bounde
 that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md) records against ADR-0007's
 otherwise stateless window side.
 _Avoid_: continuous enforcement, pinning-forever.
+
+**Ignore-set**:
+The bounded `ignored` set of `WindowId` in `State` that enforces the **Ignore** WindowRule
+action. An id enters on its first Eligible `Appeared` when the window matches an Ignore rule and
+is erased on `Vanished`, mirroring `placed`. Spatial focus consults it: `resolveFocus` drops any
+Candidate whose id is in the set, so an Ignored window is never a focus target. Kept as state —
+rather than re-matched live at keypress — so the WindowIdentity read (a `title` match needs
+`GetWindowText` → `WM_GETTEXT`, which can block on a hung window) stays on the hook thread and
+never freezes focus navigation. Like Place-once, it is **not re-asserted on reload**: an Ignore
+rule added at reload only takes effect for a matching window when it next `Appears`.
+_Avoid_: unmanaged, blacklist, Ineligible (an Ignored window IS Eligible — it is excluded by
+rule, not by the Eligibility gate).
 
 ### Launcher
 
@@ -178,6 +193,47 @@ lifecycle Event the Reducer is handling (a start emits every entry; a reload emi
 `exec` ones), never a remembered "already launched" flag or a process-list check. Reload is
 the `reload` path from a later slice; until it lands, only the start fires.
 _Avoid_: autostart (that is the OS logon task that starts winspace itself), run, spawn-rule.
+
+### Config & reload
+
+**Reload** *(the trigger)*:
+The `reload` Dispatcher — a Bind target that re-reads and re-parses the config file live, with
+no restart. Distinct from **Reloaded** (below): `reload` fires from a hotkey and *causes* the
+re-parse; `Reloaded` is the post-parse Event that only re-launches `exec` entries. The flow is
+I/O-orchestrated because the Reducer is pure and cannot read files: `Reload` Event → the Reducer
+emits a `ReloadConfig` Effect → the Worker re-reads + re-parses (the parse lives on the Worker
+thread) → on success it swaps the new `rules`/`execs` into State, hands the new Binds to the
+Hotkey thread to re-register, and posts `Reloaded` to itself.
+_Avoid_: hot-swap, restart.
+
+**Reloaded** *(the Event)*:
+The post-parse lifecycle Event that makes the Reducer emit a `LaunchApp` for each `exec` (not
+`exec-once`) entry. Carries no config — the parse already happened in the I/O layer and the new
+`execs` are already in State. Not the trigger; see **Reload**.
+
+**Keep-last-good**:
+On reload, the running config stays live if the new file does not parse cleanly. Reload is
+**atomic**: any Diagnostic rejects the *whole* file — the Worker keeps the currently-running
+Binds, rules, and execs and logs the errors; nothing is partially applied. Contrast **startup**,
+which degrades **per-line** (keeps the good lines, drops the bad) because its only fallback is
+the destructive built-in default, whereas reload's fallback is the user's own working config.
+The asymmetry is deliberate: fall back to the least-destructive thing available.
+_Avoid_: rollback, last-known-good (this is config, not State).
+
+**Settings** *(the flat tail of the grammar)*:
+General `key = value` options that are neither Binds, rules, nor Launch entries. winspace has
+**no `section { … }` grammar and no workspace rules** — both are Hyprland constructs that only
+ever carried geometry, which winspace does not own (ADR-0007). The lone surviving setting is
+**`start_at_login`** — a bool (`true`/`false`, case-insensitive; anything else is a Diagnostic)
+parsed into `Config` and carried into `State` (`bool startAtLogin`, seeded at Worker
+construction beside `rules`/`execs`, reseeded on reload). Slice 09 only *parses* it and holds
+it in State; the Task Scheduler logon task it controls is registered/removed by slice 10, which
+reads `State.startAtLogin` and emits its own Effect. A removed tiling setting
+(`min_tile_width`, `min_tile_height`) or dispatcher (`movewindow`, `maximize`, `resizeactive`,
+`togglefloat`, `movetomonitor`) is a **targeted** "removed with tiling" Diagnostic, distinct
+from the generic unknown-directive message, so a ported Hyprland config reads as *scoped*, not
+broken.
+_Avoid_: section, category, general{} (there are no blocks).
 
 ### Threads
 

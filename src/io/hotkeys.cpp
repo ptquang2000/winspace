@@ -93,6 +93,7 @@ inline Event toEvent(const Bind& bind) {
         case Dispatcher::Focus: return FocusMove{toReducerDir(bind.dir)};
         case Dispatcher::MoveToWorkspace: return MoveToWorkspace{bind.arg, true};
         case Dispatcher::MoveToWorkspaceSilent: return MoveToWorkspace{bind.arg, false};
+        case Dispatcher::Reload: return Reload{};
     }
     return Quit{};  // unreachable
 }
