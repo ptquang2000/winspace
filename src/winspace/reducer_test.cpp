@@ -462,3 +462,77 @@ TEST_CASE("an Appeared with no rules seeded emits nothing but still places the i
     const auto second = reduce(first.state, appeared(WindowId{1}, "slack.exe", "cls", "Slack"));
     REQUIRE(second.effects.empty());
 }
+
+// ── launcher: Started / Reloaded → LaunchApp (PRD 08) ────────────────────────
+//
+// A State seeded with a synthetic exec list; assert the LaunchApp Effects. Started
+// launches every entry in config order; Reloaded launches only the `exec`
+// (once == false) entries. exec-once idempotency is observed purely through which
+// Event fires — there is no launch flag in State to inspect.
+
+namespace {
+
+State stateWithExecs(std::vector<ExecEntry> es) {
+    State s;
+    s.execs = std::make_shared<const std::vector<ExecEntry>>(std::move(es));
+    return s;
+}
+
+// The command carried by the i-th emitted LaunchApp, or fail loudly if that Effect
+// is not a LaunchApp.
+std::string launched(const ReduceResult& r, size_t i) {
+    REQUIRE(i < r.effects.size());
+    REQUIRE(std::holds_alternative<LaunchApp>(r.effects[i]));
+    return std::get<LaunchApp>(r.effects[i]).command;
+}
+
+}  // namespace
+
+TEST_CASE("Started launches every exec entry, exec-once and exec alike, in config order", "[reducer][launcher]") {
+    const State s = stateWithExecs({{"firefox", true},        // exec-once
+                                    {"kitty", false},         // exec
+                                    {"code --new-window", true}});
+
+    const auto r = reduce(s, Started{});
+
+    REQUIRE(r.effects.size() == 3);
+    REQUIRE(launched(r, 0) == "firefox");
+    REQUIRE(launched(r, 1) == "kitty");
+    REQUIRE(launched(r, 2) == "code --new-window");
+    // Startup persists nothing — idempotency is stateless.
+    REQUIRE(r.state.running);
+}
+
+TEST_CASE("Reloaded launches only the exec entries, skipping exec-once, in config order", "[reducer][launcher]") {
+    const State s = stateWithExecs({{"firefox", true},   // exec-once — skipped on reload
+                                    {"kitty", false},    // exec — relaunched
+                                    {"agent", true},     // exec-once — skipped
+                                    {"tray", false}});   // exec — relaunched
+
+    const auto r = reduce(s, Reloaded{});
+
+    REQUIRE(r.effects.size() == 2);
+    REQUIRE(launched(r, 0) == "kitty");
+    REQUIRE(launched(r, 1) == "tray");
+}
+
+TEST_CASE("Started and Reloaded with no exec entries emit nothing", "[reducer][launcher]") {
+    // A default State has a null execs handle; both handlers must skip it safely.
+    REQUIRE(reduce(State{}, Started{}).effects.empty());
+    REQUIRE(reduce(State{}, Reloaded{}).effects.empty());
+
+    // An all-exec-once list yields nothing on reload, everything on start.
+    const State onceOnly = stateWithExecs({{"a", true}, {"b", true}});
+    REQUIRE(reduce(onceOnly, Reloaded{}).effects.empty());
+    REQUIRE(reduce(onceOnly, Started{}).effects.size() == 2);
+}
+
+TEST_CASE("the launch command is passed through verbatim, including a literal $", "[reducer][launcher]") {
+    // No $var expansion anywhere on the launch path — the Reducer emits the stored
+    // string byte-for-byte.
+    const State s = stateWithExecs({{"C:\\Program Files\\App\\app.exe --flag $HOME", true}});
+
+    const auto r = reduce(s, Started{});
+
+    REQUIRE(launched(r, 0) == "C:\\Program Files\\App\\app.exe --flag $HOME");
+}

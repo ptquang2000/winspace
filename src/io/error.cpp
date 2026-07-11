@@ -77,6 +77,18 @@ inline std::string narrow(std::wstring_view w) {
     return out;
 }
 
+// UTF-8 narrow → wide (UTF-16), the inverse of narrow(). The launcher needs it to
+// hand a config command line (stored as UTF-8 bytes) to CreateProcessW; no other
+// caller today. Empty in → empty out (MultiByteToWideChar rejects a zero length).
+inline std::wstring widen(std::string_view s) {
+    if (s.empty()) return {};
+    const int n =
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
+    return out;
+}
+
 // ── the error vocabulary ─────────────────────────────────────────────────────
 
 // The success value for the previously-void expecteds. A named empty type keeps

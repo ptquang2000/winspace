@@ -81,8 +81,12 @@ from tiling and may be loosened for focus candidacy later.)*
 ## 6. Launcher — *future, PRD 08*
 
 - `exec` (runs on every config reload) and `exec-once` (startup only) — hyprland idiom.
-- An entry can specify a target **workspace**; winspace launches via `CreateProcess` and
-  assigns the app's first window by **PID match**. Workspace assignment only — no geometry.
+- **Launch-only** ([ADR-0011](docs/adr/0011-launcher-launch-only-placement-via-windowrule.md)):
+  winspace launches via `CreateProcess` and detaches. It does **no** PID matching and assigns
+  **no** workspace. (The earlier "specify a target workspace, assign the first window by PID
+  match" design was dropped before it was built — PID matching is *less* reliable than an `exe`
+  rule for the multi-process apps it would most need.) To place a launched app, pair it with a
+  `windowrule = workspace N, exe:…` (PRD 07). Workspace assignment only — no geometry.
 
 ---
 

@@ -99,6 +99,22 @@ struct WindowRule {
     std::regex regex;
 };
 
+// A parsed `exec = <cmd>` / `exec-once = <cmd>` launch entry (PRD 08, ADR-0011).
+// `command` is the verbatim command line (unexpanded — no $var); `once` is true
+// for exec-once (start only, not on reload). Launch-only: no target Workspace,
+// no PID — placement is a paired `windowrule` (PRD 07). Lives in the core next to
+// WindowRule; the parser (Seam 2) collects these in source order and the reducer
+// turns each into a LaunchApp Effect. State holds the list behind a shared_ptr for
+// O(1) per-event copies, mirroring `rules` (ADR-0009).
+struct ExecEntry {
+    std::string command;
+    bool once = false;
+};
+
+constexpr bool operator==(const ExecEntry& a, const ExecEntry& b) {
+    return a.command == b.command && a.once == b.once;
+}
+
 // The four directions a `focus` press can steer keyboard focus. Nested in a
 // namespace so it stays a DISTINCT type from config::Direction — both would
 // otherwise be winspace::Direction and collide in the app/test TUs that include
@@ -154,8 +170,16 @@ struct Vanished {
     WindowId id{};
 };
 
+// Launcher lifecycle Events (PRD 08). Started = the spine posted it once the
+// Worker HWND exists; it makes the Reducer emit a LaunchApp for EVERY exec entry.
+// Reloaded = config was reloaded (the trigger itself lands with PRD 09); it emits
+// LaunchApp only for the `exec` (once == false) entries. exec-once idempotency is
+// thus stateless — purely which Event fires, never a remembered flag.
+struct Started {};
+struct Reloaded {};
+
 using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
-                           Appeared, Vanished>;
+                           Appeared, Vanished, Started, Reloaded>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
 // Worker thread against the COM bridge; the Reducer itself performs no I/O. No
@@ -195,8 +219,16 @@ struct MoveWindowToWorkspace {
     int logical = 0;
 };
 
+// Launch a detached child process (PRD 08, ADR-0011). The Worker runs `command`
+// through one CreateProcessW and closes both handles — launch-only, no PID kept,
+// no Workspace assigned (placement is a paired `windowrule`). `command` is the
+// verbatim config tail.
+struct LaunchApp {
+    std::string command;
+};
+
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
-                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace>;
+                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, LaunchApp>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -221,6 +253,9 @@ constexpr bool operator==(const MoveForegroundWindowToWorkspace& a,
 }
 constexpr bool operator==(const MoveWindowToWorkspace& a, const MoveWindowToWorkspace& b) {
     return a.id == b.id && a.logical == b.logical;
+}
+inline bool operator==(const LaunchApp& a, const LaunchApp& b) {
+    return a.command == b.command;
 }
 
 // Value equality for the plain-data window types (used by the eligibility tests
@@ -252,6 +287,12 @@ struct State {
     // erased on Vanished, so a user-moved window is never yanked back.
     std::shared_ptr<const std::vector<WindowRule>> rules;
     std::unordered_set<WindowId> placed;
+
+    // Launch entries (PRD 08), seeded once at Worker construction behind the same
+    // O(1)-copy shared handle as `rules`. Read only by the Started/Reloaded
+    // handlers, which turn each into a LaunchApp; never mutated by a reduce. No
+    // per-window launch state exists — exec-once idempotency is stateless.
+    std::shared_ptr<const std::vector<ExecEntry>> execs;
 };
 
 struct ReduceResult {
@@ -480,6 +521,26 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 State next = s;
                 next.placed.erase(v.id);
                 return {next, {}};
+            },
+            // Startup (PRD 08): emit a LaunchApp for EVERY exec entry, in config
+            // order (exec-once + exec alike). State is untouched — exec-once
+            // idempotency is stateless, falling out of which Event fires.
+            [&](const Started&) -> ReduceResult {
+                std::vector<Effect> effects;
+                if (s.execs)
+                    for (const ExecEntry& e : *s.execs)
+                        effects.push_back(Effect{LaunchApp{e.command}});
+                return {s, std::move(effects)};
+            },
+            // Reload (PRD 08; the trigger itself is PRD 09): emit LaunchApp only for
+            // the `exec` (once == false) entries, in config order — exec-once is
+            // skipped so a reload never spawns a second copy of an already-open app.
+            [&](const Reloaded&) -> ReduceResult {
+                std::vector<Effect> effects;
+                if (s.execs)
+                    for (const ExecEntry& e : *s.execs)
+                        if (!e.once) effects.push_back(Effect{LaunchApp{e.command}});
+                return {s, std::move(effects)};
             },
         },
         e);

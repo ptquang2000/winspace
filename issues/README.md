@@ -17,23 +17,22 @@ has since landed. The number **07** is now reused for the windowrule slice.
 ## Dependency graph
 
 ```
-01 ─┬─ 08   (08's launcher builds on the VD move (06) and the hook/rules (07),
-    │        both now landed)
-    ├─ 09
+01 ─┬─ 09
     └─ 10
 ```
 
-`08`'s launcher reuses the Virtual Desktop move path from `06` and the `SetWinEventHook`
-adapter / `Appeared` / `Vanished` stream reintroduced by `07` — both landed, so `08` is
-unblocked.
+`08`'s launcher was **launch-only** (ADR-0011): it starts processes via `CreateProcess` and
+does no PID matching. All Workspace placement stays with the `windowrule` path reintroduced by
+`07` (landed). Now landed: the `exec` / `exec-once` parse, the `Started`/`Reloaded` →
+`LaunchApp` reducer, and the `CreateProcessW` detach in the Worker.
 
 | # | Title | Blocked by |
 |---|-------|-----------|
-| 08 | Launcher: exec / exec-once with PID-match workspace assignment | 01, 06, 07 |
 | 09 | Full config grammar + reload | 01 |
 | 10 | Autostart via Task Scheduler logon task | 01 |
 
 _Landed and no longer listed: 01 (walking skeleton), 02 (window tracking + eligibility —
 its positioning half is now removed, the eligibility gate survives), 05 (spatial directional
 focus), 06 (move-to-workspace via internal VD move), 07 (windowrule place-once rules —
-reintroduced the hook), 11 (Win32/COM error handling), 12 (VM seam-test harness)._
+reintroduced the hook), 08 (launcher: exec / exec-once, launch-only — placement via
+windowrule), 11 (Win32/COM error handling), 12 (VM seam-test harness)._

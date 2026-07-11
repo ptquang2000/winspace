@@ -4,7 +4,7 @@ A Windows 11 workspace + focus manager that leans on OS-native facilities and st
 the input critical path. It switches Workspaces and switches keyboard focus between
 windows; it owns **no window geometry** — it never moves or sizes a window (see
 [ADR-0007](docs/adr/0007-drop-tiling-no-window-geometry.md)). This glossary fixes the
-ubiquitous language shared by `PRD.md`, `DESIGN.md`, the `issues/`, and the code.
+ubiquitous language shared by `DESIGN.md`, the `issues/`, and the code.
 
 ## Language
 
@@ -158,6 +158,26 @@ later becomes Eligible) and erased on `Vanished`. This is the deliberate, bounde
 that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md) records against ADR-0007's
 otherwise stateless window side.
 _Avoid_: continuous enforcement, pinning-forever.
+
+### Launcher
+
+**Launch entry**:
+A parsed `exec` or `exec-once` line — a **verbatim command line** winspace runs at start via
+`CreateProcessW`. The command is stored unparsed (no `$var` expansion) and handed to Win32
+as-is. A Launch entry carries **no target Workspace** and does **no** window matching: it only
+starts a process (and detaches — winspace tracks nothing about the child). To place a launched
+app on a Workspace, pair it with a **WindowRule** matching the app's `exe`. The originally
+specified PID-match placement was dropped before it was built — see
+[ADR-0011](docs/adr/0011-launcher-launch-only-placement-via-windowrule.md).
+_Avoid_: PID match, placement (the launcher places nothing — WindowRule does).
+
+**exec / exec-once**:
+The two kinds of Launch entry. **exec-once** runs only at the initial start; **exec** runs at
+start **and** on every later config reload. The distinction is stateless — it is purely which
+lifecycle Event the Reducer is handling (a start emits every entry; a reload emits only the
+`exec` ones), never a remembered "already launched" flag or a process-list check. Reload is
+the `reload` path from a later slice; until it lands, only the start fires.
+_Avoid_: autostart (that is the OS logon task that starts winspace itself), run, spawn-rule.
 
 ### Threads
 

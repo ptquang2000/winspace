@@ -69,7 +69,15 @@ inline constexpr std::string_view k_defaultConfig =
     "bind = $mod SHIFT, 2, movetoworkspacesilent, 2\n"
     "bind = $mod SHIFT, 3, movetoworkspacesilent, 3\n"
     "bind = $mod SHIFT, 4, movetoworkspacesilent, 4\n"
-    "bind = $mod SHIFT, 5, movetoworkspacesilent, 5\n";
+    "bind = $mod SHIFT, 5, movetoworkspacesilent, 5\n"
+    "# Launch apps at startup. `exec-once` runs once when winspace starts; `exec`\n"
+    "# runs at startup and again on every config reload. Each line is a verbatim\n"
+    "# command (exe + args, quoted paths for spaces), started detached — it keeps\n"
+    "# running after winspace exits. The launcher only STARTS apps; it never places\n"
+    "# them. To put a launched app on a workspace, pair it with a `windowrule` that\n"
+    "# matches the window by exe. Example: start Firefox and pin it to workspace 2.\n"
+    "# exec-once = firefox\n"
+    "# windowrule = workspace 2, exe:firefox.exe\n";
 
 // Read an environment variable with the size-then-fill two-call pattern.
 // GetEnvironmentVariableW returns the length INCLUDING the null when probing with
@@ -147,6 +155,7 @@ inline std::string loadConfigText() {
 struct LoadedConfig {
     std::vector<Bind> binds;
     std::vector<WindowRule> rules;
+    std::vector<ExecEntry> execs;
 };
 
 // Parse the config once, surfacing any parser diagnostics through the I/O sink,
@@ -157,7 +166,8 @@ inline LoadedConfig loadConfig() {
     ParseResult parsed = parse(text);
     for (const Diagnostic& d : parsed.diagnostics)
         lg::warn("config line {}: {}", d.line, d.message);
-    return {std::move(parsed.config.binds), std::move(parsed.config.rules)};
+    return {std::move(parsed.config.binds), std::move(parsed.config.rules),
+            std::move(parsed.config.execs)};
 }
 
 // A non-interactive exit path: setting WINSPACE_SELFTEST_QUIT drives one Quit
@@ -212,24 +222,34 @@ inline int runApp() {
         lg::warn("app: Per-Monitor-V2 DPI awareness not set: {}", aware.error());
     }
 
-    // One parse yields both halves. The Binds are owned here and passed to the
+    // One parse yields all three halves. The Binds are owned here and passed to the
     // Hotkey thread by const reference (this declaration outlives hotkeyThread,
-    // joined below); the WindowRules are moved into the Worker thread, which seeds
-    // them into State before publishing its HWND.
+    // joined below); the WindowRules and the launch entries are moved into the
+    // Worker thread, which seeds both into State before publishing its HWND.
     LoadedConfig cfg = loadConfig();
     const std::vector<Bind> binds = std::move(cfg.binds);
 
     // Start the Worker and wait for its message-only HWND before anyone posts. The
-    // rules are seeded in the Worker ctor, so they precede any Appeared.
+    // rules and execs are seeded in the Worker ctor, so they precede any Appeared
+    // and the Started{} below.
     std::promise<HWND> hwndReady;
     std::future<HWND> hwndFuture = hwndReady.get_future();
-    std::jthread workerThread(workerThreadMain, std::move(hwndReady), std::move(cfg.rules));
+    std::jthread workerThread(workerThreadMain, std::move(hwndReady), std::move(cfg.rules),
+                              std::move(cfg.execs));
 
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
         workerThread.join();
         return 1;  // Worker could not create its window — nothing can proceed
     }
+
+    // The Worker HWND exists and its execs are seeded: post Started{} so the launch
+    // entries fire (PRD 08). Done before the hotkey/hook threads wire up — ordering
+    // vs. the hook thread is not correctness-critical, since PRD 07's
+    // register-then-EnumWindows adoption places a launched window whether it appears
+    // before or after the hooks register. Only Started{} is triggered this slice;
+    // the Reloaded{} trigger lands with PRD 09.
+    postEvent(workerHwnd, new Event{Started{}});
 
     // Start the Hotkey thread once the Worker HWND exists to post to. It registers
     // the Binds as OS hotkeys on its own thread.

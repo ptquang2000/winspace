@@ -57,8 +57,12 @@ public:
     // so rules are in place before any Appeared (synthetic-adoption or live) can
     // arrive (PRD 06 ordering). The rule list is wrapped in a shared handle so the
     // per-event State copy stays O(1) (ADR-0009 / PRD deviation).
-    explicit Worker(std::vector<WindowRule> rules) {
+    explicit Worker(std::vector<WindowRule> rules, std::vector<ExecEntry> execs) {
         m_state.rules = std::make_shared<const std::vector<WindowRule>>(std::move(rules));
+        // Launch entries are seeded alongside rules and behind the same O(1)-copy
+        // handle, so they precede the Started{} the spine posts right after the
+        // HWND publishes (PRD 08).
+        m_state.execs = std::make_shared<const std::vector<ExecEntry>>(std::move(execs));
 
         // This thread is the single STA that will own the COM bridge (task 06).
         // COINIT_APARTMENTTHREADED demands a message loop, which run() supplies.
@@ -207,6 +211,30 @@ private:
                     // cross-Workspace pin never flashes here. Null bridge → no-op.
                     if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
                 },
+                [&](const LaunchApp& l) {
+                    // Launch-only (PRD 08 / ADR-0011): start a detached child and
+                    // forget it — no PID kept, no Workspace assigned (placement is a
+                    // paired `windowrule`). CreateProcessW itself parses exe + args
+                    // from the command line and searches %PATH%; it WRITES to
+                    // lpCommandLine, so the widened command goes into a mutable
+                    // buffer. cwd/env are inherited (nullptr). On success both handles
+                    // are closed immediately, fully detaching the child so it outlives
+                    // winspace; on failure we degrade-and-log and continue — one bad
+                    // entry never takes down the WM or blocks the others.
+                    std::wstring cmdline = widen(l.command);
+                    STARTUPINFOW si{};
+                    si.cb = sizeof(si);
+                    PROCESS_INFORMATION pi{};
+                    if (const auto launched =
+                            ok(CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
+                                              0, nullptr, nullptr, &si, &pi))) {
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                    } else {
+                        lg::warn("exec: launch failed for '{}': {}", l.command,
+                                 launched.error());
+                    }
+                },
             },
             effect);
     }
@@ -221,8 +249,9 @@ private:
 // the HWND to the spine, then pumps until Exit. On return the Worker destructor
 // tears COM and the window down on this same thread. A null published HWND
 // signals a construction failure the spine treats as fatal.
-inline void workerThreadMain(std::promise<HWND> ready, std::vector<WindowRule> rules) {
-    Worker worker(std::move(rules));
+inline void workerThreadMain(std::promise<HWND> ready, std::vector<WindowRule> rules,
+                             std::vector<ExecEntry> execs) {
+    Worker worker(std::move(rules), std::move(execs));
     const HWND hwnd = worker.hwnd();
     ready.set_value(hwnd);
     if (hwnd) worker.run();

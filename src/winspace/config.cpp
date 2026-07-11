@@ -118,6 +118,7 @@ struct Diagnostic {
 struct Config {
     std::vector<Bind> binds;
     std::vector<WindowRule> rules;
+    std::vector<ExecEntry> execs;
 };
 
 // Both halves of the return tuple exist from day one.
@@ -523,6 +524,24 @@ inline ParseResult parse(std::string_view text) {
             }
 
             result.config.rules.push_back(std::move(rule));
+            continue;
+        }
+
+        // `exec = <cmd>` / `exec-once = <cmd>` — declare an app to launch (PRD 08,
+        // ADR-0011). The command is the VERBATIM tail after `=` (may hold spaces,
+        // commas, quotes, `$`), stored unparsed into one source-ordered list so the
+        // launch order across interleaved exec / exec-once lines is preserved. NO
+        // $var expansion — winspace vars are modifier names, and a literal `$` in a
+        // path or arg must pass through (mirrors windowrule's verbatim-tail rule).
+        // `rhs` is the already-trimmed remainder; an empty tail is diagnosed and
+        // skipped. Placement is a paired `windowrule`, never the launcher's job.
+        if (lhs == "exec" || lhs == "exec-once") {
+            if (rhs.empty()) {
+                result.diagnostics.push_back(
+                    {line_no, std::string(lhs) + " needs a command"});
+                continue;
+            }
+            result.config.execs.push_back({std::string(rhs), lhs == "exec-once"});
             continue;
         }
 

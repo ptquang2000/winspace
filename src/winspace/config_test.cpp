@@ -336,3 +336,73 @@ TEST_CASE("one parse returns both binds and rules", "[config]") {
     REQUIRE(result.config.binds.size() == 1);
     REQUIRE(result.config.rules.size() == 1);
 }
+
+// ── exec / exec-once directive (PRD 08) ──────────────────────────────────────
+
+TEST_CASE("exec and exec-once parse into one source-ordered list with the right once flag", "[config]") {
+    // Interleaved exec / exec-once lines must preserve global source order in the
+    // single tagged list — that order is the launch order.
+    const auto result = parse(
+        "exec-once = firefox\n"
+        "exec = kitty\n"
+        "exec-once = code --new-window\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.execs.size() == 3);
+    REQUIRE(result.config.execs[0] == ExecEntry{"firefox", true});
+    REQUIRE(result.config.execs[1] == ExecEntry{"kitty", false});
+    REQUIRE(result.config.execs[2] == ExecEntry{"code --new-window", true});
+}
+
+TEST_CASE("the exec command tail is stored verbatim — spaces, quotes, commas, and $ survive", "[config]") {
+    // The tail after `=` is verbatim: no field-splitting on commas, no $var
+    // expansion (unlike bind). A literal `$` in a path or arg passes through.
+    const auto result = parse(
+        "exec-once = \"C:\\Program Files\\App\\app.exe\" --a, --b $HOME\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.execs.size() == 1);
+    REQUIRE(result.config.execs[0] ==
+            ExecEntry{"\"C:\\Program Files\\App\\app.exe\" --a, --b $HOME", true});
+}
+
+TEST_CASE("no $var expansion is applied to a launch command even when the var is defined", "[config]") {
+    // $mod is a real variable here; a bind would expand it, but exec must not —
+    // the `$mod` is passed through literally.
+    const auto result = parse(
+        "$mod = SUPER\n"
+        "exec = run $mod\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.execs.size() == 1);
+    REQUIRE(result.config.execs[0] == ExecEntry{"run $mod", false});
+}
+
+TEST_CASE("an empty exec or exec-once tail is diagnosed and skipped while valid lines parse", "[config]") {
+    const auto result = parse(
+        "exec-once = firefox\n"
+        "exec =\n"           // empty tail → diagnostic, skipped
+        "exec-once =   \n"   // whitespace-only tail → also empty after trim
+        "exec = kitty\n");
+
+    REQUIRE(result.diagnostics.size() == 2);
+    REQUIRE(result.diagnostics[0].line == 2);
+    REQUIRE(result.diagnostics[1].line == 3);
+    // The two well-formed entries still parse, in order.
+    REQUIRE(result.config.execs.size() == 2);
+    REQUIRE(result.config.execs[0] == ExecEntry{"firefox", true});
+    REQUIRE(result.config.execs[1] == ExecEntry{"kitty", false});
+}
+
+TEST_CASE("one parse returns binds, rules, and execs together", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, 1, workspace, 1\n"
+        "windowrule = workspace 2, exe:firefox.exe\n"
+        "exec-once = firefox\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.execs.size() == 1);
+    REQUIRE(result.config.execs[0] == ExecEntry{"firefox", true});
+}
