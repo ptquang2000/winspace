@@ -17,8 +17,7 @@ has since landed. The number **07** is now reused for the windowrule slice.
 ## Dependency graph
 
 ```
-01 ─┬─ 09
-    └─ 10
+01 ── 10
 ```
 
 `08`'s launcher was **launch-only** (ADR-0011): it starts processes via `CreateProcess` and
@@ -28,11 +27,12 @@ does no PID matching. All Workspace placement stays with the `windowrule` path r
 
 | # | Title | Blocked by |
 |---|-------|-----------|
-| 09 | Full config grammar + reload | 01 |
 | 10 | Autostart via Task Scheduler logon task | 01 |
 
 _Landed and no longer listed: 01 (walking skeleton), 02 (window tracking + eligibility —
 its positioning half is now removed, the eligibility gate survives), 05 (spatial directional
 focus), 06 (move-to-workspace via internal VD move), 07 (windowrule place-once rules —
 reintroduced the hook), 08 (launcher: exec / exec-once, launch-only — placement via
-windowrule), 11 (Win32/COM error handling), 12 (VM seam-test harness)._
+windowrule), 09 (full config grammar + reload — windowrule `ignore`, `start_at_login`,
+removed-with-tiling diagnostics, live `reload`), 11 (Win32/COM error handling), 12 (VM
+seam-test harness)._
