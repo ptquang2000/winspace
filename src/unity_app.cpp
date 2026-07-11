@@ -18,13 +18,15 @@
 // (pulled in by io/app.cpp); task 06 landed io/vd_bridge.cpp (pulled in by
 // io/worker.cpp, which owns the bridge on its STA thread). issue 05 landed
 // io/probe.cpp — the reactive window sweep behind the `focus` dispatcher (pulled
-// in by io/worker.cpp). io/window_hook.cpp was removed with tiling (ADR-0007) —
-// PRD 06 reintroduces it. io/error.cpp holds the shared error vocabulary +
-// diagnostic sink, so it precedes the adapters.
+// in by io/worker.cpp). io/window_hook.cpp is the SetWinEventHook lifecycle
+// adapter PRD 06 reintroduced (removed with tiling, ADR-0007) — pulled in by
+// io/app.cpp, which spawns its thread. io/error.cpp holds the shared error
+// vocabulary + diagnostic sink, so it precedes the adapters.
 #include "io/error.cpp"
 #include "io/hotkeys.cpp"
 #include "io/probe.cpp"
 #include "io/vd_bridge.cpp"
+#include "io/window_hook.cpp"
 #include "io/worker.cpp"
 #include "io/app.cpp"
 

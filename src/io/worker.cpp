@@ -23,6 +23,7 @@
 #include <memory>
 #include <thread>
 #include <utility>  // std::move
+#include <vector>
 
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/probe.cpp"      // window Probe sweep + WindowId ⇄ HWND mint (focus)
@@ -51,7 +52,14 @@ inline void postEvent(HWND workerHwnd, Event* ev) {
 // CoUninitialize) is likewise thread-correct.
 class Worker {
 public:
-    Worker() {
+    // Takes the parsed window rules and seeds m_state.rules BEFORE anything can
+    // reach this Worker: the ctor runs before workerThreadMain publishes the HWND,
+    // so rules are in place before any Appeared (synthetic-adoption or live) can
+    // arrive (PRD 06 ordering). The rule list is wrapped in a shared handle so the
+    // per-event State copy stays O(1) (ADR-0009 / PRD deviation).
+    explicit Worker(std::vector<WindowRule> rules) {
+        m_state.rules = std::make_shared<const std::vector<WindowRule>>(std::move(rules));
+
         // This thread is the single STA that will own the COM bridge (task 06).
         // COINIT_APARTMENTTHREADED demands a message loop, which run() supplies.
         // A failed init is tolerated (the bridge factory degrades to a null bridge);
@@ -191,6 +199,14 @@ private:
                     }
                     m_bridge->moveWindowToWorkspace(toWindowId(fg), m.logical);
                 },
+                [&](const MoveWindowToWorkspace& m) {
+                    // The WindowRule move (PRD 06): a SPECIFIC window that just
+                    // Appeared, by id — no GetForegroundWindow, no cloak. The
+                    // internal MoveViewToDesktop reassigns the desktop without ever
+                    // painting on the current one (ADR-0010 revised), so a
+                    // cross-Workspace pin never flashes here. Null bridge → no-op.
+                    if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
+                },
             },
             effect);
     }
@@ -205,8 +221,8 @@ private:
 // the HWND to the spine, then pumps until Exit. On return the Worker destructor
 // tears COM and the window down on this same thread. A null published HWND
 // signals a construction failure the spine treats as fatal.
-inline void workerThreadMain(std::promise<HWND> ready) {
-    Worker worker;
+inline void workerThreadMain(std::promise<HWND> ready, std::vector<WindowRule> rules) {
+    Worker worker(std::move(rules));
     const HWND hwnd = worker.hwnd();
     ready.set_value(hwnd);
     if (hwnd) worker.run();

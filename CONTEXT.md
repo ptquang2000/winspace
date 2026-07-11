@@ -152,8 +152,9 @@ _Avoid_: WindowInfo, metadata.
 **Place-once**:
 The rule that a `WindowRule` assigns a window a Workspace **exactly once in its lifetime** and
 never re-asserts it — a window the user later moves is not yanked back. Enforced by a bounded
-`placed` set of `WindowId` in `State`: an id is inserted on its first `Appeared` (matched or
-not) and erased on `Vanished`. This is the deliberate, bounded reintroduction of window state
+`placed` set of `WindowId` in `State`: an id is inserted on its first `Appeared` **once
+Eligible** (matched or not; an Ineligible edge inserts nothing, so it is re-evaluated when it
+later becomes Eligible) and erased on `Vanished`. This is the deliberate, bounded reintroduction of window state
 that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md) records against ADR-0007's
 otherwise stateless window side.
 _Avoid_: continuous enforcement, pinning-forever.

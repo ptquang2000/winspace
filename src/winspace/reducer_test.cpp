@@ -308,3 +308,157 @@ TEST_CASE("y-down convention: focus down picks the +y Candidate, focus up the -y
     const auto up = reduce(State{}, FocusResolve{Direction::Up, candidates, origin});
     REQUIRE(single_effect<winspace::SetForegroundWindow>(up) == winspace::SetForegroundWindow{WindowId{3}});
 }
+
+// ── window rules: match + place-once (PRD 06) ────────────────────────────────
+//
+// These feed synthetic Appeared / Vanished Events with hand-built WindowAttrs +
+// WindowIdentity and assert on the emitted Effects, never on State internals —
+// the `placed` set is observed only through what a later Appeared does or doesn't
+// emit. No WM library is linked here, so the matcher's purity is linker-enforced.
+
+namespace {
+
+std::shared_ptr<const std::vector<WindowRule>> ruleList(std::vector<WindowRule> rs) {
+    return std::make_shared<const std::vector<WindowRule>>(std::move(rs));
+}
+
+WindowRule exeRule(int ws, std::string exe) {
+    return WindowRule{Field::Exe, ws, std::move(exe), std::regex{}};
+}
+WindowRule classRule(int ws, std::string cls) {
+    return WindowRule{Field::Class, ws, std::move(cls), std::regex{}};
+}
+WindowRule titleRule(int ws, const std::string& pattern) {
+    return WindowRule{Field::Title, ws, pattern, std::regex(pattern)};
+}
+
+State stateWith(std::vector<WindowRule> rs) {
+    State s;
+    s.rules = ruleList(std::move(rs));
+    return s;
+}
+
+// An Appeared with a fully-Eligible WindowAttrs (from `eligible` above) and the
+// given identity strings; the id is shared by both halves, as the adapter mints it.
+Appeared appeared(WindowId id, std::string exe, std::string cls, std::string title) {
+    return Appeared{eligible(id, kMon),
+                    WindowIdentity{id, std::move(exe), std::move(cls), std::move(title)}};
+}
+
+}  // namespace
+
+TEST_CASE("an Appeared matching a rule emits exactly MoveWindowToWorkspace{thatId, N}", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto r = reduce(s, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+
+    REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{7}, 2});
+}
+
+TEST_CASE("a repeat Appeared for an already-placed id emits nothing", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto first = reduce(s, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(single_effect<MoveWindowToWorkspace>(first) == MoveWindowToWorkspace{WindowId{7}, 2});
+
+    // Same id again, reduced against the state the first Appeared produced.
+    const auto second = reduce(first.state, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(second.effects.empty());
+}
+
+TEST_CASE("field precedence is exe over class over title, independent of config order", "[reducer][rules]") {
+    // One window matches all three fields; the rules are listed title, class, exe
+    // (reverse precedence) to prove precedence is by FIELD, not vector position.
+    const State s = stateWith(
+        {titleRule(30, "Term"), classRule(40, "ConsoleWindowClass"), exeRule(20, "wt.exe")});
+
+    const auto r = reduce(s, appeared(WindowId{1}, "wt.exe", "ConsoleWindowClass", "Terminal"));
+
+    REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{1}, 20});
+}
+
+TEST_CASE("within a field, config order breaks ties — first match wins", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "app.exe"), exeRule(9, "app.exe")});
+
+    const auto r = reduce(s, appeared(WindowId{1}, "app.exe", "cls", "title"));
+
+    REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{1}, 2});
+}
+
+TEST_CASE("exe matching is ASCII case-insensitive and exact (not substring)", "[reducer][rules]") {
+    const State s = stateWith({exeRule(5, "slack.exe")});
+
+    const auto hit = reduce(s, appeared(WindowId{1}, "SLACK.EXE", "cls", "t"));
+    REQUIRE(single_effect<MoveWindowToWorkspace>(hit) == MoveWindowToWorkspace{WindowId{1}, 5});
+
+    const auto miss = reduce(s, appeared(WindowId{2}, "slack.exe.bak", "cls", "t"));
+    REQUIRE(miss.effects.empty());
+}
+
+TEST_CASE("an ineligible Appeared emits nothing and is not placed; a later eligible edge pins", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    // First edge: cloaked → Ineligible (the UWP cloaked-SHOW case). Emits nothing
+    // AND must not burn place-once.
+    Appeared cloaked = appeared(WindowId{7}, "slack.exe", "cls", "Slack");
+    cloaked.attrs.cloaked = true;
+    const auto first = reduce(s, cloaked);
+    REQUIRE(first.effects.empty());
+
+    // Second edge for the SAME id, now Eligible (UNCLOAKED) — the move fires here.
+    const auto second = reduce(first.state, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(single_effect<MoveWindowToWorkspace>(second) == MoveWindowToWorkspace{WindowId{7}, 2});
+}
+
+TEST_CASE("an eligible non-matching Appeared is placed and never re-evaluated", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto first = reduce(s, appeared(WindowId{7}, "notepad.exe", "cls", "t"));
+    REQUIRE(first.effects.empty());
+
+    // Even a now-matching identity for the same id emits nothing — it is placed.
+    const auto second = reduce(first.state, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(second.effects.empty());
+}
+
+TEST_CASE("Vanished erases the id so a fresh Appeared re-pins", "[reducer][rules]") {
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto placed = reduce(s, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(single_effect<MoveWindowToWorkspace>(placed) == MoveWindowToWorkspace{WindowId{7}, 2});
+
+    const auto gone = reduce(placed.state, Vanished{WindowId{7}});
+    REQUIRE(gone.effects.empty());
+
+    const auto again = reduce(gone.state, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+    REQUIRE(single_effect<MoveWindowToWorkspace>(again) == MoveWindowToWorkspace{WindowId{7}, 2});
+}
+
+TEST_CASE("title matching is substring and case-sensitive", "[reducer][rules]") {
+    // title:Slack matches "Slack | general" (substring, unanchored).
+    {
+        const auto r = reduce(stateWith({titleRule(3, "Slack")}),
+                              appeared(WindowId{1}, "e", "c", "Slack | general"));
+        REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{1}, 3});
+    }
+    // title:^Slack$ does NOT match "Slack | general" (anchored whole-title).
+    {
+        const auto r = reduce(stateWith({titleRule(3, "^Slack$")}),
+                              appeared(WindowId{2}, "e", "c", "Slack | general"));
+        REQUIRE(r.effects.empty());
+    }
+    // title:slack does NOT match "Slack" (case-sensitive).
+    {
+        const auto r = reduce(stateWith({titleRule(3, "slack")}),
+                              appeared(WindowId{3}, "e", "c", "Slack"));
+        REQUIRE(r.effects.empty());
+    }
+}
+
+TEST_CASE("an Appeared with no rules seeded emits nothing but still places the id", "[reducer][rules]") {
+    // A default State has a null rules handle; matching must be skipped safely.
+    const auto first = reduce(State{}, appeared(WindowId{1}, "slack.exe", "cls", "Slack"));
+    REQUIRE(first.effects.empty());
+    const auto second = reduce(first.state, appeared(WindowId{1}, "slack.exe", "cls", "Slack"));
+    REQUIRE(second.effects.empty());
+}

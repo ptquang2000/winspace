@@ -31,10 +31,27 @@ place-once forbids.
   **`std::vector<WindowRule> rules`** (seeded once from config; replaced on reload,
   PRD 09). Nothing else about windows is stored — no rects, no monitor model, no
   focus order. The geometry ban of ADR-0007 stands untouched.
-- On `Appeared`: if `id ∈ placed`, emit nothing. Otherwise run the matcher (gated
-  on `isEligible`) and, **whether or not a rule matched**, insert `id` into
-  `placed`. A non-matching window is thus never re-evaluated on later uncloaks
-  either.
+- On `Appeared`: if `id ∈ placed`, emit nothing. Otherwise, if the window is
+  **not** `isEligible`, emit nothing **and insert nothing** — the id stays out of
+  `placed` so a later, Eligible edge re-evaluates it. If it **is** `isEligible`,
+  run the matcher and, **whether or not a rule matched**, insert `id` into
+  `placed`. An *Eligible* non-matching window is thus never re-evaluated on later
+  uncloaks; only Ineligible edges are re-checked, and for those the cost is the
+  cheap boolean `isEligible` gate — the regex matcher never runs.
+
+  > **Amendment (2026-07-11).** The original text inserted into `placed`
+  > *unconditionally* — "whether or not a rule matched", regardless of
+  > eligibility. That burns place-once on the **first** edge even when the window
+  > is Ineligible there. UWP apps (Calculator, Store, Terminal, WhatsApp) surface
+  > as an `ApplicationFrameHost` window that fires `EVENT_OBJECT_SHOW` **while
+  > still cloaked** (`cloaked = true` → Ineligible) and only *later* fires
+  > `EVENT_OBJECT_UNCLOAKED` once fully born and Eligible. Inserting on the
+  > cloaked `SHOW` marks the id `placed`, so the subsequent Eligible `UNCLOAKED`
+  > is skipped — and the rule **never fires for any UWP app**. Gating the insert
+  > on `isEligible` fixes this while preserving the original goal (an *Eligible*
+  > unmatched window is still matched at most once). This is why the SHOW/UNCLOAKED
+  > edge was chosen over CREATE in the first place — inserting on an Ineligible
+  > edge threw that away.
 - On `Vanished` (`DESTROY` / `HIDE` / `CLOAKED`): erase `id` from `placed`. This
   bounds the set to live windows and — because Windows recycles `HWND`s — stops a
   reused handle from being wrongly treated as already-placed.

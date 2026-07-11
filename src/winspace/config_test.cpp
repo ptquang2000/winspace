@@ -221,3 +221,118 @@ TEST_CASE("changing $mod in one place re-modifies every bind that references it"
     for (const auto& b : result.config.binds)
         REQUIRE(contains(b.mods, Mod::Shift));
 }
+
+// ── windowrule directive (PRD 06) ────────────────────────────────────────────
+
+TEST_CASE("each windowrule field kind parses to the right WindowRule", "[config]") {
+    const auto result = parse(
+        "windowrule = workspace 2, exe:Slack.exe\n"
+        "windowrule = workspace 3, class:Chrome_WidgetWin_1\n"
+        "windowrule = workspace 4, title:^Term\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 3);
+
+    REQUIRE(result.config.rules[0].field == Field::Exe);
+    REQUIRE(result.config.rules[0].workspace == 2);
+    REQUIRE(result.config.rules[0].pattern == "slack.exe");  // lowercased
+
+    REQUIRE(result.config.rules[1].field == Field::Class);
+    REQUIRE(result.config.rules[1].workspace == 3);
+    REQUIRE(result.config.rules[1].pattern == "chrome_widgetwin_1");
+
+    REQUIRE(result.config.rules[2].field == Field::Title);
+    REQUIRE(result.config.rules[2].workspace == 4);
+    // The compiled regex behaves as authored (anchored substring).
+    REQUIRE(std::regex_search(std::string("Terminal"), result.config.rules[2].regex));
+    REQUIRE_FALSE(std::regex_search(std::string("xTerminal"), result.config.rules[2].regex));
+}
+
+TEST_CASE("the first-comma split keeps a comma inside a title regex", "[config]") {
+    // Only the FIRST comma splits action from spec, so a{1,3}'s comma survives.
+    const auto result = parse("windowrule = workspace 1, title:a{1,3}\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].field == Field::Title);
+    REQUIRE(result.config.rules[0].pattern == "a{1,3}");
+}
+
+TEST_CASE("the first-colon split keeps a colon inside a title regex", "[config]") {
+    const auto result = parse("windowrule = workspace 1, title:foo:bar\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].pattern == "foo:bar");
+}
+
+TEST_CASE("a windowrule with a non-integer workspace is diagnosed", "[config]") {
+    const auto result = parse("windowrule = workspace two, exe:slack.exe\n");
+
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+}
+
+TEST_CASE("an unsupported windowrule action is diagnosed and the file continues", "[config]") {
+    const auto result = parse(
+        "windowrule = ignore, exe:foo.exe\n"
+        "windowrule = workspace 2, exe:bar.exe\n");
+
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].pattern == "bar.exe");
+}
+
+TEST_CASE("an unknown windowrule field is diagnosed", "[config]") {
+    const auto result = parse("windowrule = workspace 2, pid:1234\n");
+
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+}
+
+TEST_CASE("a windowrule missing the field colon is diagnosed", "[config]") {
+    const auto result = parse("windowrule = workspace 2, slack.exe\n");
+
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+}
+
+TEST_CASE("a windowrule with an empty pattern is diagnosed (exe and title)", "[config]") {
+    const auto exe = parse("windowrule = workspace 2, exe:\n");
+    REQUIRE(exe.config.rules.empty());
+    REQUIRE(exe.diagnostics.size() == 1);
+
+    const auto title = parse("windowrule = workspace 2, title:\n");
+    REQUIRE(title.config.rules.empty());
+    REQUIRE(title.diagnostics.size() == 1);
+}
+
+TEST_CASE("an invalid title regex is diagnosed while the rest of the file parses", "[config]") {
+    const auto result = parse(
+        "windowrule = workspace 2, title:(unclosed\n"
+        "windowrule = workspace 3, exe:ok.exe\n");
+
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].pattern == "ok.exe");
+}
+
+TEST_CASE("exe and class patterns are lowercased and whitespace-trimmed", "[config]") {
+    const auto result = parse("windowrule = workspace 2, exe:  SLACK.EXE\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].pattern == "slack.exe");
+}
+
+TEST_CASE("one parse returns both binds and rules", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, 1, workspace, 1\n"
+        "windowrule = workspace 2, exe:slack.exe\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.rules.size() == 1);
+}

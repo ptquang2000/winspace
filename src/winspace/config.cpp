@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include "winspace/reducer.cpp"  // WindowRule, Field — defined once in the core
+
 namespace winspace {
 
 // ── semantic types owned by core (never Win32 constants) ────────────────────
@@ -115,6 +117,7 @@ struct Diagnostic {
 
 struct Config {
     std::vector<Bind> binds;
+    std::vector<WindowRule> rules;
 };
 
 // Both halves of the return tuple exist from day one.
@@ -173,6 +176,13 @@ inline std::optional<Mod> parse_mod(std::string_view t) {
     if (t == "CTRL") return Mod::Ctrl;
     if (t == "SHIFT") return Mod::Shift;
     return std::nullopt;
+}
+
+inline std::string to_lower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
 }
 
 inline bool iequals(std::string_view a, std::string_view b) {
@@ -419,6 +429,100 @@ inline ParseResult parse(std::string_view text) {
             // quit takes no argument; any extra field is ignored.
 
             result.config.binds.push_back(bind);
+            continue;
+        }
+
+        // `windowrule = workspace N, <field>:<pattern>` — pin a matching app to a
+        // Workspace on Appeared (PRD 06). NO $var expansion: a title regex may end
+        // in `$` (the end-anchor), which expand_vars would misread as a reference.
+        if (lhs == "windowrule") {
+            // Split the RHS on the FIRST comma (action vs. match spec) so a title
+            // regex may contain commas. rhs is already trimmed, so the spec's
+            // trailing whitespace is gone; the field half is trimmed below.
+            const size_t comma = rhs.find(',');
+            if (comma == std::string_view::npos) {
+                result.diagnostics.push_back(
+                    {line_no, "windowrule needs 'workspace N, <field>:<pattern>'"});
+                continue;
+            }
+            const std::string_view action = trim(rhs.substr(0, comma));
+            const std::string_view spec = rhs.substr(comma + 1);
+
+            // Action must be `workspace N`; `ignore` and other Hyprland forms are
+            // unsupported this slice (diagnosed, not aborting the file).
+            const auto atoks = split_ws(action);
+            if (atoks.empty() || atoks[0] != "workspace") {
+                result.diagnostics.push_back(
+                    {line_no, "unsupported windowrule action '" + std::string(action) +
+                                  "' (only 'workspace N')"});
+                continue;
+            }
+            if (atoks.size() < 2) {
+                result.diagnostics.push_back(
+                    {line_no, "windowrule workspace needs a number"});
+                continue;
+            }
+            int n = 0;
+            const std::string_view narg = atoks[1];
+            const auto [ptr, ec] = std::from_chars(narg.data(), narg.data() + narg.size(), n);
+            if (ec != std::errc{} || ptr != narg.data() + narg.size()) {
+                result.diagnostics.push_back(
+                    {line_no, "windowrule workspace must be an integer: '" +
+                                  std::string(narg) + "'"});
+                continue;
+            }
+
+            // Split the spec on the FIRST colon (field vs. verbatim pattern) so a
+            // title regex may contain colons.
+            const size_t colon = spec.find(':');
+            if (colon == std::string_view::npos) {
+                result.diagnostics.push_back(
+                    {line_no, "windowrule match needs '<field>:<pattern>'"});
+                continue;
+            }
+            const std::string_view fieldStr = trim(spec.substr(0, colon));
+            const std::string_view pattern = spec.substr(colon + 1);  // verbatim tail
+
+            WindowRule rule;
+            rule.workspace = n;
+            if (iequals(fieldStr, "exe")) rule.field = Field::Exe;
+            else if (iequals(fieldStr, "class")) rule.field = Field::Class;
+            else if (iequals(fieldStr, "title")) rule.field = Field::Title;
+            else {
+                result.diagnostics.push_back(
+                    {line_no, "unknown windowrule field '" + std::string(fieldStr) +
+                                  "' (expected exe|class|title)"});
+                continue;
+            }
+
+            if (rule.field == Field::Title) {
+                // Title pattern is verbatim; compiled here so a std::regex_error
+                // becomes a Diagnostic (not a load-time throw). Case-sensitive.
+                if (pattern.empty()) {
+                    result.diagnostics.push_back(
+                        {line_no, "windowrule title pattern is empty"});
+                    continue;
+                }
+                try {
+                    rule.regex = std::regex(std::string(pattern));
+                } catch (const std::regex_error& e) {
+                    result.diagnostics.push_back(
+                        {line_no, "invalid title regex: " + std::string(e.what())});
+                    continue;
+                }
+                rule.pattern = std::string(pattern);
+            } else {
+                // exe/class stored lowercased + whitespace-trimmed.
+                const std::string_view trimmed = trim(pattern);
+                if (trimmed.empty()) {
+                    result.diagnostics.push_back(
+                        {line_no, "windowrule pattern is empty"});
+                    continue;
+                }
+                rule.pattern = to_lower(trimmed);
+            }
+
+            result.config.rules.push_back(std::move(rule));
             continue;
         }
 

@@ -20,10 +20,13 @@
 #include <dwmapi.h>  // DwmGetWindowAttribute / DWMWA_CLOAKED
 
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>  // std::to_underlying
 #include <vector>
 
-#include "winspace/reducer.cpp"  // WindowAttrs, WindowId, MonitorId, Rect
+#include "io/error.cpp"          // narrow() — UTF-16 → UTF-8 for WindowIdentity strings
+#include "winspace/reducer.cpp"  // WindowAttrs, WindowId, MonitorId, Rect, WindowIdentity
 
 namespace winspace::io {
 
@@ -89,6 +92,46 @@ inline std::vector<WindowAttrs> probeTopLevelWindows() {
         },
         reinterpret_cast<LPARAM>(&out));
     return out;
+}
+
+// The string half of a window Probe — exe basename, window class, and title,
+// narrowed to UTF-8 (PRD 06). Called ONLY on the Appeared path (window rules
+// need it); the focus sweep never calls it, so these string reads stay off the
+// focus hot path. Each read degrades to an empty string on failure — a rule
+// simply won't match on a field it couldn't read, never a crash.
+inline WindowIdentity probeIdentity(HWND h) {
+    WindowIdentity id{};
+    id.id = toWindowId(h);
+
+    // exe: the process image basename via QueryFullProcessImageNameW (works for
+    // foreign processes with PROCESS_QUERY_LIMITED_INFORMATION, unlike the
+    // module-handle APIs).
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (const HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t buf[MAX_PATH];
+        DWORD len = static_cast<DWORD>(std::size(buf));
+        if (QueryFullProcessImageNameW(proc, 0, buf, &len)) {
+            const std::wstring_view full(buf, len);
+            const size_t slash = full.find_last_of(L"\\/");
+            id.exe = narrow(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
+        }
+        CloseHandle(proc);
+    }
+
+    // class: GetClassNameW into a fixed buffer (class names are short).
+    wchar_t cls[256];
+    if (const int n = GetClassNameW(h, cls, static_cast<int>(std::size(cls))); n > 0)
+        id.windowClass = narrow(std::wstring_view(cls, static_cast<size_t>(n)));
+
+    // title: sized by GetWindowTextLengthW, then filled (GetWindowTextW writes at
+    // most size-1 chars + a null, so the buffer needs the extra slot).
+    if (const int len = GetWindowTextLengthW(h); len > 0) {
+        std::wstring title(static_cast<size_t>(len) + 1, L'\0');
+        const int got = GetWindowTextW(h, title.data(), len + 1);
+        id.title = narrow(std::wstring_view(title.data(), static_cast<size_t>(got)));
+    }
+    return id;
 }
 
 // The Origin: the current foreground window as plain data, or nullopt when the

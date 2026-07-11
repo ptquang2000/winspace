@@ -18,9 +18,14 @@
 // tested through the emitted Effects, never by inspecting State internals.
 #pragma once
 
+#include <cctype>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <regex>
+#include <string>
 #include <tuple>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -64,6 +69,36 @@ struct WindowAttrs {
     bool fullscreen = false;
 };
 
+// The string half of a window Probe — the identity a WindowRule matches against
+// (ADR-0006's Probe/policy split, string side). Gathered only on the `Appeared`
+// path (rules need it; the focus sweep never does, so strings stay off that hot
+// path). Plain UTF-8 std::string, narrowed at the adapter so the core stays
+// wchar_t-free. Distinct from WindowAttrs, which carries the Eligibility facts.
+struct WindowIdentity {
+    WindowId id{};
+    std::string exe;
+    std::string windowClass;
+    std::string title;
+};
+
+// The one match field a WindowRule names. exe/class compare exact and
+// ASCII-case-insensitive; title is a std::regex_search (substring, case-sensitive).
+enum class Field { Exe, Class, Title };
+
+// A parsed `windowrule = workspace N, <field>:<pattern>` (PRD 06). Lives in the
+// core next to WindowAttrs; the parser (Seam 2) compiles these and the reducer
+// matches against them. For Exe/Class, `pattern` is the (lowercased, trimmed)
+// literal to compare; for Title, `regex` is the compiled pattern and `pattern`
+// keeps the source text (diagnostics only). `workspace` is the target Logical
+// number. std::regex makes this copyable-but-not-cheap, which is why State holds
+// the rule list behind a shared_ptr (PRD: O(1) per-event State copies).
+struct WindowRule {
+    Field field{};
+    int workspace = 0;
+    std::string pattern;
+    std::regex regex;
+};
+
 // The four directions a `focus` press can steer keyboard focus. Nested in a
 // namespace so it stays a DISTINCT type from config::Direction — both would
 // otherwise be winspace::Direction and collide in the app/test TUs that include
@@ -105,7 +140,22 @@ struct MoveToWorkspace {
     bool follow = false;
 };
 
-using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace>;
+// The window-lifecycle edges delivered by the SetWinEventHook adapter (PRD 06),
+// reintroduced with window rules. Appeared = EVENT_OBJECT_SHOW / _UNCLOAKED — it
+// carries a Probed WindowAttrs (the Eligibility facts) AND a WindowIdentity (the
+// strings a rule matches); the adapter hands over facts, never a verdict, so the
+// reducer runs isEligible itself (ADR-0006). Vanished = EVENT_OBJECT_DESTROY /
+// _HIDE / _CLOAKED — just a WindowId (no probe of a possibly-dead HWND).
+struct Appeared {
+    WindowAttrs attrs;
+    WindowIdentity identity;
+};
+struct Vanished {
+    WindowId id{};
+};
+
+using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
+                           Appeared, Vanished>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
 // Worker thread against the COM bridge; the Reducer itself performs no I/O. No
@@ -134,8 +184,19 @@ struct MoveForegroundWindowToWorkspace {
     int logical = 0;
 };
 
+// Move a SPECIFIC window (usually a background one that just Appeared) to a
+// Logical workspace — the WindowRule move (PRD 06). Distinct from
+// MoveForegroundWindowToWorkspace, whose Worker arm resolves GetForegroundWindow()
+// inline; a rule names its target by id. Both drive the same id-addressable bridge
+// method moveWindowToWorkspace(WindowId, int); there is no cloak wrapping (the
+// internal MoveViewToDesktop never paints on the current desktop; ADR-0010 revised).
+struct MoveWindowToWorkspace {
+    WindowId id{};
+    int logical = 0;
+};
+
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
-                            MoveForegroundWindowToWorkspace>;
+                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -158,6 +219,9 @@ constexpr bool operator==(const MoveForegroundWindowToWorkspace& a,
                           const MoveForegroundWindowToWorkspace& b) {
     return a.logical == b.logical;
 }
+constexpr bool operator==(const MoveWindowToWorkspace& a, const MoveWindowToWorkspace& b) {
+    return a.id == b.id && a.logical == b.logical;
+}
 
 // Value equality for the plain-data window types (used by the eligibility tests
 // and, later, issue 05's directional-focus tests).
@@ -178,6 +242,16 @@ constexpr bool operator==(const WindowAttrs& a, const WindowAttrs& b) {
 struct State {
     int currentWorkspace = 1;
     bool running = true;
+
+    // Window-rule state — the bounded, deliberate reintroduction of window state
+    // ADR-0009 records against ADR-0007's otherwise-stateless window side. `rules`
+    // is an immutable shared handle (seeded once at Worker construction), so the
+    // per-event State copy stays O(1) instead of deep-copying N compiled regexes
+    // (PRD deviation from ADR-0009's literal vector). `placed` is the place-once
+    // set: an id enters on its first Eligible Appeared (matched or not) and is
+    // erased on Vanished, so a user-moved window is never yanked back.
+    std::shared_ptr<const std::vector<WindowRule>> rules;
+    std::unordered_set<WindowId> placed;
 };
 
 struct ReduceResult {
@@ -301,6 +375,47 @@ inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
     return chosen;
 }
 
+// ── window-rule matcher: the pure rule (PRD 06) ──────────────────────────────
+
+namespace rule_detail {
+
+// ASCII per-byte case-insensitive equality — the same fold as config's iequals,
+// re-expressed here so the core stays self-contained. exe/class match exactly
+// under this fold; no Unicode case-folding this slice (PRD Out of Scope).
+inline bool asciiIEquals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+
+inline bool matchesField(const WindowRule& r, const WindowIdentity& id) {
+    switch (r.field) {
+        case Field::Exe: return asciiIEquals(r.pattern, id.exe);
+        case Field::Class: return asciiIEquals(r.pattern, id.windowClass);
+        case Field::Title: return std::regex_search(id.title, r.regex);
+    }
+    return false;
+}
+
+}  // namespace rule_detail
+
+// The matcher: three sequential passes over the rule list — all `exe` rules
+// (config order), then all `class`, then all `title` — first match wins, and its
+// target workspace is returned. The fixed field precedence exe→class→title makes
+// overlapping rules resolve the same way every time; config order breaks
+// within-field ties. Pure: a function of (rules, identity) only.
+inline std::optional<int> matchRule(const std::vector<WindowRule>& rules,
+                                    const WindowIdentity& id) {
+    for (const Field pass : {Field::Exe, Field::Class, Field::Title})
+        for (const WindowRule& r : rules)
+            if (r.field == pass && rule_detail::matchesField(r, id)) return r.workspace;
+    return std::nullopt;
+}
+
 // ── the seam ────────────────────────────────────────────────────────────────
 
 inline ReduceResult reduce(const State& s, const Event& e) {
@@ -339,6 +454,32 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.currentWorkspace = m.logical;
                 effects.push_back(Effect{SwitchToWorkspace{m.logical}});
                 return {next, std::move(effects)};
+            },
+            // A window appeared (SHOW / UNCLOAKED). Place-once (ADR-0009): if the id
+            // is already `placed`, do nothing. If the window is not Eligible, emit
+            // AND insert nothing — a later Eligible edge re-evaluates it (the UWP
+            // cloaked-SHOW→Eligible-UNCLOAKED case). If Eligible, run the matcher,
+            // emit the move on a match, and insert the id REGARDLESS of match — so an
+            // Eligible unmatched window is never re-matched on later uncloaks.
+            [&](const Appeared& a) -> ReduceResult {
+                if (s.placed.contains(a.attrs.id)) return {s, {}};
+                if (!isEligible(a.attrs)) return {s, {}};
+                std::vector<Effect> effects;
+                if (s.rules)
+                    if (const auto logical = matchRule(*s.rules, a.identity))
+                        effects.push_back(Effect{MoveWindowToWorkspace{a.attrs.id, *logical}});
+                State next = s;
+                next.placed.insert(a.attrs.id);
+                return {next, std::move(effects)};
+            },
+            // A window vanished (DESTROY / HIDE / CLOAKED). Erase the id: this bounds
+            // `placed` to live windows and, because Windows recycles HWNDs, stops a
+            // reused handle from being wrongly treated as already-placed. A fresh
+            // Appeared for the same id afterward re-pins (a new lifetime).
+            [&](const Vanished& v) -> ReduceResult {
+                State next = s;
+                next.placed.erase(v.id);
+                return {next, {}};
             },
         },
         e);

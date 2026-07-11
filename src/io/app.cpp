@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "io/hotkeys.cpp"
+#include "io/window_hook.cpp"
 #include "io/worker.cpp"
 #include "winspace/config.cpp"
 #include "winspace/reducer.cpp"
@@ -140,14 +141,23 @@ inline std::string loadConfigText() {
     return std::string(k_defaultConfig);
 }
 
-// Parse the config, surfacing any parser diagnostics through the I/O sink. `text`
-// outlives parse(); the returned Binds and Diagnostic messages own their data.
-inline std::vector<Bind> loadBinds() {
+// Both halves of one parse: the Binds the Hotkey thread registers and the
+// WindowRules the Worker seeds into State (PRD 06). Owned by runApp for the
+// lifetime of the threads that borrow them.
+struct LoadedConfig {
+    std::vector<Bind> binds;
+    std::vector<WindowRule> rules;
+};
+
+// Parse the config once, surfacing any parser diagnostics through the I/O sink,
+// and return both binds and rules. `text` outlives parse(); the returned data owns
+// itself. (Replaces the former loadBinds — one parse, both halves; PRD 06.)
+inline LoadedConfig loadConfig() {
     const std::string text = loadConfigText();
     ParseResult parsed = parse(text);
     for (const Diagnostic& d : parsed.diagnostics)
         lg::warn("config line {}: {}", d.line, d.message);
-    return std::move(parsed.config.binds);
+    return {std::move(parsed.config.binds), std::move(parsed.config.rules)};
 }
 
 // A non-interactive exit path: setting WINSPACE_SELFTEST_QUIT drives one Quit
@@ -202,15 +212,18 @@ inline int runApp() {
         lg::warn("app: Per-Monitor-V2 DPI awareness not set: {}", aware.error());
     }
 
-    // The parsed Binds are owned here and passed to the Hotkey thread by const
-    // reference; this declaration outlives hotkeyThread (which is joined below),
-    // so the reference stays valid for the thread's whole life.
-    const std::vector<Bind> binds = loadBinds();
+    // One parse yields both halves. The Binds are owned here and passed to the
+    // Hotkey thread by const reference (this declaration outlives hotkeyThread,
+    // joined below); the WindowRules are moved into the Worker thread, which seeds
+    // them into State before publishing its HWND.
+    LoadedConfig cfg = loadConfig();
+    const std::vector<Bind> binds = std::move(cfg.binds);
 
-    // Start the Worker and wait for its message-only HWND before anyone posts.
+    // Start the Worker and wait for its message-only HWND before anyone posts. The
+    // rules are seeded in the Worker ctor, so they precede any Appeared.
     std::promise<HWND> hwndReady;
     std::future<HWND> hwndFuture = hwndReady.get_future();
-    std::jthread workerThread(workerThreadMain, std::move(hwndReady));
+    std::jthread workerThread(workerThreadMain, std::move(hwndReady), std::move(cfg.rules));
 
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
@@ -226,14 +239,25 @@ inline int runApp() {
                               std::move(tidReady));
     const DWORD hotkeyTid = tidFuture.get();
 
+    // Start the Hook thread (third jthread, mirroring the Hotkey thread). It owns
+    // the SetWinEventHook adapter, registers its hooks then runs startup adoption,
+    // and posts Appeared / Vanished Events to the Worker.
+    std::promise<DWORD> hookTidReady;
+    std::future<DWORD> hookTidFuture = hookTidReady.get_future();
+    std::jthread hookThread(hookThreadMain, workerHwnd, std::move(hookTidReady));
+    const DWORD hookTid = hookTidFuture.get();
+
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.
     workerThread.join();
 
-    // Worker is down; unwind the Hotkey loop. This WM_QUIT is thread-lifecycle
-    // control — NOT the Event transport, which is always a PostMessage to the
-    // Worker's HWND.
+    // Worker is down; unwind the Hotkey and Hook loops. These WM_QUITs are
+    // thread-lifecycle control — NOT the Event transport, which is always a
+    // PostMessage to the Worker's HWND. The Hook thread unhooks both hooks after
+    // its loop returns, so no dangling SetWinEventHook survives quit.
     PostThreadMessageW(hotkeyTid, WM_QUIT, 0, 0);
     hotkeyThread.join();
+    PostThreadMessageW(hookTid, WM_QUIT, 0, 0);
+    hookThread.join();
     return 0;
 }
 

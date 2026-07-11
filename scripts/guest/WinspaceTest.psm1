@@ -285,6 +285,33 @@ function Get-WinspaceRoot {
 function Get-WinspaceExe { Join-Path (Get-WinspaceRoot) 'winspace.exe' }
 function Get-WinspaceLog { Join-Path (Get-WinspaceRoot) 'run.log' }
 
+# winspace reads %USERPROFILE%\.config\winspace\winspace.conf at startup (src/io/app.cpp
+# configPath()). This is the SAME session as the runner, so the profile we write to is the
+# one the launched winspace.exe reads.
+function Get-WinspaceConfigPath { Join-Path $env:USERPROFILE '.config\winspace\winspace.conf' }
+
+# ── seed an on-disk config before Start-Winspace ──────────────────────────────
+# The seeded default (k_defaultConfig) carries NO `windowrule`, so a rule seam must
+# supply its own config. winspace parses the file as UTF-8 BYTES; PS 5.1's
+# `Set-Content -Encoding UTF8` prepends a BOM, which would corrupt the first line, so
+# write BOM-free via UTF8Encoding($false). Returns the path written.
+function Set-WinspaceConfig {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Content)
+    $path = Get-WinspaceConfigPath
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+# Remove the seeded config so the next Start-Winspace re-seeds the built-in default —
+# keeps a non-Fresh, VM-shared run from leaking one seam's config into the next.
+function Clear-WinspaceConfig {
+    $path = Get-WinspaceConfigPath
+    if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+}
+
 # ── loud gate: an interactive session must exist (autologon on) ──────────────
 # Without it every SendInput Trigger reaches no desktop and seams fail silently;
 # fail here instead, naming the cause. See scripts/PROVISIONING.md.
@@ -947,6 +974,7 @@ Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState
     Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
     Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
     Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog,
+    Get-WinspaceConfigPath, Set-WinspaceConfig, Clear-WinspaceConfig,
     Get-ForegroundWindow, Set-ForegroundByClick, Get-WindowDesktopId,
     Get-WindowRect, Get-FrameBounds, Get-WorkArea, Test-WindowCloaked, Find-WindowsByTitle,
     Test-RectNear, Test-RectEqual, Format-Rect,
