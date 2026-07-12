@@ -227,13 +227,43 @@ ever carried geometry, which winspace does not own (ADR-0007). The lone survivin
 **`start_at_login`** — a bool (`true`/`false`, case-insensitive; anything else is a Diagnostic)
 parsed into `Config` and carried into `State` (`bool startAtLogin`, seeded at Worker
 construction beside `rules`/`execs`, reseeded on reload). Slice 09 only *parses* it and holds
-it in State; the Task Scheduler logon task it controls is registered/removed by slice 10, which
-reads `State.startAtLogin` and emits its own Effect. A removed tiling setting
+it in State; the **Logon task** it controls is registered/removed by slice 10, which reads
+`State.startAtLogin` and emits a **SyncAutostart** Effect. A removed tiling setting
 (`min_tile_width`, `min_tile_height`) or dispatcher (`movewindow`, `maximize`, `resizeactive`,
 `togglefloat`, `movetomonitor`) is a **targeted** "removed with tiling" Diagnostic, distinct
 from the generic unknown-directive message, so a ported Hyprland config reads as *scoped*, not
 broken.
 _Avoid_: section, category, general{} (there are no blocks).
+
+### Autostart
+
+**Logon task**:
+The OS artifact that makes winspace start with the user session — a **Task Scheduler task with a
+logon trigger**, registered per-user at `\winspace\<username>` (a dedicated `winspace` task
+folder, one task per user, so two accounts on one machine never collide). It launches the
+windowless `winspace.exe` at sign-in with **restart-on-failure** and a **limited** (LUA, never
+elevated) run level. Deliberately **not a Windows service** (a Session-0 service cannot touch the
+interactive desktop, Virtual Desktops, or hotkeys) and **not a userspace watchdog** (that would
+own restart-on-failure — a thing Windows gives for free — and its supervisor would itself need
+autostarting): the OS scheduler *is* the supervisor and winspace is the worker it launches into
+the session (see [ADR-0013](docs/adr/0013-autostart-per-user-logon-task.md)). The worker cannot
+manage windows before the session exists, so a logon task reaches the first manageable moment as
+early as anything can — and **Adoption** absorbs any window that opened first. Controlled by the
+**`start_at_login`** Setting via the **SyncAutostart** Effect.
+_Avoid_: service, watchdog, supervisor process, Run key, Startup folder.
+
+**SyncAutostart** *(the Effect)*:
+The Effect that makes the OS **Logon task** match `State.startAtLogin` — **declarative**, not a
+transition command: the Reducer always emits `SyncAutostart{startAtLogin}` and never decides
+register-vs-remove. The Worker executes it on its existing STA apartment via COM `ITaskService`
+(never `schtasks`/PowerShell): `enabled` → `RegisterTaskDefinition` with `TASK_CREATE_OR_UPDATE`
+(idempotent — no duplicate on repeated enable, and re-writing the exe path each launch self-heals
+a moved binary); `!enabled` → delete the task, counting `ERROR_FILE_NOT_FOUND` as success so a
+repeated disable is a clean no-op. Emitted from **Started** (initial start) and **Reloaded** (so
+toggling `start_at_login` + `reload` registers/removes the task live), mirroring how `LaunchApp`
+falls out of those same two lifecycle Events. Failures degrade-and-log (ADR-0004); autostart
+never blocks or crashes the running WM.
+_Avoid_: RegisterAutostart/RemoveAutostart (it is one declarative Effect, not a transition pair).
 
 ### Threads
 

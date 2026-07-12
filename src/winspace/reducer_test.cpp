@@ -568,10 +568,12 @@ TEST_CASE("Started launches every exec entry, exec-once and exec alike, in confi
 
     const auto r = reduce(s, Started{});
 
-    REQUIRE(r.effects.size() == 3);
+    // The three launches in config order, then the trailing SyncAutostart (issue 10).
+    REQUIRE(r.effects.size() == 4);
     REQUIRE(launched(r, 0) == "firefox");
     REQUIRE(launched(r, 1) == "kitty");
     REQUIRE(launched(r, 2) == "code --new-window");
+    REQUIRE(std::holds_alternative<SyncAutostart>(r.effects[3]));
     // Startup persists nothing — idempotency is stateless.
     REQUIRE(r.state.running);
 }
@@ -584,20 +586,74 @@ TEST_CASE("Reloaded launches only the exec entries, skipping exec-once, in confi
 
     const auto r = reduce(s, Reloaded{});
 
-    REQUIRE(r.effects.size() == 2);
+    // The two `exec` relaunches, then the trailing SyncAutostart (issue 10).
+    REQUIRE(r.effects.size() == 3);
     REQUIRE(launched(r, 0) == "kitty");
     REQUIRE(launched(r, 1) == "tray");
+    REQUIRE(std::holds_alternative<SyncAutostart>(r.effects[2]));
 }
 
-TEST_CASE("Started and Reloaded with no exec entries emit nothing", "[reducer][launcher]") {
-    // A default State has a null execs handle; both handlers must skip it safely.
-    REQUIRE(reduce(State{}, Started{}).effects.empty());
-    REQUIRE(reduce(State{}, Reloaded{}).effects.empty());
+TEST_CASE("Started and Reloaded with no exec entries still emit exactly one SyncAutostart", "[reducer][launcher]") {
+    // A default State has a null execs handle; both handlers skip it safely and are
+    // left with only the SyncAutostart the flag always produces (issue 10).
+    REQUIRE(single_effect<SyncAutostart>(reduce(State{}, Started{})) == SyncAutostart{false});
+    REQUIRE(single_effect<SyncAutostart>(reduce(State{}, Reloaded{})) == SyncAutostart{false});
 
-    // An all-exec-once list yields nothing on reload, everything on start.
+    // An all-exec-once list yields only the SyncAutostart on reload, and every
+    // launch plus the SyncAutostart on start.
     const State onceOnly = stateWithExecs({{"a", true}, {"b", true}});
-    REQUIRE(reduce(onceOnly, Reloaded{}).effects.empty());
-    REQUIRE(reduce(onceOnly, Started{}).effects.size() == 2);
+    REQUIRE(single_effect<SyncAutostart>(reduce(onceOnly, Reloaded{})) == SyncAutostart{false});
+    REQUIRE(reduce(onceOnly, Started{}).effects.size() == 3);  // 2 launches + SyncAutostart
+}
+
+// ── autostart: Started / Reloaded → SyncAutostart{startAtLogin} (issue 10) ────
+//
+// Both lifecycle Events emit exactly one SyncAutostart carrying State.startAtLogin
+// verbatim (declarative — the Reducer never decides register-vs-remove), and neither
+// changes the flag. Asserted for both flag values; the Worker's ITaskService adapter
+// (create-or-update / delete-if-exists) is a VM Smoke seam, not a unit test.
+
+namespace {
+
+// The bool carried by the single emitted SyncAutostart, failing loudly if the last
+// Effect is not one. Started/Reloaded emit it last (after any LaunchApp).
+bool syncedAutostart(const ReduceResult& r) {
+    REQUIRE_FALSE(r.effects.empty());
+    const Effect& last = r.effects.back();
+    REQUIRE(std::holds_alternative<SyncAutostart>(last));
+    return std::get<SyncAutostart>(last).enabled;
+}
+
+}  // namespace
+
+TEST_CASE("Started emits exactly one SyncAutostart with the current flag and leaves State unchanged", "[reducer][autostart]") {
+    for (const bool flag : {false, true}) {
+        State s;
+        s.startAtLogin = flag;
+
+        const auto r = reduce(s, Started{});
+
+        // Exactly one SyncAutostart (no execs here), carrying the flag verbatim.
+        REQUIRE(r.effects.size() == 1);
+        REQUIRE(single_effect<SyncAutostart>(r) == SyncAutostart{flag});
+        REQUIRE(syncedAutostart(r) == flag);
+        // The flag rides through unchanged — Started derives an Effect, not a mutation.
+        REQUIRE(r.state.startAtLogin == flag);
+    }
+}
+
+TEST_CASE("Reloaded emits exactly one SyncAutostart with the current flag and leaves State unchanged", "[reducer][autostart]") {
+    for (const bool flag : {false, true}) {
+        State s;
+        s.startAtLogin = flag;
+
+        const auto r = reduce(s, Reloaded{});
+
+        REQUIRE(r.effects.size() == 1);
+        REQUIRE(single_effect<SyncAutostart>(r) == SyncAutostart{flag});
+        REQUIRE(syncedAutostart(r) == flag);
+        REQUIRE(r.state.startAtLogin == flag);
+    }
 }
 
 TEST_CASE("the launch command is passed through verbatim, including a literal $", "[reducer][launcher]") {

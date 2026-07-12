@@ -249,9 +249,19 @@ struct LaunchApp {
 // reads no file, so everything the reload needs is discovered by the Worker.
 struct ReloadConfig {};
 
+// Make the OS logon task match `enabled` (issue 10, ADR-0013). DECLARATIVE, not a
+// transition command: the Reducer always emits SyncAutostart{state.startAtLogin}
+// and never decides register-vs-remove — the Worker's adapter does create-or-update
+// when enabled, delete-if-exists when not (counting an absent task as success). One
+// SyncAutostart falls out of Started (initial start) and Reloaded (so toggling
+// start_at_login + reload registers/removes the task live), mirroring LaunchApp.
+struct SyncAutostart {
+    bool enabled = false;
+};
+
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
                             MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, LaunchApp,
-                            ReloadConfig>;
+                            ReloadConfig, SyncAutostart>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -281,6 +291,9 @@ inline bool operator==(const LaunchApp& a, const LaunchApp& b) {
     return a.command == b.command;
 }
 constexpr bool operator==(const ReloadConfig&, const ReloadConfig&) { return true; }
+constexpr bool operator==(const SyncAutostart& a, const SyncAutostart& b) {
+    return a.enabled == b.enabled;
+}
 
 // Value equality for the plain-data window types (used by the eligibility tests
 // and, later, issue 05's directional-focus tests).
@@ -577,23 +590,31 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 return {next, {}};
             },
             // Startup (PRD 08): emit a LaunchApp for EVERY exec entry, in config
-            // order (exec-once + exec alike). State is untouched — exec-once
-            // idempotency is stateless, falling out of which Event fires.
+            // order (exec-once + exec alike), then one SyncAutostart carrying the
+            // current start_at_login flag (issue 10) — the autostart task is synced
+            // at start just as the launchers fire. State is untouched — exec-once
+            // idempotency is stateless, falling out of which Event fires, and the
+            // flag is declarative (the Worker's adapter, not the Reducer, decides
+            // register-vs-remove).
             [&](const Started&) -> ReduceResult {
                 std::vector<Effect> effects;
                 if (s.execs)
                     for (const ExecEntry& e : *s.execs)
                         effects.push_back(Effect{LaunchApp{e.command}});
+                effects.push_back(Effect{SyncAutostart{s.startAtLogin}});
                 return {s, std::move(effects)};
             },
             // Reload (PRD 08; the trigger itself is PRD 09): emit LaunchApp only for
             // the `exec` (once == false) entries, in config order — exec-once is
-            // skipped so a reload never spawns a second copy of an already-open app.
+            // skipped so a reload never spawns a second copy of an already-open app —
+            // then one SyncAutostart with the freshly-reseeded flag (issue 10), so
+            // toggling start_at_login and reloading registers/removes the task live.
             [&](const Reloaded&) -> ReduceResult {
                 std::vector<Effect> effects;
                 if (s.execs)
                     for (const ExecEntry& e : *s.execs)
                         if (!e.once) effects.push_back(Effect{LaunchApp{e.command}});
+                effects.push_back(Effect{SyncAutostart{s.startAtLogin}});
                 return {s, std::move(effects)};
             },
             // The `reload` hotkey fired (issue 09, ADR-0012). The Reducer is pure —

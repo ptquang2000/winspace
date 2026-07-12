@@ -276,6 +276,33 @@ function Get-WindowDesktopId {
     return [Winspace.Vdm]::GetWindowDesktopId($Hwnd)
 }
 
+# ── Oracle: the per-user winspace autostart logon task (issue 10, ADR-0013) ───
+# The Windows-blessed autostart record IS the independent OS state a SyncAutostart
+# seam asserts against — a Task Scheduler logon task at \winspace\<username>,
+# registered when start_at_login is on and removed when off. Read via
+# Get-ScheduledTask (the task store), never winspace's own log. The task is named
+# for the current account (the adapter uses GetUserNameW; $env:USERNAME matches it
+# in the single interactive session the runner and winspace share).
+function Get-WinspaceAutostartTask {
+    # -TaskPath needs the trailing backslash to name the \winspace folder. A missing
+    # task or folder yields a non-terminating error, silenced to $null here.
+    return Get-ScheduledTask -TaskPath '\winspace\' -TaskName $env:USERNAME -ErrorAction SilentlyContinue
+}
+
+# The count of tasks under the \winspace\ folder — the idempotency Oracle (a repeated
+# enable must never yield a second task). 0 when the folder is absent. The unary comma
+# keeps a single-element result an array so .Count is always defined under StrictMode.
+function Get-WinspaceAutostartTaskCount {
+    return @(Get-ScheduledTask -TaskPath '\winspace\' -ErrorAction SilentlyContinue).Count
+}
+
+# Best-effort precondition/cleanup: remove this user's autostart task so a seam stages
+# its own baseline (mirrors Set-DesktopCount) and never leaks into the next. Never
+# throws — an absent task is the desired end state either way.
+function Remove-WinspaceAutostartTask {
+    Unregister-ScheduledTask -TaskPath '\winspace\' -TaskName $env:USERNAME -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+}
+
 # ── deploy layout ────────────────────────────────────────────────────────────
 # The host deploys everything under one root; WINSPACE_E2E_ROOT overrides it.
 function Get-WinspaceRoot {
@@ -617,7 +644,11 @@ function Start-Winspace {
 
 function Stop-Winspace {
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Process)
+    # AllowNull: finally-block cleanup calls this with a var a seam nulled after an
+    # early stop (idempotent teardown, mirroring Stop-TestWindow). Without it a
+    # Mandatory bind throws on $null, aborting the rest of the finally — leaking any
+    # not-yet-stopped winspace, which then steals hotkeys/VD from later seams.
+    param([Parameter(Mandatory)][AllowNull()]$Process)
     if ($Process -and -not $Process.HasExited) {
         Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
     }
@@ -970,6 +1001,7 @@ function Invoke-WinspaceSeams {
 
 Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState,
     Get-WinspaceWindows, Set-DesktopCount,
+    Get-WinspaceAutostartTask, Get-WinspaceAutostartTaskCount, Remove-WinspaceAutostartTask,
     ConvertFrom-VirtualDesktopIDs, ConvertFrom-CurrentVirtualDesktop, Read-WinspaceLog,
     Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
     Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,

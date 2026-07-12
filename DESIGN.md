@@ -93,9 +93,10 @@ from tiling and may be loosened for focus candidacy later.)*
 ## 7. Autostart
 
 - winspace runs as a **normal windowless user-session process**, autostarted via a
-  **Task Scheduler logon task** with restart-on-failure. *(Not a Windows service — a
-  Session-0 service cannot touch the interactive desktop, VDs, or hotkeys.)*
-- Opt-in `start_at_login` config flag registers the task.
+  **per-user Task Scheduler logon task** with restart-on-failure — the OS scheduler is the
+  supervisor, winspace the worker. *(Not a service, and not a userspace watchdog; see
+  [ADR-0013](docs/adr/0013-autostart-per-user-logon-task.md) for why both were rejected.)*
+- Opt-in `start_at_login` config flag registers/removes the task live, unelevated.
 
 ---
 

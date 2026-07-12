@@ -25,6 +25,7 @@
 #include <utility>  // std::move
 #include <vector>
 
+#include "io/autostart.cpp"  // syncAutostart — the ITaskService logon-task adapter (issue 10)
 #include "io/config_io.cpp"  // readAndParseConfig — the shared reload read+parse (issue 09)
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/probe.cpp"      // window Probe sweep + WindowId ⇄ HWND mint (focus)
@@ -302,9 +303,20 @@ private:
                     }
 
                     // (3) Post Reloaded{} to ourselves so the existing exec-relaunch path
-                    // runs unchanged — `exec` entries re-launch, `exec-once` do not.
+                    // runs unchanged — `exec` entries re-launch, `exec-once` do not — and
+                    // the Reloaded handler additionally emits SyncAutostart, so the logon
+                    // task is re-synced to the freshly-reseeded flag on this same reload.
                     postEvent(m_hwnd, new Event{Reloaded{}});
                     lg::info("reload: applied new config");
+                },
+                [&](const SyncAutostart& s) {
+                    // Delegate the whole ITaskService interaction to the adapter (issue 10,
+                    // ADR-0013): create-or-update the `\winspace\<username>` logon task when
+                    // enabled, delete-if-exists when not. Degrade-and-log on any failure
+                    // (ADR-0004) — autostart never blocks or crashes the WM.
+                    if (const auto synced = syncAutostart(s.enabled); !synced)
+                        lg::warn("autostart: sync (enabled={}) failed: {}", s.enabled,
+                                 synced.error());
                 },
             },
             effect);
