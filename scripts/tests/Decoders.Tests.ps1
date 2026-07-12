@@ -4,7 +4,7 @@
     These run on the HOST with NO VM and no VMware — the decoders are pure
     (bytes in, objects out), so they are exercised against captured REG_BINARY
     fixtures under ./fixtures. This mirrors how winspace unit-tests its pure core
-    with zero Windows deps (issues/README.md); the VM-driving layer is verified
+    with zero Windows deps (ADR-0005); the VM-driving layer is verified
     separately by a live run.
 
     Entry point: a plain `Invoke-Pester scripts/tests` — no harness, no VM.

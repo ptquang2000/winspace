@@ -4,7 +4,7 @@ A Windows 11 workspace + focus manager that leans on OS-native facilities and st
 the input critical path. It switches Workspaces and switches keyboard focus between
 windows; it owns **no window geometry** — it never moves or sizes a window (see
 [ADR-0007](docs/adr/0007-drop-tiling-no-window-geometry.md)). This glossary fixes the
-ubiquitous language shared by `DESIGN.md`, the `issues/`, and the code.
+ubiquitous language shared by the ADRs (`docs/adr/`) and the code.
 
 ## Language
 

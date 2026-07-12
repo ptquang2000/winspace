@@ -426,7 +426,7 @@ function Send-Chord {
 #
 # These three decoders (VirtualDesktopIDs, current-GUID, Read-WinspaceLog) are the
 # only logically-fallible logic in the harness, so — mirroring winspace's own
-# pure-core-tested-with-zero-deps split (issues/README.md) — they are pure
+# pure-core-tested-with-zero-deps split (ADR-0005) — they are pure
 # functions (bytes/text in, objects out; no registry, process, or VM access
 # inside them) and are host-unit-tested against captured fixtures with no VM
 # (scripts/tests). Get-VdState below composes them over the live registry.
