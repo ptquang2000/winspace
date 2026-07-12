@@ -40,11 +40,10 @@ AfterAll {
 
 Describe 'spatial-focus' {
 
-    # The seeded default config (src/io/app.cpp) binds vim-style Alt + h/j/k/l to
-    # `focus` (Alt+L → focus right). Alt (not Win) because Windows reserves the whole
-    # Win+h/j/k/l set even under NoWinKeys, whereas Alt+<letter> registers cleanly —
-    # verified by direct RegisterHotKey probe on this guest. This seam drives the real
-    # default `focus right` binding.
+    # The seeded default config (src/io/config_io.cpp) binds vim-style $mod + h/j/k/l
+    # to `focus` (Alt+L → focus right), where $mod = ALT (ADR-0014). Alt+<letter>
+    # registers on stock Windows 11 with no policy — verified by direct RegisterHotKey
+    # probe on this guest. This seam drives the real default `focus right` binding.
     It 'focus-right: a "focus right" chord moves the foreground to the window on the right' -Tag 'spatial-focus' {
         $winspace = $null
         $left = $null

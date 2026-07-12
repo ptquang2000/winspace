@@ -21,12 +21,11 @@ BeforeAll {
 
 Describe 'workspace-switch' {
 
-    # $mod is SUPER (the Windows key) in the seeded default config (src/io/app.cpp),
-    # so the workspace chords are Win+<n>. These only register because NoWinKeys=1 is
-    # baked into the winspace-e2e-nowinkeys snapshot (scripts/PROVISIONING.md) — that
-    # policy frees the Win+<key> shell shortcuts for RegisterHotKey. It does NOT touch
-    # the native OS Virtual Desktop hotkeys (Win+Ctrl+D / Win+Ctrl+F4), which still
-    # work and are used only to stage/unstage the precondition.
+    # $mod is ALT (the Alt key) in the seeded default config (src/io/config_io.cpp),
+    # so the workspace chords are Alt+<n>. Alt+<n> register on a stock Windows 11 with
+    # no policy (ADR-0014), so the snapshot is just winspace-e2e (stock). It does NOT
+    # touch the native OS Virtual Desktop hotkeys (Win+Ctrl+D / Win+Ctrl+F4), which
+    # still work and are used only to stage/unstage the precondition.
     It 'create-on-demand: $mod+5 spawns one desktop at the tail and switches to it' -Tag 'create-on-demand' {
         $winspace = $null
         try {
@@ -42,7 +41,7 @@ Describe 'workspace-switch' {
             # Focus an existing workspace first ($mod+2) so we are demonstrably
             # not sitting on the tail when create-on-demand fires.
             $staged = Get-VdState
-            Send-Chord 'Win+2'
+            Send-Chord 'Alt+2'
             Wait-Until -Because 'current desktop to become the 2nd (adoption)' -Condition {
                 (Get-VdState).CurrentGuid -eq $staged.Guids[1]
             }
@@ -50,7 +49,7 @@ Describe 'workspace-switch' {
             # ── Act: $mod+5 — logical 5 has no binding, so the bridge
             # materializes exactly one new desktop at the tail and switches ────
             $before = Get-VdState
-            Send-Chord 'Win+5'
+            Send-Chord 'Alt+5'
             Wait-Until -Because 'a new desktop to appear at the tail' -Condition {
                 (Get-VdState).Count -eq $before.Count + 1
             }
@@ -104,7 +103,7 @@ Describe 'workspace-switch' {
             $winspace = Start-Winspace
             $before = Get-VdState
 
-            Send-Chord 'Win+2'
+            Send-Chord 'Alt+2'
             Wait-Until -Because 'current desktop to become the pre-existing 2nd' -Condition {
                 (Get-VdState).CurrentGuid -eq $secondGuid
             }
@@ -139,7 +138,7 @@ Describe 'workspace-switch' {
 
             # Materialize a new tail desktop ($mod+5 over 3 adopted) and record its GUID.
             $before = Get-VdState
-            Send-Chord 'Win+5'
+            Send-Chord 'Alt+5'
             Wait-Until -Because 'a new tail desktop to be created' -Condition {
                 (Get-VdState).Count -eq $before.Count + 1
             }
@@ -159,11 +158,11 @@ Describe 'workspace-switch' {
 
             # Switch away, then to the tail's re-adopted logical number: it must land
             # on the SAME physical desktop (same GUID) it had before the restart.
-            Send-Chord 'Win+1'
+            Send-Chord 'Alt+1'
             Wait-Until -Because 'current desktop to become the 1st' -Condition {
                 (Get-VdState).CurrentGuid -eq $g1
             }
-            Send-Chord "Win+$tailCount"
+            Send-Chord "Alt+$tailCount"
             Wait-Until -Because 'current desktop to become the re-adopted tail' -Condition {
                 (Get-VdState).CurrentGuid -eq $tailGuid
             }
@@ -186,9 +185,9 @@ Describe 'workspace-switch' {
     It 'guid-stability: literal Task-View reorder keeps the workspace-to-GUID binding' -Skip -Tag 'guid-stability' {
     }
 
-    # PRD step 5. $mod+Q -> the process exits cleanly; winspace reaps no desktops,
+    # PRD step 5. $mod SHIFT+Q -> the process exits cleanly; winspace reaps no desktops,
     # so it leaves exactly the desktops the test staged.
-    It 'quit: $mod+Q exits the process cleanly and orphans no desktops' -Tag 'quit' {
+    It 'quit: $mod SHIFT+Q exits the process cleanly and orphans no desktops' -Tag 'quit' {
         $winspace = $null
         try {
             Set-DesktopCount 2
@@ -196,7 +195,7 @@ Describe 'workspace-switch' {
             $winspace = Start-Winspace
             $wsPid = $winspace.Id            # $PID is read-only (this runner's own id)
 
-            Send-Chord 'Win+Q'
+            Send-Chord 'Alt+Shift+Q'
             Wait-Until -Because 'the winspace process to exit' -Condition {
                 $winspace.HasExited -or -not (Get-Process -Id $wsPid -ErrorAction SilentlyContinue)
             }

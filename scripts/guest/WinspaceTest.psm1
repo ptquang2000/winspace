@@ -714,10 +714,10 @@ function Set-RunnerConsoleVisible {
 # Pre-registers a global hotkey in a SEPARATE process so that when winspace later
 # RegisterHotKey's the same combo it gets ERROR_HOTKEY_ALREADY_REGISTERED — the
 # genuine, deterministic trigger for the skip-and-log degrade path (hotkeys.cpp).
-# The default combo is Win+1 (MOD_NOREPEAT|MOD_WIN + '1'), i.e. exactly
-# winspace's first seeded bind (src/io/app.cpp $mod = SUPER), so the collision is
-# real. (Win+1 only registers because NoWinKeys=1 is baked into the snapshot; without
-# that policy the OS owns Win+1 and BOTH the helper and winspace would fail to take it.)
+# The default combo is Alt+1 (MOD_NOREPEAT|MOD_ALT + '1'), i.e. exactly
+# winspace's first seeded bind (src/io/config_io.cpp $mod = ALT), so the collision is
+# real. (Alt+1 registers on stock Windows 11 with no policy — unlike the old bare-Win
+# $mod, which needed NoWinKeys; see ADR-0014.)
 # RegisterHotKey binds to
 # the calling thread, so the helper simply holds it and sleeps; the registration
 # lives as long as the process does. Returns the helper Process (Stop-Process to
@@ -726,7 +726,7 @@ function Set-RunnerConsoleVisible {
 function Register-ConflictingHotkey {
     [CmdletBinding()]
     param(
-        [uint32]$Modifiers = 0x4008,   # MOD_NOREPEAT(0x4000)|MOD_WIN(0x0008)
+        [uint32]$Modifiers = 0x4001,   # MOD_NOREPEAT(0x4000)|MOD_ALT(0x0001)
         [uint32]$Vk = 0x31,            # '1'
         [int]$ReadyTimeoutSec = 8
     )

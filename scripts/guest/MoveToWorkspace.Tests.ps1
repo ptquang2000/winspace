@@ -39,10 +39,10 @@ AfterAll {
 
 Describe 'move-to-workspace' {
 
-    # The seeded default config (src/io/app.cpp) binds Super+Shift+<n> to
-    # `movetoworkspacesilent N` (Win+Shift+<digit> registers under the same NoWinKeys
-    # policy baked into the winspace-e2e-nowinkeys snapshot as the Win+<n> workspace
-    # chords). This seam drives the real default `movetoworkspacesilent 1` binding.
+    # The seeded default config (src/io/config_io.cpp) binds Alt+Shift+<n> to
+    # `movetoworkspacesilent N` (Alt+Shift+<digit> registers on a stock Windows 11 with
+    # no policy, ADR-0014, as do the Alt+<n> workspace chords; the snapshot is just
+    # winspace-e2e). This seam drives the real default `movetoworkspacesilent 1` binding.
     It 'silent move: the focused window is reassigned to the inactive target desktop, and the active desktop stays' -Tag 'move-to-workspace' {
         $winspace = $null
         $window = $null
@@ -69,10 +69,10 @@ Describe 'move-to-workspace' {
             (Get-WindowDesktopId -Hwnd $window.Hwnd) | Should -Be $desktop2Guid `
                 -Because 'the window opens on the current (active) desktop before the move'
 
-            # Act: Win+Shift+1 -> movetoworkspacesilent 1. winspace resolves the
+            # Act: Alt+Shift+1 -> movetoworkspacesilent 1. winspace resolves the
             # foreground window, cloaks it (target 1 != current 2), moves it to
             # desktop 1's GUID via the public manager, then uncloaks — without switching.
-            Send-Chord 'Win+Shift+1'
+            Send-Chord 'Alt+Shift+1'
 
             Wait-Until -Because 'the window to be reassigned to the inactive desktop 1' -Condition {
                 (Get-WindowDesktopId -Hwnd $window.Hwnd) -eq $desktop1Guid

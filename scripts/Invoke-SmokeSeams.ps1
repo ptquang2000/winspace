@@ -52,7 +52,7 @@
 [CmdletBinding()]
 param(
     [string]$Vm = 'win11-24h2',
-    [string]$Snapshot = 'winspace-e2e-nowinkeys',
+    [string]$Snapshot = 'winspace-e2e',
     [string]$Seam,
     [string]$ExePath = (Join-Path $PSScriptRoot '..\build\release\winspace.exe'),
     [string]$GuestRoot = 'C:\winspace-e2e',

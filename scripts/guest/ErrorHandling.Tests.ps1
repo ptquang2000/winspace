@@ -84,7 +84,7 @@ Describe 'error-handling' {
     # 11.04 step 5. A hotkey already held by another app is skipped-and-logged (WARN)
     # while the remaining binds still register, and winspace stays alive — one failed
     # OS call must never take the process down. The conflict is genuine: a helper
-    # process holds Win+1 (winspace's first seeded bind) via RegisterHotKey before
+    # process holds Alt+1 (winspace's first seeded bind) via RegisterHotKey before
     # winspace launches, so winspace's own RegisterHotKey for it returns
     # ERROR_HOTKEY_ALREADY_REGISTERED — the real trigger, not a simulated one.
     It 'degrade-dont-crash: a pre-registered hotkey is skipped-and-logged, the rest bind, the process survives' -Tag 'degrade-dont-crash' {
@@ -92,9 +92,9 @@ Describe 'error-handling' {
         $conflict = $null
         try {
             # ── Arrange: stage 3 desktops (current lands on the 3rd), then pre-seize
-            # Win+1 from another process so winspace collides on that one bind.
+            # Alt+1 from another process so winspace collides on that one bind.
             Set-DesktopCount 3
-            $conflict = Register-ConflictingHotkey     # holds Win+1
+            $conflict = Register-ConflictingHotkey     # holds Alt+1
             $winspace = Start-Winspace                 # adopts the 3 desktops; bind 1 will collide
 
             # ── Assert 1: the collision was skipped-and-logged (log Oracle — no OS-state
@@ -103,13 +103,13 @@ Describe 'error-handling' {
             $log.HotkeySkipAndLog | Should -BeTrue -Because 'the held hotkey must be skipped-and-logged, not fatal'
 
             # ── Assert 2: the REST bound — a non-conflicting bind still switches. Current
-            # is the 3rd desktop after staging; Win+2 (bind 2, not held) must switch
+            # is the 3rd desktop after staging; Alt+2 (bind 2, not held) must switch
             # to the 2nd. This is OS-state truth via the registry, not the log.
             $before = Get-VdState
             $secondGuid = $before.Guids[1]
             $before.CurrentGuid | Should -Not -Be $secondGuid -Because 'staging leaves us off the 2nd desktop'
-            Send-Chord 'Win+2'
-            Wait-Until -Because 'Win+2 (a non-conflicting bind) to switch to the 2nd desktop' -Condition {
+            Send-Chord 'Alt+2'
+            Wait-Until -Because 'Alt+2 (a non-conflicting bind) to switch to the 2nd desktop' -Condition {
                 (Get-VdState).CurrentGuid -eq $secondGuid
             }
             (Get-VdState).CurrentGuid | Should -Be $secondGuid

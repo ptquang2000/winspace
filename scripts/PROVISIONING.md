@@ -3,10 +3,10 @@
 The VM seam-test harness ([ADR-0005](../docs/adr/0005-vm-seam-test-harness.md)) drives the real
 Release `winspace.exe` inside a throwaway VM and asserts against independent OS state. The VM is
 **`win11-24h2`**; the host orchestrator (`Invoke-SmokeSeams.ps1`) reverts to a snapshot named
-**`winspace-e2e-nowinkeys`** at the start of every run — a child of the **`winspace-e2e`** baseline
-with the `NoWinKeys=1` policy applied (step 8). That snapshot must be captured **logged in and
-ready**. This is the one-time runbook. (`vmctl exec`/`cp` below take the VM name as their first
-positional; substitute your VM's name if it differs.)
+**`winspace-e2e`** at the start of every run — a pristine, **stock** Windows 11 baseline (no
+registry policy of any kind). That snapshot must be captured **logged in and ready**. This is the
+one-time runbook. (`vmctl exec`/`cp` below take the VM name as their first positional; substitute
+your VM's name if it differs.)
 
 Everything below is load-bearing: a snapshot captured at the lock screen, or without VMware Tools,
 silently breaks every Trigger. The harness fails **loud** when it can (Release gate, interactive-session
@@ -24,7 +24,7 @@ gate), but the items here are its assumptions.
 | 6 | **`C:\winspace-e2e\` directory exists** | The deploy root the host copies the exe + guest module into. |
 | 7 | **1-desktop baseline** | Each seam stages its own precondition from a known floor; the create-on-demand seam drives 1 → 3 desktops, then asserts a +1 delta. |
 | 8 | **`vmctl auth` credentials registered on the host** | Guest ops (`cp`, `exec`) authenticate with the guest user. Registered on the **host**, not baked into the snapshot. |
-| 9 | **`NoWinKeys=1` policy applied** (`HKCU\…\Policies\Explorer`) | The seeded default `$mod = SUPER` (the Windows key) binds `Win+<n>` / `Win+Q`. Windows reserves the `Win+<key>` shell shortcuts, so `RegisterHotKey` returns `ERROR_HOTKEY_ALREADY_REGISTERED` (1409) unless NoWinKeys frees them. It does **not** touch the native VD hotkeys (`Win+Ctrl+D` / `Win+Ctrl+F4`), which the seams use to stage desktops. Baked into the `winspace-e2e-nowinkeys` child snapshot (step 8). |
+| 9 | **No hotkey policy — stock shell** | The seeded default is `$mod = ALT`; `Alt+<n>` / `Alt+Shift+<n>` / `Alt+<letter>` all register via `RegisterHotKey` on an **unmodified** Windows 11 (ADR-0014). Nothing needs freeing — do **not** apply `NoWinKeys` or any other policy. The native VD hotkeys (`Win+Ctrl+D` / `Win+Ctrl+F4`) the seams use to stage desktops are OS-level and always available. |
 
 ## One-time steps
 
@@ -60,8 +60,8 @@ Import-Module Pester -MinimumVersion 5.0    # confirm it loads
 
 ### 4. VC++ x64 redistributable
 Install the latest **Microsoft Visual C++ Redistributable (x64)** (`vc_redist.x64.exe`). Sanity-check
-that a Release winspace runs (it exits only on `$mod+Q`, so just confirm it launches without a missing-DLL
-dialog).
+that a Release winspace runs (it exits only on `$mod SHIFT+Q`, so just confirm it launches without a
+missing-DLL dialog).
 
 ### 5. Deploy root + 1-desktop baseline
 
@@ -83,29 +83,17 @@ With the guest booted, auto-logged-in, sitting on a single desktop:
 vmctl snapshot commit win11-24h2 winspace-e2e -m "e2e baseline: autologon, Tools, Pester, redist, 1 desktop"
 ```
 
-This `winspace-e2e` snapshot is the pristine baseline; step 8 layers NoWinKeys on top of it.
+The snapshot **name** must be `winspace-e2e` (the orchestrator's default `-Snapshot`). This is the
+pristine, stock baseline the harness reverts to — no policy layered on top.
 
-### 8. Bake `NoWinKeys=1` → the `winspace-e2e-nowinkeys` snapshot the harness reverts to
-`$mod = SUPER` binds bare-Win chords, which the shell reserves; `NoWinKeys=1` frees them (requirement
-9). Apply it and capture a child snapshot. The registry write needs an **elevated** guest session —
-`vmctl exec -t` runs at High integrity (the `test` user is a split-token admin); an interactive
-`-it` session runs at Medium and is **denied** on this policy key. HKCU is shared across both tokens,
-so setting it from `-t` applies to the interactive session too:
+Verify: after `vmctl snapshot reset win11-24h2 winspace-e2e`, `RegisterHotKey(MOD_ALT,'1')` must
+return `OK` in an interactive (`-it`) session — with **no** registry policy applied. That is the
+whole point of `$mod = ALT` (ADR-0014): winspace binds on a stock Windows 11.
 
-```powershell
-vmctl snapshot reset win11-24h2 winspace-e2e     # start from the pristine baseline
-vmctl exec -t win11-24h2 "`$pk='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; New-Item -Path `$pk -Force | Out-Null; Set-ItemProperty -Path `$pk -Name NoWinKeys -Type DWord -Value 1; Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force"
-vmctl snapshot commit win11-24h2 winspace-e2e-nowinkeys -m "winspace-e2e + NoWinKeys=1 for bare-Win \$mod"
-```
-
-The snapshot **name** must be `winspace-e2e-nowinkeys` (the orchestrator's default `-Snapshot`).
-Verify: after `vmctl snapshot reset win11-24h2 winspace-e2e-nowinkeys`, `RegisterHotKey(MOD_WIN,'1')`
-must return `OK` in an interactive (`-it`) session.
-
-> **End users, not just the VM:** because winspace defaults to `$mod = SUPER`, a real install also
-> needs `NoWinKeys=1` for `Win+<n>`/`Win+Q` to bind (winspace does **not** set it — that would kill
-> the user's `Win+E`/`Win+D`/etc. globally; it is an opt-in the user must accept). Without it winspace
-> skips-and-logs every workspace bind. The seeded config header (`src/io/app.cpp`) documents this.
+> **End users:** because winspace defaults to `$mod = ALT`, a real install needs **no** setup — the
+> `Alt+<n>` / `Alt+Shift+<n>` chords register out of the box. The tradeoff (documented in the seeded
+> config header, `src/io/config_io.cpp`) is that these global Alt chords shadow the focused app's own
+> `Alt+<key>` shortcuts while winspace runs; rebind if that bites.
 
 ## Running the harness *(host)*
 

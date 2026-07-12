@@ -15,9 +15,9 @@
 
     Oracle policy (ADR-0005): assert on independent OS state — the Task Scheduler
     store via Get-ScheduledTask (the Windows-blessed autostart record itself), never
-    winspace's own log. `reload` is Triggered by a synthesized Win+Shift+R chord
-    (Send-Chord); $mod is SUPER (the Windows key), which only registers because
-    NoWinKeys=1 is baked into the winspace-e2e-nowinkeys snapshot (scripts/PROVISIONING.md).
+    winspace's own log. `reload` is Triggered by a synthesized Alt+Shift+R chord
+    (Send-Chord); $mod is ALT (the Alt key), which registers on a stock Windows 11 with
+    no policy (ADR-0014). The snapshot is just winspace-e2e (stock).
 
     Each seam stages its own task-store precondition (Remove-WinspaceAutostartTask)
     so run order never matters, mirroring Set-DesktopCount for the VD seams.
@@ -31,7 +31,7 @@ BeforeAll {
     # bind rides along so the live-toggle seam can flip the flag without a restart. A
     # double-quoted here-string, so `$mod is escaped to survive to the file verbatim.
     $script:ConfigOn = @"
-`$mod = SUPER
+`$mod = ALT
 bind = `$mod SHIFT, R, reload
 start_at_login = true
 "@
@@ -39,7 +39,7 @@ start_at_login = true
     # start_at_login OFF: the running winspace must remove the task (a clean no-op if
     # already absent). Same reload bind so the toggle seam can flip either direction.
     $script:ConfigOff = @"
-`$mod = SUPER
+`$mod = ALT
 bind = `$mod SHIFT, R, reload
 start_at_login = false
 "@
@@ -184,7 +184,7 @@ Describe 'autostart' {
             # poll — the hotkey re-fire is idempotent, and a reload re-registers in place.
             Set-WinspaceConfig -Content $script:ConfigOn | Out-Null
             Wait-Until -Because 'the reload to register the task live' -Condition {
-                Send-Chord 'Win+Shift+R'
+                Send-Chord 'Alt+Shift+R'
                 $null -ne (Get-WinspaceAutostartTask)
             }
             $winspace.HasExited | Should -BeFalse -Because 'a live reload must not restart the WM'
@@ -193,7 +193,7 @@ Describe 'autostart' {
             # live process.
             Set-WinspaceConfig -Content $script:ConfigOff | Out-Null
             Wait-Until -Because 'the reload to remove the task live' -Condition {
-                Send-Chord 'Win+Shift+R'
+                Send-Chord 'Alt+Shift+R'
                 $null -eq (Get-WinspaceAutostartTask)
             }
             $winspace.HasExited | Should -BeFalse -Because 'the WM stayed up across both live toggles'

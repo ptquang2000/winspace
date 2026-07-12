@@ -44,8 +44,8 @@ BeforeAll {
     # A double-quoted here-string so `$mod is escaped to survive to the file while
     # $LaunchExe expands here. winspace re-seeds its default once the file is cleared.
     $script:LauncherConfig = @"
-`$mod = SUPER
-bind = `$mod, Q, quit
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
 bind = `$mod SHIFT, R, reload
 exec-once = $script:LaunchExe
 windowrule = workspace 1, exe:$script:LaunchExe.exe
@@ -149,7 +149,7 @@ Describe 'launcher' {
 
             # Fire `reload` on the SAME (unchanged) config. Reloaded{} re-launches only
             # `exec` entries, never `exec-once`, so the count must stay at one.
-            Send-Chord 'Win+Shift+R'
+            Send-Chord 'Alt+Shift+R'
             Wait-Until -Because 'the Worker to apply the reload' -Condition {
                 (Get-WinspaceLogText) -match 'reload: applied new config'
             }

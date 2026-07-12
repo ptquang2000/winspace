@@ -50,8 +50,8 @@ BeforeAll {
     # A double-quoted here-string, so `$mod is escaped to survive to the file while
     # $RuleTitle expands here. winspace re-seeds its default once the file is cleared.
     $script:RuleConfig = @"
-`$mod = SUPER
-bind = `$mod, Q, quit
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
 windowrule = workspace 1, title:$script:RuleTitle
 "@
 
@@ -62,15 +62,15 @@ windowrule = workspace 1, title:$script:RuleTitle
     # fixture, never the runner console or a helper powershell.
     $script:IneligibleTitle = 'winspace-eligibility-probe'
     $script:IneligibleConfig = @"
-`$mod = SUPER
-bind = `$mod, Q, quit
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
 windowrule = workspace 1, title:$script:IneligibleTitle
 "@
     # UWP frame eligibility keys on Calculator's frame caption; the parser compiles a title
     # rule as std::regex, so the literal "Calculator" matches the real frame window.
     $script:UwpConfig = @"
-`$mod = SUPER
-bind = `$mod, Q, quit
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
 windowrule = workspace 1, title:Calculator
 "@
 }
@@ -298,7 +298,7 @@ Describe 'window-rules' {
             # (it never opened a query-capable handle); touching .Handle now fixes that.
             $null = $winspace.Handle
 
-            Send-Chord 'Win+Q'   # $mod, Q -> quit
+            Send-Chord 'Alt+Shift+Q'   # $mod SHIFT, Q -> quit
 
             # Blocking WaitForExit (not a HasExited poll): it both proves no thread or
             # hook is left hanging AND settles the cached ExitCode — a polled HasExited
