@@ -37,8 +37,8 @@
 namespace winspace::io {
 
 // ── leveled diagnostics sink ─────────────────────────────────────────────────
-// One line per event, prefixed with a bold ANSI-colored level. Shared I/O sink;
-// task 06 uses it for variant logging. Narrow (UTF-8) throughout.
+// One line per event, prefixed with a bold ANSI-colored level. Shared I/O sink
+// used for variant logging. Narrow (UTF-8) throughout.
 namespace lg {
 
 // Each level is a variadic format wrapper over a compile-time-checked format

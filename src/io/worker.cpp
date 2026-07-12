@@ -2,14 +2,14 @@
 //
 // The single STA thread at winspace's center. It:
 //   * CoInitializeEx(COINIT_APARTMENTTHREADED) — sole apartment owner of the
-//     COM Virtual Desktop bridge (wired in task 06);
+//     COM Virtual Desktop bridge;
 //   * creates a message-only (HWND_MESSAGE) window in its constructor, so the
 //     HWND is valid before anything can post to it;
 //   * runs a GetMessage loop whose WndProc feeds each incoming Event through the
 //     pure `reduce` and executes the emitted Effects on this thread;
 //   * owns the authoritative State and the Reducer.
 //
-// Transport contract: producers (the Hotkey thread, task 05) hand an Event to
+// Transport contract: producers (the Hotkey thread) hand an Event to
 // the Worker by PostMessage-ing a heap-allocated `Event*` in LPARAM to this
 // window (never PostThreadMessage — a thread-queue post has no HWND to own the
 // message and races the loop's realization). The Worker takes ownership and
@@ -25,8 +25,8 @@
 #include <utility>  // std::move
 #include <vector>
 
-#include "io/autostart.cpp"  // syncAutostart — the ITaskService logon-task adapter (issue 10)
-#include "io/config_io.cpp"  // readAndParseConfig — the shared reload read+parse (issue 09)
+#include "io/autostart.cpp"  // syncAutostart — the ITaskService logon-task adapter
+#include "io/config_io.cpp"  // readAndParseConfig — the shared reload read+parse
 #include "io/error.cpp"      // io::Error vocabulary (ok() wrappers) + lg:: levels
 #include "io/probe.cpp"      // window Probe sweep + WindowId ⇄ HWND mint (focus)
 #include "io/vd_bridge.cpp"  // IVirtualDesktopBridge + factory (this thread owns it)
@@ -42,14 +42,14 @@ inline constexpr UINT k_wmEvent = WM_APP + 0;
 // Tells the Worker the Hotkey thread's id (WPARAM), so a live reload can hand that
 // thread the new Binds. Posted to the Worker's HWND once by the spine after the
 // Hotkey thread publishes its id (the Worker is constructed first, so it cannot
-// know the id at construction). Issue 09 / ADR-0012.
+// know the id at construction). ADR-0012.
 inline constexpr UINT k_wmSetHotkeyThread = WM_APP + 1;
 
 // Carries a freshly-parsed std::vector<Bind>* to the HOTKEY thread's queue on a
 // reload (PostThreadMessage, so it has no HWND and is handled inline in that
 // thread's loop, like WM_HOTKEY). The Hotkey thread takes ownership and rebuilds
 // its HotkeyTable; on a failed post the sender deletes the vector (mirroring
-// postEvent's delete-on-failure ownership). Issue 09 / ADR-0012.
+// postEvent's delete-on-failure ownership). ADR-0012.
 inline constexpr UINT k_wmReloadBinds = WM_APP + 2;
 
 // Hand an Event to the Worker across threads. Ownership transfers to the Worker
@@ -70,20 +70,20 @@ public:
     // Takes the parsed window rules and seeds m_state.rules BEFORE anything can
     // reach this Worker: the ctor runs before workerThreadMain publishes the HWND,
     // so rules are in place before any Appeared (synthetic-adoption or live) can
-    // arrive (PRD 06 ordering). The rule list is wrapped in a shared handle so the
-    // per-event State copy stays O(1) (ADR-0009 / PRD deviation).
+    // arrive (startup ordering). The rule list is wrapped in a shared handle so the
+    // per-event State copy stays O(1) (ADR-0009).
     explicit Worker(std::vector<WindowRule> rules, std::vector<ExecEntry> execs,
                     bool startAtLogin) {
         m_state.rules = std::make_shared<const std::vector<WindowRule>>(std::move(rules));
         // Launch entries are seeded alongside rules and behind the same O(1)-copy
         // handle, so they precede the Started{} the spine posts right after the
-        // HWND publishes (PRD 08).
+        // HWND publishes.
         m_state.execs = std::make_shared<const std::vector<ExecEntry>>(std::move(execs));
-        // The start_at_login flag is seeded here beside rules/execs (issue 09);
-        // slice 10 will read it. It emits no Effect and is reseeded on reload.
+        // The start_at_login flag is seeded here beside rules/execs. It emits no
+        // Effect and is reseeded on reload.
         m_state.startAtLogin = startAtLogin;
 
-        // This thread is the single STA that will own the COM bridge (task 06).
+        // This thread is the single STA that will own the COM bridge.
         // COINIT_APARTMENTTHREADED demands a message loop, which run() supplies.
         // A failed init is tolerated (the bridge factory degrades to a null bridge);
         // the derived bool is what gates the matching CoUninitialize in the dtor.
@@ -210,7 +210,7 @@ private:
                         lg::warn("focus: SetForegroundWindow failed: {}", set.error());
                 },
                 [&](const MoveForegroundWindowToWorkspace& m) {
-                    // Ungated by Eligibility (issue 06): the user aimed at the
+                    // Ungated by Eligibility: the user aimed at the
                     // foreground window explicitly. Resolve it inline — no probe
                     // round-trip, since there is no pure decision to make. No bridge
                     // or no foreground window → degrade-and-log, never crash. The
@@ -227,7 +227,7 @@ private:
                     m_bridge->moveWindowToWorkspace(toWindowId(fg), m.logical);
                 },
                 [&](const MoveWindowToWorkspace& m) {
-                    // The WindowRule move (PRD 06): a SPECIFIC window that just
+                    // The WindowRule move: a SPECIFIC window that just
                     // Appeared, by id — no GetForegroundWindow, no cloak. The
                     // internal MoveViewToDesktop reassigns the desktop without ever
                     // painting on the current one (ADR-0010 revised), so a
@@ -235,7 +235,7 @@ private:
                     if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
                 },
                 [&](const LaunchApp& l) {
-                    // Launch-only (PRD 08 / ADR-0011): start a detached child and
+                    // Launch-only (ADR-0011): start a detached child and
                     // forget it — no PID kept, no Workspace assigned (placement is a
                     // paired `windowrule`). CreateProcessW itself parses exe + args
                     // from the command line and searches %PATH%; it WRITES to
@@ -259,7 +259,7 @@ private:
                     }
                 },
                 [&](const ReloadConfig&) {
-                    // Live reload (issue 09, ADR-0012), executed on THIS thread. Re-read
+                    // Live reload (ADR-0012), executed on THIS thread. Re-read
                     // + re-parse via the shared helper, then apply ATOMICALLY: any
                     // Diagnostic — or an unreadable file — keeps the currently-running
                     // config live and changes nothing (the fallback is the user's own
@@ -310,8 +310,8 @@ private:
                     lg::info("reload: applied new config");
                 },
                 [&](const SyncAutostart& s) {
-                    // Delegate the whole ITaskService interaction to the adapter (issue 10,
-                    // ADR-0013): create-or-update the `\winspace\<username>` logon task when
+                    // Delegate the whole ITaskService interaction to the adapter
+                    // (ADR-0013): create-or-update the `\winspace\<username>` logon task when
                     // enabled, delete-if-exists when not. Degrade-and-log on any failure
                     // (ADR-0004) — autostart never blocks or crashes the WM.
                     if (const auto synced = syncAutostart(s.enabled); !synced)

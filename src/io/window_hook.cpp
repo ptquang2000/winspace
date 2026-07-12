@@ -1,9 +1,8 @@
 // Window-hook adapter — I/O adapter (owns <windows.h>). The SetWinEventHook
-// lifecycle stream behind window rules (PRD 06), reintroduced on its OWN
-// dedicated thread when this slice became the hook's first genuine consumer
-// (ADR-0007 removed it with tiling). It mirrors the Hotkey thread: it owns no
-// State and makes no decision — its callback runs the noise gate, Probes the
-// window, and posts an Appeared / Vanished Event to the Worker, which reduces it.
+// lifecycle stream behind window rules, on its own dedicated thread, mirroring
+// the Hotkey thread: it owns no State and makes no decision — its callback runs
+// the noise gate, Probes the window, and posts an Appeared / Vanished Event to
+// the Worker, which reduces it.
 //
 // Kept off the Worker thread so hook delivery never queues behind a blocking
 // Effect (a SwitchDesktop or a move round-trip). Two tight SetWinEventHook ranges

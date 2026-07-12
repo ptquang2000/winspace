@@ -222,7 +222,7 @@ inline DWORD readUbr() {
     return ubr;
 }
 
-// Optional smoke-test hook (task 07 step 6): WINSPACE_FORCE_VD_VARIANT=21h2|22h2|
+// Optional smoke-test hook: WINSPACE_FORCE_VD_VARIANT=21h2|22h2|
 // 23h2-kb forces selection of a stubbed variant so its "not yet implemented"
 // diagnostic can be observed on the 24H2 dev machine. Unset → normal probing.
 inline std::wstring forcedVariantOverride() {

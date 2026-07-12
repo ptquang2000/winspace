@@ -74,7 +74,7 @@ TEST_CASE("reduce is pure — same inputs yield same Effects and leave the input
     REQUIRE(s.running);
 }
 
-// ── move-to-workspace: the move Effect, and follow vs. silent (issue 06) ──────
+// ── move-to-workspace: the move Effect, and follow vs. silent ────────────────
 
 TEST_CASE("movetoworkspace (follow) emits the move then the switch", "[reducer]") {
     const auto r = reduce(State{.currentWorkspace = 1, .running = true},
@@ -309,7 +309,7 @@ TEST_CASE("y-down convention: focus down picks the +y Candidate, focus up the -y
     REQUIRE(single_effect<winspace::SetForegroundWindow>(up) == winspace::SetForegroundWindow{WindowId{3}});
 }
 
-// ── window rules: match + place-once (PRD 06) ────────────────────────────────
+// ── window rules: match + place-once ─────────────────────────────────────────
 //
 // These feed synthetic Appeared / Vanished Events with hand-built WindowAttrs +
 // WindowIdentity and assert on the emitted Effects, never on State internals —
@@ -332,7 +332,7 @@ WindowRule titleRule(int ws, const std::string& pattern) {
     return WindowRule{Field::Title, RuleAction::Place, ws, pattern, std::regex(pattern)};
 }
 
-// An Ignore-action rule (issue 09). workspace is unused for Ignore, so 0.
+// An Ignore-action rule. workspace is unused for Ignore, so 0.
 WindowRule ignoreExeRule(std::string exe) {
     return WindowRule{Field::Exe, RuleAction::Ignore, 0, std::move(exe), std::regex{}};
 }
@@ -471,7 +471,7 @@ TEST_CASE("an Appeared with no rules seeded emits nothing but still places the i
     REQUIRE(second.effects.empty());
 }
 
-// ── windowrule ignore action + the ignored set (issue 09) ────────────────────
+// ── windowrule ignore action + the ignored set ───────────────────────────────
 
 TEST_CASE("an Appeared matching an Ignore rule emits no move — the id is recorded, not placed elsewhere", "[reducer][rules]") {
     // Ignore never moves the window (winspace acts on it in no way), yet the window
@@ -536,7 +536,7 @@ TEST_CASE("Vanished clears an ignored id so the window becomes a focus target ag
             winspace::SetForegroundWindow{WindowId{2}});
 }
 
-// ── launcher: Started / Reloaded → LaunchApp (PRD 08) ────────────────────────
+// ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────
 //
 // A State seeded with a synthetic exec list; assert the LaunchApp Effects. Started
 // launches every entry in config order; Reloaded launches only the `exec`
@@ -568,7 +568,7 @@ TEST_CASE("Started launches every exec entry, exec-once and exec alike, in confi
 
     const auto r = reduce(s, Started{});
 
-    // The three launches in config order, then the trailing SyncAutostart (issue 10).
+    // The three launches in config order, then the trailing SyncAutostart.
     REQUIRE(r.effects.size() == 4);
     REQUIRE(launched(r, 0) == "firefox");
     REQUIRE(launched(r, 1) == "kitty");
@@ -586,7 +586,7 @@ TEST_CASE("Reloaded launches only the exec entries, skipping exec-once, in confi
 
     const auto r = reduce(s, Reloaded{});
 
-    // The two `exec` relaunches, then the trailing SyncAutostart (issue 10).
+    // The two `exec` relaunches, then the trailing SyncAutostart.
     REQUIRE(r.effects.size() == 3);
     REQUIRE(launched(r, 0) == "kitty");
     REQUIRE(launched(r, 1) == "tray");
@@ -595,7 +595,7 @@ TEST_CASE("Reloaded launches only the exec entries, skipping exec-once, in confi
 
 TEST_CASE("Started and Reloaded with no exec entries still emit exactly one SyncAutostart", "[reducer][launcher]") {
     // A default State has a null execs handle; both handlers skip it safely and are
-    // left with only the SyncAutostart the flag always produces (issue 10).
+    // left with only the SyncAutostart the flag always produces.
     REQUIRE(single_effect<SyncAutostart>(reduce(State{}, Started{})) == SyncAutostart{false});
     REQUIRE(single_effect<SyncAutostart>(reduce(State{}, Reloaded{})) == SyncAutostart{false});
 
@@ -606,7 +606,7 @@ TEST_CASE("Started and Reloaded with no exec entries still emit exactly one Sync
     REQUIRE(reduce(onceOnly, Started{}).effects.size() == 3);  // 2 launches + SyncAutostart
 }
 
-// ── autostart: Started / Reloaded → SyncAutostart{startAtLogin} (issue 10) ────
+// ── autostart: Started / Reloaded → SyncAutostart{startAtLogin} ──────────────
 //
 // Both lifecycle Events emit exactly one SyncAutostart carrying State.startAtLogin
 // verbatim (declarative — the Reducer never decides register-vs-remove), and neither
@@ -666,7 +666,7 @@ TEST_CASE("the launch command is passed through verbatim, including a literal $"
     REQUIRE(launched(r, 0) == "C:\\Program Files\\App\\app.exe --flag $HOME");
 }
 
-// ── reload trigger: Reload → ReloadConfig (issue 09, ADR-0012) ───────────────
+// ── reload trigger: Reload → ReloadConfig (ADR-0012) ─────────────────────────
 //
 // The Reducer is pure and cannot read a file, so a Reload{} only ASKS: it emits a
 // single ReloadConfig{} Effect and mutates no State. The Worker does the re-read /
@@ -687,11 +687,11 @@ TEST_CASE("a Reload Event emits exactly one ReloadConfig and changes no State", 
     REQUIRE(r.state.placed.contains(WindowId{7}));
 }
 
-// ── start_at_login carried through State (issue 09) ──────────────────────────
+// ── start_at_login carried through State ────────────────────────────────────
 //
 // The flag is seeded at Worker construction and reseeded on reload; the Reducer
 // only carries it — no Event derives an Effect from it, and every reduce preserves
-// it unchanged (the slice-10 logon task is what acts on it).
+// it unchanged (the logon task is what acts on it).
 
 TEST_CASE("startAtLogin round-trips through State and no Event emits an Effect for it", "[reducer]") {
     State on;

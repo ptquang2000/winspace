@@ -4,12 +4,12 @@
 // place behavioral logic lives; it consumes an Event, returns fresh State by
 // value, and emits Effects as plain data. It reasons purely in Logical
 // workspace numbers — it never sees a Virtual Desktop GUID (the logical->GUID
-// map, adoption, and create-on-demand all live in the bridge, task 06).
+// map, adoption, and create-on-demand all live in the bridge).
 //
 // winspace owns no window geometry (ADR-0007): no Effect ever moves or sizes a
 // window. What remains here on the window side is the Eligibility substrate —
 // strong identities and the pure `isEligible` gate — which the Spatial-focus
-// slice (issue 05) builds on and PRD 06's rules reuse. The tiling machinery
+// slice builds on and the window rules reuse. The tiling machinery
 // (layout, PositionWindow, focus order, the monitor model, and the
 // Appeared/Vanished lifecycle stream) was removed with tiling.
 //
@@ -42,7 +42,7 @@ enum class WindowId : uint64_t {};
 enum class MonitorId : uint64_t {};
 
 // A logical rectangle in virtual-screen coordinates. Plain data; the Reducer
-// reasons in these (issue 05 resolves directional focus over them). The
+// reasons in these (directional focus resolves over them). The
 // drop-shadow delta and DPI never enter the core.
 struct Rect {
     int left = 0;
@@ -52,7 +52,7 @@ struct Rect {
 };
 
 // The Probe result: one window's live attributes, read reactively when needed
-// (on a `focus` keypress, issue 05). `id`, the monitor it sits on, its live
+// (on a `focus` keypress). `id`, the monitor it sits on, its live
 // `rect` in virtual-screen coordinates (the directional resolution reasons over
 // these), and the eligibility booleans — the Eligibility gate is the pure AND of
 // those facts. The rect is probed together with the eligibility facts in one read.
@@ -85,19 +85,18 @@ struct WindowIdentity {
 // ASCII-case-insensitive; title is a std::regex_search (substring, case-sensitive).
 enum class Field { Exe, Class, Title };
 
-// The action a matching WindowRule applies (ADR-0009 extension, issue 09):
+// The action a matching WindowRule applies (ADR-0009 extension):
 // Place pins the window to a target Workspace on Appeared (the original behavior);
 // Ignore excludes the window from Spatial focus (it is never a focus target).
 enum class RuleAction { Place, Ignore };
 
-// A parsed `windowrule = <action>, <field>:<pattern>` (PRD 06; the Ignore action
-// added in issue 09). Lives in the core next to WindowAttrs; the parser (Seam 2)
+// A parsed `windowrule = <action>, <field>:<pattern>`. Lives in the core next to WindowAttrs; the parser (Seam 2)
 // compiles these and the reducer matches against them. For Exe/Class, `pattern` is
 // the (lowercased, trimmed) literal to compare; for Title, `regex` is the compiled
 // pattern and `pattern` keeps the source text (diagnostics only). `workspace` is
 // the target Logical number for a Place rule (unused for Ignore). std::regex makes
 // this copyable-but-not-cheap, which is why State holds the rule list behind a
-// shared_ptr (PRD: O(1) per-event State copies).
+// shared_ptr (O(1) per-event State copies).
 struct WindowRule {
     Field field{};
     RuleAction action = RuleAction::Place;
@@ -106,10 +105,10 @@ struct WindowRule {
     std::regex regex;
 };
 
-// A parsed `exec = <cmd>` / `exec-once = <cmd>` launch entry (PRD 08, ADR-0011).
+// A parsed `exec = <cmd>` / `exec-once = <cmd>` launch entry (ADR-0011).
 // `command` is the verbatim command line (unexpanded — no $var); `once` is true
 // for exec-once (start only, not on reload). Launch-only: no target Workspace,
-// no PID — placement is a paired `windowrule` (PRD 07). Lives in the core next to
+// no PID — placement is a paired `windowrule`. Lives in the core next to
 // WindowRule; the parser (Seam 2) collects these in source order and the reducer
 // turns each into a LaunchApp Effect. State holds the list behind a shared_ptr for
 // O(1) per-event copies, mirroring `rules` (ADR-0009).
@@ -152,7 +151,7 @@ struct FocusResolve {
     std::optional<WindowAttrs> origin;      // the foreground window; nullopt => no-op
 };
 
-// movetoworkspace / movetoworkspacesilent (issue 06): move the FOREGROUND window
+// movetoworkspace / movetoworkspacesilent: move the FOREGROUND window
 // to a Logical workspace. `follow` = the plain form (the active desktop also
 // becomes N); the silent form stays put. Ungated by Eligibility — the user aimed
 // at the foreground window explicitly. Unlike focus (ADR-0008) there is no pure
@@ -163,7 +162,7 @@ struct MoveToWorkspace {
     bool follow = false;
 };
 
-// The window-lifecycle edges delivered by the SetWinEventHook adapter (PRD 06),
+// The window-lifecycle edges delivered by the SetWinEventHook adapter,
 // reintroduced with window rules. Appeared = EVENT_OBJECT_SHOW / _UNCLOAKED — it
 // carries a Probed WindowAttrs (the Eligibility facts) AND a WindowIdentity (the
 // strings a rule matches); the adapter hands over facts, never a verdict, so the
@@ -177,15 +176,15 @@ struct Vanished {
     WindowId id{};
 };
 
-// Launcher lifecycle Events (PRD 08). Started = the spine posted it once the
+// Launcher lifecycle Events. Started = the spine posted it once the
 // Worker HWND exists; it makes the Reducer emit a LaunchApp for EVERY exec entry.
-// Reloaded = config was reloaded (the trigger itself lands with PRD 09); it emits
+// Reloaded = config was reloaded; it emits
 // LaunchApp only for the `exec` (once == false) entries. exec-once idempotency is
 // thus stateless — purely which Event fires, never a remembered flag.
 struct Started {};
 struct Reloaded {};
 
-// The `reload` hotkey trigger (issue 09, ADR-0012). Posted by the Hotkey thread
+// The `reload` hotkey trigger (ADR-0012). Posted by the Hotkey thread
 // when a bound `reload` dispatcher fires. The Reducer is pure and cannot read a
 // file, so it only ASKS: reduce(state, Reload{}) emits a single ReloadConfig{}
 // Effect and touches no State. Distinct from Reloaded{} (above), the POST-parse
@@ -223,7 +222,7 @@ struct MoveForegroundWindowToWorkspace {
 };
 
 // Move a SPECIFIC window (usually a background one that just Appeared) to a
-// Logical workspace — the WindowRule move (PRD 06). Distinct from
+// Logical workspace — the WindowRule move. Distinct from
 // MoveForegroundWindowToWorkspace, whose Worker arm resolves GetForegroundWindow()
 // inline; a rule names its target by id. Both drive the same id-addressable bridge
 // method moveWindowToWorkspace(WindowId, int); there is no cloak wrapping (the
@@ -233,7 +232,7 @@ struct MoveWindowToWorkspace {
     int logical = 0;
 };
 
-// Launch a detached child process (PRD 08, ADR-0011). The Worker runs `command`
+// Launch a detached child process (ADR-0011). The Worker runs `command`
 // through one CreateProcessW and closes both handles — launch-only, no PID kept,
 // no Workspace assigned (placement is a paired `windowrule`). `command` is the
 // verbatim config tail.
@@ -241,7 +240,7 @@ struct LaunchApp {
     std::string command;
 };
 
-// Re-read and re-apply the config file live (issue 09, ADR-0012). Emitted by the
+// Re-read and re-apply the config file live (ADR-0012). Emitted by the
 // Reducer in response to a Reload{} Event; executed by the Worker on its own
 // thread — it re-resolves the config path, re-reads and re-parses the file, and
 // (only on a clean parse) reseeds config-derived State, hands the new Binds to the
@@ -249,7 +248,7 @@ struct LaunchApp {
 // reads no file, so everything the reload needs is discovered by the Worker.
 struct ReloadConfig {};
 
-// Make the OS logon task match `enabled` (issue 10, ADR-0013). DECLARATIVE, not a
+// Make the OS logon task match `enabled` (ADR-0013). DECLARATIVE, not a
 // transition command: the Reducer always emits SyncAutostart{state.startAtLogin}
 // and never decides register-vs-remove — the Worker's adapter does create-or-update
 // when enabled, delete-if-exists when not (counting an absent task as success). One
@@ -296,7 +295,7 @@ constexpr bool operator==(const SyncAutostart& a, const SyncAutostart& b) {
 }
 
 // Value equality for the plain-data window types (used by the eligibility tests
-// and, later, issue 05's directional-focus tests).
+// and the directional-focus tests).
 constexpr bool operator==(const Rect& a, const Rect& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
@@ -309,7 +308,7 @@ constexpr bool operator==(const WindowAttrs& a, const WindowAttrs& b) {
 
 // All the Reducer owns. Tiny by design: pass-by-value and return-by-value keep
 // reduce pure and trivially testable. No window/geometry state lives here —
-// Spatial focus (issue 05) is stateless, resolving from rects probed live at
+// Spatial focus is stateless, resolving from rects probed live at
 // keypress, so nothing about windows is persisted between events.
 struct State {
     int currentWorkspace = 1;
@@ -319,13 +318,13 @@ struct State {
     // ADR-0009 records against ADR-0007's otherwise-stateless window side. `rules`
     // is an immutable shared handle (seeded once at Worker construction), so the
     // per-event State copy stays O(1) instead of deep-copying N compiled regexes
-    // (PRD deviation from ADR-0009's literal vector). `placed` is the place-once
+    // (a deviation from ADR-0009's literal vector). `placed` is the place-once
     // set: an id enters on its first Eligible Appeared (matched or not) and is
     // erased on Vanished, so a user-moved window is never yanked back.
     std::shared_ptr<const std::vector<WindowRule>> rules;
     std::unordered_set<WindowId> placed;
 
-    // The Ignore-set (ADR-0009 extension, issue 09): the bounded set of ids a
+    // The Ignore-set (ADR-0009 extension): the bounded set of ids a
     // matching Ignore WindowRule has excluded from Spatial focus. Mirrors `placed`
     // — an id enters on its first Eligible Appeared whose first match is an Ignore
     // rule (and enters `placed` too, since it has been evaluated), and is erased on
@@ -334,15 +333,15 @@ struct State {
     // never moved or sized, still Alt-Tab reachable).
     std::unordered_set<WindowId> ignored;
 
-    // Launch entries (PRD 08), seeded once at Worker construction behind the same
+    // Launch entries, seeded once at Worker construction behind the same
     // O(1)-copy shared handle as `rules`. Read only by the Started/Reloaded
     // handlers, which turn each into a LaunchApp; never mutated by a reduce. No
     // per-window launch state exists — exec-once idempotency is stateless.
     std::shared_ptr<const std::vector<ExecEntry>> execs;
 
-    // The parsed `start_at_login` flag (issue 09), seeded at Worker construction
-    // beside `rules`/`execs` and reseeded on reload. Slice 09 only carries it into
-    // State — no Effect derives from it here; the slice-10 logon task reads it and
+    // The parsed `start_at_login` flag, seeded at Worker construction
+    // beside `rules`/`execs` and reseeded on reload. State only carries it — no Effect derives from it here;
+    // the logon task reads it and
     // emits its own Effect. Every reduce preserves it unchanged.
     bool startAtLogin = false;
 };
@@ -374,9 +373,9 @@ overload(Fs...) -> overload<Fs...>;
 // The Eligibility gate: a window is Eligible iff every probed fact agrees. A
 // real top-level, visible, resizable, captioned application window that is
 // neither a tool window, cloaked, nor fullscreen. The Spatial-focus sweep
-// (issue 05) filters candidates through this; PRD 06's rules match against the
+// filters candidates through this; the window rules match against the
 // same set. (`thickFrame` is a tiling-era hold-over and may be loosened for
-// focus candidacy later — see ADR-0007 / DESIGN §4.)
+// focus candidacy later — see ADR-0007.)
 constexpr bool isEligible(const WindowAttrs& a) {
     return a.topLevel && a.visible && a.thickFrame && a.caption && !a.toolWindow && !a.cloaked &&
            !a.fullscreen;
@@ -470,13 +469,13 @@ inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
     return chosen;
 }
 
-// ── window-rule matcher: the pure rule (PRD 06) ──────────────────────────────
+// ── window-rule matcher: the pure rule ───────────────────────────────────────
 
 namespace rule_detail {
 
 // ASCII per-byte case-insensitive equality — the same fold as config's iequals,
 // re-expressed here so the core stays self-contained. exe/class match exactly
-// under this fold; no Unicode case-folding this slice (PRD Out of Scope).
+// under this fold; no Unicode case-folding (out of scope).
 inline bool asciiIEquals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -589,9 +588,9 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.ignored.erase(v.id);
                 return {next, {}};
             },
-            // Startup (PRD 08): emit a LaunchApp for EVERY exec entry, in config
+            // Startup: emit a LaunchApp for EVERY exec entry, in config
             // order (exec-once + exec alike), then one SyncAutostart carrying the
-            // current start_at_login flag (issue 10) — the autostart task is synced
+            // current start_at_login flag — the autostart task is synced
             // at start just as the launchers fire. State is untouched — exec-once
             // idempotency is stateless, falling out of which Event fires, and the
             // flag is declarative (the Worker's adapter, not the Reducer, decides
@@ -604,10 +603,10 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 effects.push_back(Effect{SyncAutostart{s.startAtLogin}});
                 return {s, std::move(effects)};
             },
-            // Reload (PRD 08; the trigger itself is PRD 09): emit LaunchApp only for
+            // Reload: emit LaunchApp only for
             // the `exec` (once == false) entries, in config order — exec-once is
             // skipped so a reload never spawns a second copy of an already-open app —
-            // then one SyncAutostart with the freshly-reseeded flag (issue 10), so
+            // then one SyncAutostart with the freshly-reseeded flag, so
             // toggling start_at_login and reloading registers/removes the task live.
             [&](const Reloaded&) -> ReduceResult {
                 std::vector<Effect> effects;
@@ -617,7 +616,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 effects.push_back(Effect{SyncAutostart{s.startAtLogin}});
                 return {s, std::move(effects)};
             },
-            // The `reload` hotkey fired (issue 09, ADR-0012). The Reducer is pure —
+            // The `reload` hotkey fired (ADR-0012). The Reducer is pure —
             // it cannot read the file — so it only ASKS: emit one ReloadConfig{}
             // Effect and touch no State. The Worker executes the re-read/re-parse and
             // (on a clean parse) reseeds State, re-registers hotkeys, and posts

@@ -2,11 +2,10 @@
 //
 // Seam 2: parse(text) -> (config, diagnostics). Owns the vocabulary the parser
 // produces — Mod, Key, Dispatcher, Bind — none of them Win32 constants; the I/O
-// adapter (task 05) maps Mod->MOD_* and Key->VK_*. The test TU links no WM
+// adapter maps Mod->MOD_* and Key->VK_*. The test TU links no WM
 // libraries, so any stray OS call reachable from here is a link error.
 //
-// The grammar is a strict subset of the eventual Hyprland DSL (issue 09 only
-// adds directives, it never reshapes this parser):
+// The grammar is a strict subset of the eventual Hyprland DSL:
 //   * `#` comments (whole-line or trailing)
 //   * `$name = tokens` variable definitions, referenced as `$name`
 //   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit,
@@ -62,7 +61,7 @@ constexpr bool contains(Mod set, Mod flag) {
     return (std::to_underlying(set) & std::to_underlying(flag)) != 0;
 }
 
-// Every key a Bind can name; the I/O adapter (task 05) maps each to a VK_*. Each
+// Every key a Bind can name; the I/O adapter maps each to a VK_*. Each
 // contiguous run (digits, letters, function keys) lets parse_key map by offset.
 enum class Key : uint8_t {
     // Digits 0-9 — a digit char maps by offset from N0.
@@ -90,15 +89,15 @@ namespace config {
 enum class Direction : uint8_t { Left, Right, Up, Down };
 }
 
-// Dispatchers recognized this slice. An unknown name is diagnosed here, not
-// deferred to registration (task 05).
+// Dispatchers recognized. An unknown name is diagnosed here, not
+// deferred to registration.
 enum class Dispatcher : uint8_t {
     Workspace,
     Quit,
     Focus,
     MoveToWorkspace,        // movetoworkspace N — move + follow (switch to N)
     MoveToWorkspaceSilent,  // movetoworkspacesilent N — move, stay on current
-    Reload,                 // reload — re-read + re-apply the config file (issue 09)
+    Reload,                 // reload — re-read + re-apply the config file
 };
 
 // A parsed bind line. `arg` carries the workspace number for Workspace and the two
@@ -127,8 +126,8 @@ struct Config {
     std::vector<Bind> binds;
     std::vector<WindowRule> rules;
     std::vector<ExecEntry> execs;
-    // The flat `start_at_login` setting (issue 09); false when absent or set to
-    // `false`. Carried into State; the slice-10 logon task consumes it.
+    // The flat `start_at_login` setting; false when absent or set to
+    // `false`. Carried into State; the logon task consumes it.
     bool startAtLogin = false;
 };
 
@@ -470,8 +469,8 @@ inline ParseResult parse(std::string_view text) {
         }
 
         // `windowrule = <action>, <field>:<pattern>` — where <action> is
-        // `workspace N` (Place a matching app on a Workspace on Appeared, PRD 06) or
-        // `ignore` (exclude it from Spatial focus, issue 09). NO $var expansion: a
+        // `workspace N` (Place a matching app on a Workspace on Appeared) or
+        // `ignore` (exclude it from Spatial focus). NO $var expansion: a
         // title regex may end in `$` (the end-anchor), which expand_vars would
         // misread as a reference.
         if (lhs == "windowrule") {
@@ -488,7 +487,7 @@ inline ParseResult parse(std::string_view text) {
             const std::string_view spec = rhs.substr(comma + 1);
 
             // Action is `workspace N` (Place) or `ignore`; any other Hyprland form is
-            // unsupported this slice (diagnosed, not aborting the file).
+            // unsupported (diagnosed, not aborting the file).
             const auto atoks = split_ws(action);
             WindowRule rule;
             if (!atoks.empty() && atoks[0] == "workspace") {
@@ -571,8 +570,7 @@ inline ParseResult parse(std::string_view text) {
             continue;
         }
 
-        // `exec = <cmd>` / `exec-once = <cmd>` — declare an app to launch (PRD 08,
-        // ADR-0011). The command is the VERBATIM tail after `=` (may hold spaces,
+        // `exec = <cmd>` / `exec-once = <cmd>` — declare an app to launch (ADR-0011). The command is the VERBATIM tail after `=` (may hold spaces,
         // commas, quotes, `$`), stored unparsed into one source-ordered list so the
         // launch order across interleaved exec / exec-once lines is preserved. NO
         // $var expansion — winspace vars are modifier names, and a literal `$` in a
@@ -589,7 +587,7 @@ inline ParseResult parse(std::string_view text) {
             continue;
         }
 
-        // `start_at_login = <bool>` — the lone flat setting (issue 09). true/false,
+        // `start_at_login = <bool>` — the lone flat setting. true/false,
         // case-insensitive; anything else is a Diagnostic. Absent behaves as false.
         // No section{} grammar and no workspace rules (both geometry-only, ADR-0007).
         if (lhs == "start_at_login") {

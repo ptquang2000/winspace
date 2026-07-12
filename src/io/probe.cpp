@@ -1,5 +1,5 @@
 // Window Probe — I/O adapter (owns <windows.h>). The reactive sweep behind the
-// `focus` dispatcher (issue 05): on a keypress the Worker runs it once, reads
+// `focus` dispatcher: on a keypress the Worker runs it once, reads
 // every top-level window's live attributes+rect and the foreground Origin into
 // plain data, and hands that to the pure Reducer, which decides. Nothing is
 // persisted and no timer runs — the adapter is idle until the next keypress
@@ -12,7 +12,7 @@
 //
 // The WindowId ⇄ HWND mint lives here too: WindowId is an opaque uint64 minted
 // from the HWND's pointer bits, and toHwnd reverses it for the
-// SetForegroundWindow Effect (the "named reverse-mint helper" of the PRD).
+// SetForegroundWindow Effect (the named reverse-mint helper).
 #pragma once
 
 #include <windows.h>
@@ -95,7 +95,7 @@ inline std::vector<WindowAttrs> probeTopLevelWindows() {
 }
 
 // The string half of a window Probe — exe basename, window class, and title,
-// narrowed to UTF-8 (PRD 06). Called ONLY on the Appeared path (window rules
+// narrowed to UTF-8. Called ONLY on the Appeared path (window rules
 // need it); the focus sweep never calls it, so these string reads stay off the
 // focus hot path. Each read degrades to an empty string on failure — a rule
 // simply won't match on a field it couldn't read, never a crash.

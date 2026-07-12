@@ -8,9 +8,6 @@
 //   Hotkey thread ──PostMessage(Event*)──▶ Worker's message-only HWND
 //                                          Worker: reduce → execute Effects
 //                                          Exit Effect → PostQuitMessage → unwind
-//
-// (The Window-hook thread was removed with tiling — ADR-0007. PRD 06 reintroduces
-// it as the first genuine consumer of the lifecycle event stream.)
 #pragma once
 
 #include <windows.h>
@@ -22,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include "io/config_io.cpp"  // config load/parse helpers + LoadedConfig (issue 09 prefactor)
+#include "io/config_io.cpp"  // config load/parse helpers + LoadedConfig
 #include "io/hotkeys.cpp"
 #include "io/window_hook.cpp"
 #include "io/worker.cpp"
@@ -31,7 +28,7 @@
 
 namespace winspace::io {
 
-// Load the config for STARTUP (issue 09). Shares the read+parse mechanism with the
+// Load the config for STARTUP. Shares the read+parse mechanism with the
 // Worker's reload path (io/config_io.cpp: seedDefaultConfigIfMissing +
 // readAndParseConfig) but layers startup's own fallback policy on top: seed the
 // built-in default on first run, and if the file is unreadable fall back to the
@@ -88,7 +85,7 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
                     postEvent(workerHwnd, new Event{std::move(*ev)});
             continue;
         }
-        // A live reload (issue 09): the Worker handed us a heap-allocated Bind
+        // A live reload: the Worker handed us a heap-allocated Bind
         // vector to re-register. Take ownership, drop the old table (unregister-all),
         // then build the new one (register-all) — in that order (see above).
         if (msg.message == k_wmReloadBinds) {
@@ -109,7 +106,7 @@ inline int runApp() {
     // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
     // message-only HWND included), so it leads runApp. This puts the process and
     // every window rect in ONE physical-pixel coordinate space — the precondition
-    // for correct spatial-focus resolution across scaled displays (issue 05). Best
+    // for correct spatial-focus resolution across scaled displays. Best
     // effort: a failure (an OS predating V2, or awareness already pinned by a
     // manifest) leaves the prior awareness in place and is logged, never fatal.
     if (const auto aware =
@@ -141,11 +138,10 @@ inline int runApp() {
     }
 
     // The Worker HWND exists and its execs are seeded: post Started{} so the launch
-    // entries fire (PRD 08). Done before the hotkey/hook threads wire up — ordering
-    // vs. the hook thread is not correctness-critical, since PRD 07's
+    // entries fire. Done before the hotkey/hook threads wire up — ordering
+    // vs. the hook thread is not correctness-critical, since the
     // register-then-EnumWindows adoption places a launched window whether it appears
-    // before or after the hooks register. Only Started{} is triggered this slice;
-    // the Reloaded{} trigger lands with PRD 09.
+    // before or after the hooks register.
     postEvent(workerHwnd, new Event{Started{}});
 
     // Start the Hotkey thread once the Worker HWND exists to post to. It registers
@@ -157,7 +153,7 @@ inline int runApp() {
     const DWORD hotkeyTid = tidFuture.get();
 
     // Tell the Worker the Hotkey thread's id so a live `reload` can hand that thread
-    // the freshly-parsed Binds to re-register (issue 09, ADR-0012). Posted after the
+    // the freshly-parsed Binds to re-register (ADR-0012). Posted after the
     // id is known — the Worker was constructed before this thread existed.
     PostMessageW(workerHwnd, k_wmSetHotkeyThread, static_cast<WPARAM>(hotkeyTid), 0);
 

@@ -222,7 +222,7 @@ TEST_CASE("changing $mod in one place re-modifies every bind that references it"
         REQUIRE(contains(b.mods, Mod::Shift));
 }
 
-// ── windowrule directive (PRD 06) ────────────────────────────────────────────
+// ── windowrule directive ─────────────────────────────────────────────────────
 
 TEST_CASE("each windowrule field kind parses to the right WindowRule", "[config]") {
     const auto result = parse(
@@ -338,7 +338,7 @@ TEST_CASE("one parse returns both binds and rules", "[config]") {
     REQUIRE(result.config.rules.size() == 1);
 }
 
-// ── windowrule ignore action (issue 09) ──────────────────────────────────────
+// ── windowrule ignore action ─────────────────────────────────────────────────
 
 TEST_CASE("windowrule ignore parses to an Ignore-action rule for each match field", "[config]") {
     const auto result = parse(
@@ -389,7 +389,7 @@ TEST_CASE("a windowrule ignore with a missing or empty pattern is diagnosed", "[
     REQUIRE(emptyTitle.diagnostics.size() == 1);
 }
 
-// ── start_at_login setting (issue 09) ────────────────────────────────────────
+// ── start_at_login setting ───────────────────────────────────────────────────
 
 TEST_CASE("start_at_login parses true and false case-insensitively", "[config]") {
     REQUIRE(parse("start_at_login = true\n").config.startAtLogin == true);
@@ -413,7 +413,7 @@ TEST_CASE("a non-bool start_at_login value is diagnosed", "[config]") {
     REQUIRE(result.config.startAtLogin == false);
 }
 
-// ── reload dispatcher (issue 09) ─────────────────────────────────────────────
+// ── reload dispatcher ────────────────────────────────────────────────────────
 
 TEST_CASE("the reload dispatcher parses as a zero-argument bind", "[config]") {
     const auto result = parse("bind = SUPER SHIFT, R, reload\n");
@@ -424,7 +424,7 @@ TEST_CASE("the reload dispatcher parses as a zero-argument bind", "[config]") {
             Bind{Mod::Super | Mod::Shift, Key::R, Dispatcher::Reload, 0});
 }
 
-// ── removed-with-tiling diagnostics (issue 09) ───────────────────────────────
+// ── removed-with-tiling diagnostics ──────────────────────────────────────────
 
 TEST_CASE("a bind to each removed tiling dispatcher yields a targeted removed-with-tiling diagnostic", "[config]") {
     for (const std::string disp :
@@ -460,7 +460,7 @@ TEST_CASE("an unknown name that is NOT a removed tiling one keeps the generic di
     REQUIRE(dir.diagnostics[0].message.find("removed with tiling") == std::string::npos);
 }
 
-// ── exec / exec-once directive (PRD 08) ──────────────────────────────────────
+// ── exec / exec-once directive ───────────────────────────────────────────────
 
 TEST_CASE("exec and exec-once parse into one source-ordered list with the right once flag", "[config]") {
     // Interleaved exec / exec-once lines must preserve global source order in the

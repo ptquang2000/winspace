@@ -1,6 +1,6 @@
 // Autostart adapter — I/O adapter (owns <windows.h> + the Task Scheduler COM ABI).
 //
-// The sole executor of the SyncAutostart Effect (issue 10, ADR-0013). The pure
+// The sole executor of the SyncAutostart Effect (ADR-0013). The pure
 // Reducer emits SyncAutostart{state.startAtLogin} from Started/Reloaded; the Worker
 // hands the bool to syncAutostart(), which owns the ENTIRE ITaskService interaction
 // so no COM chain is inlined in the Worker (mirroring vd_bridge's ownership of the
@@ -177,7 +177,7 @@ inline std::expected<Success, Error> buildDefinition(ITaskDefinition* def,
 
 }  // namespace autostart_detail
 
-// Make the OS logon task match `enabled` (issue 10, ADR-0013), owning the entire
+// Make the OS logon task match `enabled` (ADR-0013), owning the entire
 // ITaskService interaction. `enabled` create-or-updates `\winspace\<username>`
 // (idempotent — repeated enable never duplicates, and the exec path is rewritten so
 // a moved binary self-heals); `!enabled` deletes it, counting ERROR_FILE_NOT_FOUND

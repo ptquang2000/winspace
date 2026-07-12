@@ -19,7 +19,7 @@
 #pragma warning(pop)
 
 // ── core under test (pure, no <windows.h>) ──────────────────────────────────
-// Populated by tasks 02 (config parser) and 03 (reducer). Each core source is
+// The pure core: the config parser and the reducer. Each core source is
 // pulled in through its test file, which #includes the source under test:
 #include "winspace/config_test.cpp"
 #include "winspace/reducer_test.cpp"

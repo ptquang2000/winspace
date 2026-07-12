@@ -3,7 +3,7 @@
 // The single home for "find the config file, read it, parse it" — the path
 // resolution, file read, and parse() call that BOTH the process spine's initial
 // load (io/app.cpp) and the Worker's live reload (io/worker.cpp, ADR-0012) drive.
-// Extracted here (issue 09 prefactor) so neither owner duplicates the path/read/
+// Extracted here (a prefactor) so neither owner duplicates the path/read/
 // parse logic, and so worker.cpp — which is #included before app.cpp in the unity
 // TU — can reach it.
 //
@@ -36,7 +36,7 @@
 namespace winspace::io {
 
 // The config winspace seeds on first run and falls back to when the on-disk file
-// is unreadable. It is the Hyprland-subset grammar this slice supports; a user who
+// is unreadable. It is the Hyprland-subset grammar winspace supports; a user who
 // edits the seeded file grows it from here.
 inline constexpr std::string_view k_defaultConfig =
     "# winspace config — edit and save, then hit your `reload` bind (or restart).\n"
@@ -83,7 +83,7 @@ inline constexpr std::string_view k_defaultConfig =
     "# Exclude a dock or always-on-top widget from directional focus (it is never a\n"
     "# focus target, but stays Alt-Tab reachable and is never moved or sized).\n"
     "# windowrule = ignore, class:Shell_TrayWnd\n"
-    "# Start winspace with your session (registered by a later slice's logon task).\n"
+    "# Start winspace with your session (registered by the logon task).\n"
     "# start_at_login = false\n";
 
 // Read an environment variable with the size-then-fill two-call pattern.
