@@ -1,19 +1,20 @@
 // Process spine — I/O adapter (owns <windows.h> and thread lifecycle).
 //
-// The backbone the whole product plugs into: it spawns the Worker thread and the
-// Hotkey thread, wires the producer→Worker transport, and joins both on a clean
+// The backbone the whole product plugs into: it spawns the Worker, Hotkey, and Hook
+// threads, wires the producer→Worker transport, and tears all three down on a clean
 // exit. No domain logic lives here — behavior is the Reducer's, executed by the
 // Worker. This file carries only the thread wiring.
 //
-//   Hotkey thread ──PostMessage(Event*)──▶ Worker's message-only HWND
-//                                          Worker: reduce → execute Effects
-//                                          Exit Effect → PostQuitMessage → unwind
+//   Hotkey / Hook thread ─PostMessage(Event*)─▶ Worker's message-only HWND
+//                                               Worker: reduce → execute Effects
+//                                               Exit Effect → PostQuitMessage → unwind
 #pragma once
 
 #include <windows.h>
 
 #include <functional>
 #include <future>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -83,9 +84,10 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
         // A hotkey has a null window, so it never dispatches to a WndProc — handle
         // it here. wParam is the hotkey id, i.e. the Bind's index in the table.
         if (msg.message == WM_HOTKEY) {
-            if (hotkeys)
-                if (auto ev = hotkeys->eventFor(static_cast<int>(msg.wParam)))
-                    postEvent(workerHwnd, new Event{std::move(*ev)});
+            if (!hotkeys)
+                continue;
+            if (auto ev = hotkeys->eventFor(static_cast<int>(msg.wParam)))
+                postEvent(workerHwnd, new Event{std::move(*ev)});
             continue;
         }
         // A live reload: the Worker handed us a heap-allocated Bind
@@ -103,7 +105,7 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
     }
 }
 
-// Bring up both threads, run until Exit, then tear down cleanly. Returns the
+// Bring up all three threads, run until Exit, then tear down cleanly. Returns the
 // process exit code. Called by wWinMain.
 inline int runApp() {
     // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
@@ -119,9 +121,9 @@ inline int runApp() {
     }
 
     // One parse yields all three halves. The Binds are owned here and passed to the
-    // Hotkey thread by const reference (this declaration outlives hotkeyThread,
-    // joined below); the WindowRules and the launch entries are moved into the
-    // Worker thread, which seeds both into State before publishing its HWND.
+    // Hotkey thread by const reference (this declaration outlives hotkeyThread, which
+    // is torn down at scope exit); the WindowRules and the launch entries are moved
+    // into the Worker thread, which seeds both into State before publishing its HWND.
     LoadedConfig cfg = loadConfig();
     const std::vector<Bind> binds = std::move(cfg.binds);
     const bool startAtLogin = cfg.startAtLogin;
@@ -151,9 +153,15 @@ inline int runApp() {
     // the Binds as OS hotkeys on its own thread.
     std::promise<DWORD> tidReady;
     std::future<DWORD> tidFuture = tidReady.get_future();
-    std::jthread hotkeyThread(hotkeyThreadMain, workerHwnd, std::cref(binds),
-                              std::move(tidReady));
+    auto* rawHotkeyThread = new std::jthread(hotkeyThreadMain, workerHwnd, std::cref(binds),
+                                             std::move(tidReady));
     const DWORD hotkeyTid = tidFuture.get();
+    auto quitHotkey = [hotkeyTid](std::jthread* t) {
+        PostThreadMessageW(hotkeyTid, WM_QUIT, 0, 0);
+        delete t;
+    };
+    std::unique_ptr<std::jthread, decltype(quitHotkey)> hotkeyThread(rawHotkeyThread,
+                                                                     std::move(quitHotkey));
 
     // Tell the Worker the Hotkey thread's id so a live `reload` can hand that thread
     // the freshly-parsed Binds to re-register (ADR-0012). Posted after the
@@ -165,20 +173,17 @@ inline int runApp() {
     // and posts Appeared / Vanished Events to the Worker.
     std::promise<DWORD> hookTidReady;
     std::future<DWORD> hookTidFuture = hookTidReady.get_future();
-    std::jthread hookThread(hookThreadMain, workerHwnd, std::move(hookTidReady));
+    auto* rawHookThread = new std::jthread(hookThreadMain, workerHwnd, std::move(hookTidReady));
     const DWORD hookTid = hookTidFuture.get();
+    auto quitHook = [hookTid](std::jthread* t) {
+        PostThreadMessageW(hookTid, WM_QUIT, 0, 0);
+        delete t;
+    };
+    std::unique_ptr<std::jthread, decltype(quitHook)> hookThread(rawHookThread,
+                                                                 std::move(quitHook));
 
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.
     workerThread.join();
-
-    // Worker is down; unwind the Hotkey and Hook loops. These WM_QUITs are
-    // thread-lifecycle control — NOT the Event transport, which is always a
-    // PostMessage to the Worker's HWND. The Hook thread unhooks both hooks after
-    // its loop returns, so no dangling SetWinEventHook survives quit.
-    PostThreadMessageW(hotkeyTid, WM_QUIT, 0, 0);
-    hotkeyThread.join();
-    PostThreadMessageW(hookTid, WM_QUIT, 0, 0);
-    hookThread.join();
     return 0;
 }
 
