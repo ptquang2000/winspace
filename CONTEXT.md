@@ -28,11 +28,13 @@ The reducer reasons only in logical numbers; the `logical→GUID` map lives in t
 **Adoption**:
 At startup, binding the Virtual Desktops that already exist to logical numbers `1..N` (by
 GUID), and seeding the current workspace from the active desktop — so winspace inherits the
-session rather than resetting it.
+session rather than resetting it. This is a **Workspace**-level concept — the desktops, not
+the windows on them. _Distinct from_ **Rule adoption** (the window-level startup sweep).
 
 **Reaping**:
 Destroying an empty, unfocused Workspace so junk desktops don't accumulate. A wanted
-feature, deferred until window tracking (PRD 06) can detect "empty"; the GUID-anchored
+feature, still deferred: it needs per-Workspace occupancy tracking the hook does not yet
+maintain (the lifecycle stream is in master, an occupancy model is not); the GUID-anchored
 mapping is what makes it safe.
 
 **Display**:
@@ -80,7 +82,7 @@ is a candidate to loosen for focus candidacy later; kept as-is for now.
 
 **Eligible window**:
 A window that passes the Eligibility gate — a real top-level application window winspace
-treats as a focus candidate (and, in PRD 06, a rule-match target). winspace never moves or
+treats as a focus candidate (and a rule-match target). winspace never moves or
 sizes it; "Eligible" is about *whether winspace considers it*, not about geometry.
 _Avoid_: Tileable (dead — nothing is tiled), Managed.
 
@@ -121,18 +123,25 @@ _Avoid_: Target (that's the single chosen one), option.
 **Probe**:
 A one-shot synchronous read of a window's live attributes (styles, cloak state, rect) taken
 *reactively* at the moment they are needed — on a `focus` keypress (Spatial focus), never on
-a timer. In PRD 06 the parked hook adapter will also Probe on a lifecycle edge.
+a timer. The hook adapter also Probes on a lifecycle edge (an `Appeared`).
 _Avoid_: Poll, scan, snapshot-loop (there is no interval).
 
 **Appeared / Vanished** *(PRD 06)*:
 The window-lifecycle edges delivered by a `SetWinEventHook` adapter. **Appeared** =
 `EVENT_OBJECT_SHOW` / `EVENT_OBJECT_UNCLOAKED` (never raw `CREATE` — the window is half-born
 there and misclassifies, per [ADR-0006](docs/adr/0006-window-tracking-probe-decide-seam.md));
-**Vanished** = `EVENT_OBJECT_DESTROY` / `HIDE` / `CLOAKED`. Removed from master with tiling;
-PRD 06 (window rules) — the hook's first genuine consumer — reintroduces them. `Appeared`
-carries a Probed `WindowAttrs` (the Eligibility facts) **and** a `WindowIdentity` (exe / class
-/ title for matching); `Vanished` carries just a `WindowId`. Not yet in master — the code
-lands with PRD 06.
+**Vanished** = `EVENT_OBJECT_DESTROY` / `HIDE` / `CLOAKED`. `Appeared` carries a Probed
+`WindowAttrs` (the Eligibility facts) **and** a `WindowIdentity` (exe / class / title for
+matching); `Vanished` carries just a `WindowId`. Removed from master with tiling, then
+reintroduced by PRD 06 (window rules) — the hook's first genuine consumer — so both are in
+master now.
+
+**Rule adoption**:
+The window-level startup sweep: once its hooks are live, the adapter runs `EnumWindows` and
+posts a synthetic **Appeared** for every top-level window, so a window **rule** pins apps that
+were already open when winspace launched — the startup counterpart of a live `SHOW`. _Distinct
+from_ **Adoption**, which is the Workspace/Virtual-Desktop-level startup binding; Rule adoption
+inherits the *windows*, Adoption inherits the *desktops*.
 
 **WindowRule**:
 A parsed `windowrule` carrying one **action** — **Place** (`workspace N`, pin a matching app to
@@ -283,7 +292,8 @@ The dedicated thread that owns the `SetWinEventHook` adapter (`WINEVENT_OUTOFCON
 mirroring the Hotkey thread: its callback runs the noise gate, Probes the window, and posts an
 `Appeared` / `Vanished` Event to the Worker — no domain logic, no State. Kept off the Worker
 thread so hook delivery never queues behind a blocking Effect (a `SwitchDesktop` or the
-cloak-move round-trip). Reintroduced with PRD 06; removed from master with tiling.
+cloak-move round-trip). Removed from master with tiling, reintroduced when PRD 06 (window
+rules) landed; in master now.
 _Avoid_: Event thread, watcher thread.
 
 ### VM seam testing

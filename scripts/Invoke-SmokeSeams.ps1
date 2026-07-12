@@ -19,9 +19,11 @@
 
     As of 12.04 it drives all six workspace-switch Smoke seams (create-on-demand, windowless,
     adoption, guid-stability, quit, variant-diagnostic) plus the two error-handling runtime
-    seams (formaterror-quality, degrade-dont-crash). As of 02.06 it also drives the six
-    window-tracking Smoke seams (fill-one, adoption-fill, reclaim, ineligible, cloaked-uwp,
-    clean-unhook), with issues 03–10 present as skipped scaffolds.
+    seams (formaterror-quality, degrade-dont-crash). The 02.06 window-tracking seams asserted
+    tiling (fill-to-work-area) and were retired when tiling was dropped (ADR-0007); their two
+    surviving Eligibility seams (eligibility-ineligible, eligibility-uwp-frame) live in
+    WindowRules.Tests.ps1 alongside the window-rule seams. Issues 03–10 present as skipped
+    scaffolds.
 
     Isolation has two modes (ADR-0005):
       * default  — revert the snapshot ONCE, then run every seam in a single guest

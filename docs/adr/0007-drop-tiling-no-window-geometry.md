@@ -42,3 +42,17 @@ windows.
   06 — the hook's first genuine consumer — reintroduces the `SetWinEventHook`
   adapter and the `Appeared` / `Vanished` stream when it lands. The design is
   preserved in git history and in PRD 0002.
+- The 02.06 window-tracking VM smoke seams (`WindowTracking.Tests.ps1`) asserted
+  fill-to-work-area and so tested tiling. They were authored the day before this
+  drop and were **retired** as part of it: the pure-tiling seams (`fill-one`,
+  `adoption`, `reclaim`, `clean-unhook`) were deleted, and the two whose intent
+  survives were rewritten onto the window-rules path and folded into
+  `WindowRules.Tests.ps1`: `ineligible` (a tool window matching a rule is not
+  pinned — the live Eligibility gate) and `uwp-frame` (a real UWP
+  ApplicationFrameHost is classified eligible and pinned). Cloak *exclusion* — the
+  old `cloaked-uwp` seam's claim — was NOT preserved as a live seam: VD-pinning
+  re-cloaks the pinned frame (off-desktop cloak) and UWP startup cloak flips are
+  transient, so "stays cloaked, never pinned" has no stable observable on the rules
+  path; it stays covered by the `isEligible` reducer unit tests. A red
+  window-tracking fill seam is a stale test of this dropped feature, never a
+  regression.

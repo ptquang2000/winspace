@@ -17,6 +17,17 @@
     test window's distinct -Title is an unambiguous Oracle key. The parser compiles a
     title rule as a std::regex, so the literal title matches.
 
+    This file also carries the two Eligibility seams (`ineligible`, `uwp-frame`) folded in
+    from the retired WindowTracking.Tests.ps1 when tiling was dropped (ADR-0007): those
+    seams once asserted fill-to-work-area — a behaviour that no longer exists — but their
+    surviving intent is the live Probe's classification, which the pure reducer cannot
+    reach. Rewritten onto this same rules path: `ineligible` proves a tool window that
+    matches a rule is NOT pinned (an eligible bait's pin is the barrier that proves the
+    stream drained), and `uwp-frame` proves a REAL UWP ApplicationFrameHost IS classified
+    eligible and pinned. Cloak EXCLUSION is not asserted here — VD-pinning re-cloaks the
+    pinned frame and UWP startup cloak flips are transient, so it has no stable observable
+    on this path; it stays covered by the isEligible reducer unit tests.
+
     Oracle policy (ADR-0005): assert on independent OS state — the window's desktop
     GUID from the PUBLIC IVirtualDesktopManager::GetWindowDesktopId (Get-WindowDesktopId),
     checked against Get-VdState's registry GUID list — never on winspace's own log.
@@ -42,6 +53,25 @@ BeforeAll {
 `$mod = SUPER
 bind = `$mod, Q, quit
 windowrule = workspace 1, title:$script:RuleTitle
+"@
+
+    # Eligibility-gate fixtures (the two seams folded in from the retired
+    # WindowTracking.Tests.ps1 when tiling was dropped, ADR-0007). Each proves the live
+    # Probe's classification on the rules path: a rule that WOULD pin a matching window
+    # does NOT pin an ineligible one. A distinct title keys the Oracle on exactly the
+    # fixture, never the runner console or a helper powershell.
+    $script:IneligibleTitle = 'winspace-eligibility-probe'
+    $script:IneligibleConfig = @"
+`$mod = SUPER
+bind = `$mod, Q, quit
+windowrule = workspace 1, title:$script:IneligibleTitle
+"@
+    # UWP frame eligibility keys on Calculator's frame caption; the parser compiles a title
+    # rule as std::regex, so the literal "Calculator" matches the real frame window.
+    $script:UwpConfig = @"
+`$mod = SUPER
+bind = `$mod, Q, quit
+windowrule = workspace 1, title:Calculator
 "@
 }
 
@@ -132,6 +162,123 @@ Describe 'window-rules' {
             throw
         } finally {
             Stop-TestWindow $window
+            Stop-Winspace -Process $winspace
+        }
+    }
+
+    # Eligibility gate (live Probe). An ineligible window — a tool window
+    # (WS_EX_TOOLWINDOW) — is skipped by the reducer's isEligible (reducer.cpp: the
+    # Appeared arm returns early when !isEligible) even when its title matches a
+    # windowrule, so it is NEVER pinned. Post-ADR-0007 there is no fill, so this is proven
+    # on the rules path: an eligible BAIT with the same title, pinned to the target
+    # desktop, is the barrier proving the hook stream drained PAST the tool window's own
+    # Appeared (opened first, so ordered before the bait). The tool must then still sit on
+    # the active desktop. (Rewritten from the fill-based `ineligible` seam of 02.06.)
+    It 'ineligible: a tool window matching a rule is not pinned (Eligibility gate)' -Tag 'eligibility-ineligible' {
+        $winspace = $null
+        $tool = $null
+        $bait = $null
+        try {
+            Set-DesktopCount 2
+            $before = Get-VdState
+            $before.Count | Should -Be 2 -Because 'the seam needs an inactive desktop to pin to'
+            $desktop1Guid = $before.Guids[0]   # rule target (inactive)
+            $desktop2Guid = $before.Guids[1]   # active desktop the windows open on
+            $before.CurrentGuid | Should -Be $desktop2Guid
+
+            Set-WinspaceConfig -Content $script:IneligibleConfig | Out-Null
+            $winspace = Start-Winspace
+
+            # A tool window whose title matches the rule: ineligible, so never pinned.
+            $tool = Start-TestWindow -Style tool -Title $script:IneligibleTitle -X 120 -Y 120 -Width 360 -Height 260
+            (Get-WindowDesktopId -Hwnd $tool.Hwnd) | Should -Be $desktop2Guid `
+                -Because 'the tool window opens on the active desktop'
+
+            # Eligible bait, same matching title, opened AFTER the tool: its pin is the
+            # barrier proving winspace has processed the stream past the tool's Appeared.
+            $bait = Start-TestWindow -Title $script:IneligibleTitle -X 200 -Y 200 -Width 480 -Height 320
+            Wait-Until -Because 'the eligible bait to be pinned to workspace 1 (stream drained)' -Condition {
+                (Get-WindowDesktopId -Hwnd $bait.Hwnd) -eq $desktop1Guid
+            }
+
+            # The tool window was skipped by isEligible: still on the active desktop.
+            $after = Get-VdState
+            (Get-WindowDesktopId -Hwnd $tool.Hwnd) | Should -Be $desktop2Guid `
+                -Because "an ineligible tool window must not be pinned by the rule"
+            $after.CurrentGuid | Should -Be $desktop2Guid `
+                -Because 'pinning the bait must not switch the active desktop'
+        } catch {
+            Save-FailureScreenshot -Name 'eligibility-ineligible'
+            throw
+        } finally {
+            Stop-TestWindow $tool
+            Stop-TestWindow $bait
+            Stop-Winspace -Process $winspace
+        }
+    }
+
+    # UWP frame eligibility (live Probe). A Store app (Calculator) surfaces a real
+    # ApplicationFrameHost frame window PLUS DWM-cloaked siblings (a CoreWindow). This seam
+    # proves the one thing reliably observable on the rules path that the pure reducer
+    # cannot reach: the live Probe classifies a REAL UWP frame as Eligible, so a
+    # `title:Calculator` rule pins it — driving an actual ApplicationFrameHost (not a
+    # synthetic WindowAttrs) through Probe -> isEligible -> MoveViewToDesktop. Calculator is
+    # the always-present Store app; if it is absent the seam FAILS loudly, not empty.
+    #
+    # It deliberately does NOT assert cloak EXCLUSION. On a real UWP app the cloak is
+    # transient — a cloaked-SHOW CoreWindow is re-evaluated on its later UNCLOAKED edge
+    # (reducer.cpp) and can legitimately become eligible and be pinned too — and VD-pinning
+    # re-cloaks the eligible frame itself (off-desktop cloak). So there is no stable "stays
+    # cloaked, never pinned" observable on this path (an earlier attempt flagged the
+    # legitimately-uncloaked CoreWindow as a false phantom pin). Cloak exclusion is covered
+    # deterministically by the isEligible reducer unit tests; the live negative-classification
+    # path is covered by the `ineligible` seam above (a tool window a rule never pins).
+    #
+    # Uses the ADOPTION path (launch, capture the uncloaked frame's HWND, THEN start
+    # winspace) so the frame is identified before the pin cloaks it as an off-desktop window.
+    It 'uwp-frame: a rule pins a real UWP app frame (adoption)' -Tag 'eligibility-uwp-frame' {
+        $winspace = $null
+        $calc = $null
+        try {
+            Set-DesktopCount 2
+            $before = Get-VdState
+            $before.Count | Should -Be 2 -Because 'the seam needs an inactive desktop to pin to'
+            $desktop1Guid = $before.Guids[0]
+            $desktop2Guid = $before.Guids[1]
+            $before.CurrentGuid | Should -Be $desktop2Guid
+
+            Set-WinspaceConfig -Content $script:UwpConfig | Out-Null
+
+            # Launch Calculator BEFORE winspace; capture the uncloaked frame while it is
+            # still on the active desktop (no pin yet, so no off-desktop cloak).
+            $calc = Start-Process -FilePath 'calc.exe' -PassThru
+            $script:frameHwnd = [IntPtr]::Zero
+            Wait-Until -TimeoutSec 30 -Because 'the Calculator frame window to appear (uncloaked, active desktop)' -Condition {
+                $hit = @(Find-WindowsByTitle 'Calculator' | Where-Object { -not (Test-WindowCloaked $_) })
+                if ($hit.Count -ge 1) { $script:frameHwnd = $hit[0]; return $true }
+                return $false
+            }
+            $frameHwnd = $script:frameHwnd
+            $frameHwnd | Should -Not -Be ([IntPtr]::Zero) -Because 'the real Calculator frame must be found'
+            (Get-WindowDesktopId -Hwnd $frameHwnd) | Should -Be $desktop2Guid `
+                -Because 'the frame opens on the active desktop before winspace adopts it'
+
+            # winspace boots; startup adoption sweeps the pre-existing frame into the rule.
+            $winspace = Start-Winspace
+            Wait-Until -Because 'adoption to pin the real Calculator frame to workspace 1' -Condition {
+                (Get-WindowDesktopId -Hwnd $frameHwnd) -eq $desktop1Guid
+            }
+
+            # The eligible real UWP frame was classified and pinned to the target desktop.
+            (Get-WindowDesktopId -Hwnd $frameHwnd) | Should -Be $desktop1Guid `
+                -Because "the eligible UWP frame must be pinned to workspace 1's desktop"
+            (Get-VdState).CurrentGuid | Should -Be $desktop2Guid `
+                -Because 'pinning the frame must not switch the active desktop'
+        } catch {
+            Save-FailureScreenshot -Name 'eligibility-uwp-frame'
+            throw
+        } finally {
+            if ($calc) { Stop-Process -Name 'CalculatorApp', 'Calculator', 'calc' -Force -ErrorAction SilentlyContinue }
             Stop-Winspace -Process $winspace
         }
     }
