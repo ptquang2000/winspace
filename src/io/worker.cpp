@@ -264,7 +264,10 @@ private:
                     // Diagnostic — or an unreadable file — keeps the currently-running
                     // config live and changes nothing (the fallback is the user's own
                     // working config, so reload can afford to reject the whole file).
-                    ConfigReadResult load = readAndParseConfig();
+                    const std::optional<std::filesystem::path> path = configPath();
+                    ConfigReadResult load =
+                        path ? readAndParseConfig(*path, SeedPolicy::NoSeed)
+                             : ConfigReadResult{};
                     if (!load.read) {
                         lg::warn("reload: config unreadable; keeping the running config");
                         return;

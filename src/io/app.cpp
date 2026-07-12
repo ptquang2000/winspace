@@ -28,19 +28,22 @@
 
 namespace winspace::io {
 
-// Load the config for STARTUP. Shares the read+parse mechanism with the
-// Worker's reload path (io/config_io.cpp: seedDefaultConfigIfMissing +
-// readAndParseConfig) but layers startup's own fallback policy on top: seed the
-// built-in default on first run, and if the file is unreadable fall back to the
-// built-in default text. Startup degrades PER-LINE (each diagnostic is logged and
-// the good lines still apply) because its only fallback is the destructive built-in
-// default — the deliberate asymmetry with reload's atomic keep-last-good (ADR-0012).
+// Load the config for STARTUP. Shares the read+parse mechanism with the Worker's
+// reload path (io/config_io.cpp: readAndParseConfig) but passes SeedPolicy::Seed so
+// a first run creates the file, and layers startup's own fallback on top: if
+// %USERPROFILE% is unset or the file is unreadable, fall back to the built-in
+// default text. Startup degrades PER-LINE (each diagnostic is logged and the good
+// lines still apply) because its only fallback is the destructive built-in default
+// — the deliberate asymmetry with reload's atomic keep-last-good (ADR-0012).
 inline LoadedConfig loadConfig() {
-    seedDefaultConfigIfMissing();
-    ConfigReadResult load = readAndParseConfig();
+    const std::optional<std::filesystem::path> path = configPath();
+    if (!path)
+        lg::warn("config: %USERPROFILE% is unset; using built-in defaults");
+    ConfigReadResult load =
+        path ? readAndParseConfig(*path, SeedPolicy::Seed) : ConfigReadResult{};
     ParseResult parsed =
         load.read ? std::move(load.parsed) : parse(std::string(k_defaultConfig));
-    if (!load.read)
+    if (path && !load.read)
         lg::warn("config: file unreadable at startup; using built-in defaults");
     for (const Diagnostic& d : parsed.diagnostics)
         lg::warn("config line {}: {}", d.line, d.message);

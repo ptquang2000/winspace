@@ -48,6 +48,11 @@ on top of the diagnostics vector.
   **any** Diagnostic (or is unreadable), the Worker logs the errors and changes
   **nothing**: the running Binds, `rules`, and `execs` stay live. Only a clean parse is
   applied. The gate is exactly `parsed.diagnostics.empty()`.
+  Reload also passes `SeedPolicy::NoSeed` to the shared `readAndParseConfig`, so a
+  reload of a *deleted* file is treated as unreadable and keeps the last good config
+  — it never re-seeds the built-in default. Startup passes `SeedPolicy::Seed`. The
+  seed step lives inside `readAndParseConfig` but is gated by this policy, preserving
+  the startup-seeds / reload-doesn't asymmetry.
 - **A clean parse fans out to three places:**
   1. the Worker swaps `m_state.rules`, `m_state.execs`, and `m_state.startAtLogin` to
      the freshly-parsed values (new `shared_ptr`s);

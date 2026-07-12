@@ -88,26 +88,28 @@ inline constexpr std::string_view k_defaultConfig =
     "# Start winspace with your session (registered by the logon task).\n"
     "# start_at_login = false\n";
 
-// Read an environment variable with the size-then-fill two-call pattern.
-// GetEnvironmentVariableW returns the length INCLUDING the null when probing with
-// a null buffer, EXCLUDING it when filling — so allocate n and fill n. Empty
-// optional means the variable is unset (or unreadable): there is no home to anchor
-// the config path to.
-inline std::optional<std::wstring> envVar(const wchar_t* name) {
-    const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
-    if (n == 0) return std::nullopt;
-    std::wstring value(n - 1, L'\0');  // n counts the terminator; string owns size()+1
-    GetEnvironmentVariableW(name, value.data(), n);
-    return value;
+// Expand %VAR% tokens in a template against the process environment
+// (ExpandEnvironmentStringsW), size-then-fill two-call pattern: the probe returns
+// the length INCLUDING the null, the fill consumes it. An UNSET variable has no
+// error signal — the API leaves its %VAR% token as literal text — so a caller that
+// must distinguish "unset" inspects the returned string (see configPath).
+inline std::wstring expandvars(std::wstring_view tmpl) {
+    const std::wstring in(tmpl);  // ExpandEnvironmentStringsW needs a null-terminated source
+    const DWORD n = ExpandEnvironmentStringsW(in.c_str(), nullptr, 0);
+    if (n == 0) return in;  // failure: hand back the template unchanged
+    std::wstring out(n - 1, L'\0');  // n counts the terminator; string owns size()+1
+    ExpandEnvironmentStringsW(in.c_str(), out.data(), n);
+    return out;
 }
 
 // The known location: %USERPROFILE%\.config\winspace\winspace.conf — the Win32
 // home for the Hyprland-style ~/.config/<app> layout. Empty optional when
-// %USERPROFILE% is unset, which leaves winspace on its built-in defaults.
+// %USERPROFILE% is unset — expandvars leaves the token unchanged (or empty) — which
+// leaves winspace on its built-in defaults.
 inline std::optional<std::filesystem::path> configPath() {
-    const std::optional<std::wstring> home = envVar(L"USERPROFILE");
-    if (!home) return std::nullopt;
-    return std::filesystem::path(*home) / L".config" / L"winspace" / L"winspace.conf";
+    const std::wstring home = expandvars(L"%USERPROFILE%");
+    if (home.empty() || home == L"%USERPROFILE%") return std::nullopt;
+    return std::filesystem::path(home) / L".config" / L"winspace" / L"winspace.conf";
 }
 
 // Slurp a file's bytes verbatim (the config is UTF-8, which the parser consumes as
@@ -120,29 +122,25 @@ inline std::optional<std::string> readFile(const std::filesystem::path& path) {
     return std::move(buffer).str();
 }
 
-// First-run only: if the config file does not yet exist, create the directory chain
-// and seed it with the built-in default. Best effort — a missing home or an
-// unwritable disk logs a diagnostic and returns, leaving readAndParseConfig() to
-// report the file as unreadable (the caller then falls back to the default text).
-// Reload never calls this: a reload of a deleted file keeps the last good config.
-inline void seedDefaultConfigIfMissing() {
-    const std::optional<std::filesystem::path> path = configPath();
-    if (!path) {
-        lg::warn("config: %USERPROFILE% is unset; using built-in defaults");
-        return;
-    }
-    const std::string shown = narrow(path->wstring());
+// First-run seed: when no file exists at `path`, create the directory chain and
+// write the built-in default there. Best effort — an unwritable disk logs a
+// diagnostic and returns, leaving readAndParseConfig() to report the file as
+// unreadable (startup then falls back to the default text). Only the seeding path
+// reaches here; reload passes SeedPolicy::NoSeed so a deleted file stays deleted
+// and the last good config keeps running (the ADR-0012 asymmetry).
+inline void seedDefaultConfig(const std::filesystem::path& path) {
+    const std::string shown = narrow(path.wstring());
 
     std::error_code ec;
-    if (std::filesystem::exists(*path, ec)) return;
+    if (std::filesystem::exists(path, ec)) return;
 
-    std::filesystem::create_directories(path->parent_path(), ec);
+    std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         lg::warn("config: cannot create {}: {}; using built-in defaults",
-                 narrow(path->parent_path().wstring()), ec.message());
+                 narrow(path.parent_path().wstring()), ec.message());
         return;
     }
-    std::ofstream out(*path, std::ios::binary);
+    std::ofstream out(path, std::ios::binary);
     out << k_defaultConfig;
     if (!out) {
         lg::warn("config: cannot write default {}; using built-in defaults", shown);
@@ -164,13 +162,21 @@ struct ConfigReadResult {
     ParseResult parsed;
 };
 
-// Resolve the path, read the file, parse it. The one place the path/read/parse
-// chain lives; startup and reload both call it and differ only in the fallback
-// policy they apply to the result.
-inline ConfigReadResult readAndParseConfig() {
-    const std::optional<std::filesystem::path> path = configPath();
-    if (!path) return {};
-    std::optional<std::string> text = readFile(*path);
+// Whether readAndParseConfig may seed the built-in default when the file is
+// absent. Startup passes Seed (first-run creates the file); reload passes NoSeed —
+// a reload of a deleted file keeps the last good config rather than resurrecting
+// the default (the ADR-0012 asymmetry).
+enum class SeedPolicy { Seed, NoSeed };
+
+// Given the resolved config `path`: optionally seed the default (per policy), then
+// read + parse. The one place the seed/read/parse chain lives; startup and reload
+// both call it and differ only in the SeedPolicy they pass and the fallback they
+// layer on the result. Path resolution (configPath) and the unset-%USERPROFILE%
+// fallback belong to the callers.
+inline ConfigReadResult readAndParseConfig(const std::filesystem::path& path,
+                                           SeedPolicy seed) {
+    if (seed == SeedPolicy::Seed) seedDefaultConfig(path);
+    std::optional<std::string> text = readFile(path);
     if (!text) return {};
     return {true, parse(*text)};
 }
