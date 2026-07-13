@@ -21,7 +21,7 @@ BeforeAll {
 
 Describe 'workspace-switch' {
 
-    # $mod is ALT (the Alt key) in the seeded default config (src/io/config_io.cpp),
+    # $mod is ALT (the Alt key) in the seeded default config (src/win32.cpp),
     # so the workspace chords are Alt+<n>. Alt+<n> register on a stock Windows 11 with
     # no policy (ADR-0014), so the snapshot is just winspace-e2e (stock). It does NOT
     # touch the native OS Virtual Desktop hotkeys (Win+Ctrl+D / Win+Ctrl+F4), which
@@ -124,7 +124,7 @@ Describe 'workspace-switch' {
     # 12.03 ticket's literal "$mod+5 again". winspace never persists its
     # logical->GUID map (CONTEXT.md: State is rebuilt on start), and adoption
     # rebinds desktops to logical 1..N *positionally by GUID order* every launch
-    # (src/io/vd_bridge.cpp adopt()). So after a restart the tail desktop we
+    # (src/win32.cpp adopt()). So after a restart the tail desktop we
     # created with $mod+5 is re-adopted at logical == Count, and pressing $mod+5
     # again would materialize a brand-new desktop — not resolve the old one. The
     # invariant PRD step 4 actually asserts (a materialized desktop's GUID identity

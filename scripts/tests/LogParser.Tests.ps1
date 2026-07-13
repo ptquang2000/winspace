@@ -5,7 +5,7 @@
 
     winspace is windowless, so its diagnostics only survive as captured stderr
     (winspace.exe 2> run.log). Each line is ANSI-coloured and tagged
-    [INFO]/[WARN]/[ERROR] (src/io/error.cpp); the parser strips the colour and
+    [INFO]/[WARN]/[ERROR] (src/win32.cpp); the parser strips the colour and
     exposes the seam predicates the workspace-switch/error-handling tests assert on.
 #>
 

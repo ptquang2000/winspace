@@ -312,7 +312,7 @@ function Get-WinspaceRoot {
 function Get-WinspaceExe { Join-Path (Get-WinspaceRoot) 'winspace.exe' }
 function Get-WinspaceLog { Join-Path (Get-WinspaceRoot) 'run.log' }
 
-# winspace reads %USERPROFILE%\.config\winspace\winspace.conf at startup (src/io/app.cpp
+# winspace reads %USERPROFILE%\.config\winspace\winspace.conf at startup (src/win32.cpp
 # configPath()). This is the SAME session as the runner, so the profile we write to is the
 # one the launched winspace.exe reads.
 function Get-WinspaceConfigPath { Join-Path $env:USERPROFILE '.config\winspace\winspace.conf' }
@@ -458,7 +458,7 @@ function ConvertFrom-CurrentVirtualDesktop {
 
 # Parse a captured winspace stderr string into structured records plus the seam
 # predicates the workspace-switch/error-handling tests consult. winspace tags each line with an
-# ANSI-coloured [INFO]/[WARN]/[ERROR] (src/io/error.cpp), so the colour codes are
+# ANSI-coloured [INFO]/[WARN]/[ERROR] (src/win32.cpp), so the colour codes are
 # stripped before the level+message split. Text in, object out — no file, process,
 # or VM access — so it is unit-testable host-side against a captured run.log.
 function Read-WinspaceLog {
@@ -715,7 +715,7 @@ function Set-RunnerConsoleVisible {
 # RegisterHotKey's the same combo it gets ERROR_HOTKEY_ALREADY_REGISTERED — the
 # genuine, deterministic trigger for the skip-and-log degrade path (hotkeys.cpp).
 # The default combo is Alt+1 (MOD_NOREPEAT|MOD_ALT + '1'), i.e. exactly
-# winspace's first seeded bind (src/io/config_io.cpp $mod = ALT), so the collision is
+# winspace's first seeded bind (src/win32.cpp $mod = ALT), so the collision is
 # real. (Alt+1 registers on stock Windows 11 with no policy — unlike the old bare-Win
 # $mod, which needed NoWinKeys; see ADR-0014.)
 # RegisterHotKey binds to

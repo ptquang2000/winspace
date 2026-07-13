@@ -1,12 +1,12 @@
 [
   {
     "directory": "C:/Users/quang.phan/work/winspace",
-    "command": "cl.exe /nologo /std:c++latest /EHsc /W4 /WX /permissive- /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Ithird_party /Isrc /c src/unity_app.cpp",
-    "file": "src/unity_app.cpp"
+    "command": "cl.exe /nologo /std:c++latest /EHsc /W4 /WX /permissive- /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Ithird_party /Isrc /c src/win32.cpp",
+    "file": "src/win32.cpp"
   },
   {
     "directory": "C:/Users/quang.phan/work/winspace",
-    "command": "cl.exe /nologo /std:c++latest /EHsc /W4 /WX /permissive- /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Ithird_party /Isrc /c src/unity_test.cpp",
-    "file": "src/unity_test.cpp"
+    "command": "cl.exe /nologo /std:c++latest /EHsc /W4 /WX /permissive- /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Ithird_party /Isrc /c src/winspace_test.cpp",
+    "file": "src/winspace_test.cpp"
   }
 ]

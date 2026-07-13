@@ -7,7 +7,7 @@
 
     The matcher, place-once state (`placed`), and the MoveWindowToWorkspace Effect are
     fully reducer-tested (reducer_test.cpp). This seam proves only what the unit tests
-    cannot: that winspace's reintroduced SetWinEventHook adapter (src/io/window_hook.cpp)
+    cannot: that winspace's reintroduced SetWinEventHook adapter (src/win32.cpp)
     genuinely observes a foreign window's SHOW / EnumWindows adoption, Probes its
     identity, and drives the internal MoveViewToDesktop (ADR-0010) so the window lands
     on the rule's target desktop on a real session.

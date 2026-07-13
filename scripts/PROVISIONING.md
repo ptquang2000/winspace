@@ -92,7 +92,7 @@ whole point of `$mod = ALT` (ADR-0014): winspace binds on a stock Windows 11.
 
 > **End users:** because winspace defaults to `$mod = ALT`, a real install needs **no** setup — the
 > `Alt+<n>` / `Alt+Shift+<n>` chords register out of the box. The tradeoff (documented in the seeded
-> config header, `src/io/config_io.cpp`) is that these global Alt chords shadow the focused app's own
+> config header, `src/win32.cpp`) is that these global Alt chords shadow the focused app's own
 > `Alt+<key>` shortcuts while winspace runs; rebind if that bites.
 
 ## Running the harness *(host)*

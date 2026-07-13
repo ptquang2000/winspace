@@ -39,7 +39,7 @@ AfterAll {
 
 Describe 'move-to-workspace' {
 
-    # The seeded default config (src/io/config_io.cpp) binds Alt+Shift+<n> to
+    # The seeded default config (src/win32.cpp) binds Alt+Shift+<n> to
     # `movetoworkspacesilent N` (Alt+Shift+<digit> registers on a stock Windows 11 with
     # no policy, ADR-0014, as do the Alt+<n> workspace chords; the snapshot is just
     # winspace-e2e). This seam drives the real default `movetoworkspacesilent 1` binding.

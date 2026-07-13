@@ -5,12 +5,13 @@
 
 .DESCRIPTION
     Assumes an x64 Native Tools for VS command prompt (cl.exe already on PATH).
-    Builds two unity translation units into build/<config>/ with an always-clean
+    Builds two translation units into build/<config>/ with an always-clean
     full rebuild:
 
-      * app  (src/unity_app.cpp)  — core + I/O adapters + WinMain; links the WM
-        import libraries; /SUBSYSTEM:WINDOWS (windowless) -> winspace.exe
-      * test (src/unity_test.cpp) — core only + Catch2; links NO WM libraries;
+      * app  (src/win32.cpp)         — I/O layer (which #includes the pure core,
+        src/winspace.cpp) + WinMain; links the WM import libraries;
+        /SUBSYSTEM:WINDOWS (windowless) -> winspace.exe
+      * test (src/winspace_test.cpp) — core only + Catch2; links NO WM libraries;
         /SUBSYSTEM:CONSOLE -> winspace_tests.exe
 
     Both TUs compile on every run so a purity violation in core (an OS call that
@@ -136,8 +137,8 @@ Write-Host "winspace build — config: $Config"
 $appExe = Join-Path $buildDir 'winspace.exe'
 $testExe = Join-Path $buildDir 'winspace_tests.exe'
 
-$appOk = Build-TU -Label 'app'  -Source 'src\unity_app.cpp'  -Libs $wmLibs -Subsystem 'WINDOWS' -OutExe $appExe
-$testOk = Build-TU -Label 'test' -Source 'src\unity_test.cpp' -Libs @()     -Subsystem 'CONSOLE' -OutExe $testExe
+$appOk = Build-TU -Label 'app'  -Source 'src\win32.cpp'         -Libs $wmLibs -Subsystem 'WINDOWS' -OutExe $appExe
+$testOk = Build-TU -Label 'test' -Source 'src\winspace_test.cpp' -Libs @()     -Subsystem 'CONSOLE' -OutExe $testExe
 
 $runOk = $true
 if ($Test -and $testOk) {

@@ -13,8 +13,8 @@ Inputs for the pure host-side decoder tests (`../Decoders.Tests.ps1`,
 | `formaterror-garbage.log`      | an unstructured line + a loc+hex line for an undocumented code — neither clears the `formatError` quality bar |
 
 **Provenance.** These are hand-authored to the exact on-disk byte layout and the
-exact stderr line formats winspace emits (`src/io/error.cpp` level tags +
-ANSI codes; `src/io/vd_bridge.cpp` adoption/variant lines; `src/io/hotkeys.cpp`
+exact stderr line formats winspace emits (`src/win32.cpp` level tags +
+ANSI codes; `src/win32.cpp` adoption/variant lines; `src/win32.cpp`
 skip line) — the GUID packing round-trips through `[guid]` the same way the real
 `VirtualDesktopIDs` blob does. They were **not** captured from a live `winspace-e2e`
 VM (none is provisioned in this environment). When a real 12.01 run is available,

@@ -1,15 +1,15 @@
-# clangd takes its flags from compile_commands.json, which lists only the two
-# unity TUs (src/unity_app.cpp, src/unity_test.cpp). The pure-core sources under
-# src/winspace/ are #included into those TUs, so they have no entry of their own.
-# Open one directly and clangd falls back to clang-cl's default — C++14 — where
+# clangd takes its flags from compile_commands.json, which lists the two
+# production TUs (src/win32.cpp, src/winspace_test.cpp). The pure core lives in
+# src/winspace.cpp, which is #included into both, so it has no entry of its own.
+# Open it directly and clangd falls back to clang-cl's default — C++14 — where
 # <string_view>/<ranges> are gated out ("no type named 'string_view' in namespace
-# 'std'"). Pin the language standard for every file so the #included fragments
-# parse exactly as the build compiles them. Keep this in sync with build.ps1.
+# 'std'"). Pin the language standard for every file so the #included core parses
+# exactly as the build compiles it. Keep this in sync with build.ps1.
 CompileFlags:
   # /std pins the language standard (see above). /Isrc and /Ithird_party mirror
-  # the -I roots in compile_commands.json so the quoted includes in the #included
-  # fragments (e.g. #include "winspace/reducer.cpp", #include "io/worker.cpp")
-  # resolve when a file is opened directly rather than only as part of a unity TU.
-  # Without them clangd searches relative to the open file and reports the include
-  # as "file not found". Keep this in sync with build.ps1 / compile_commands.json.
+  # the -I roots in compile_commands.json so the quoted includes (e.g.
+  # #include "winspace.cpp", #include "catch2/catch_amalgamated.hpp") resolve when
+  # a file is opened directly rather than only as part of a TU. Without them
+  # clangd searches relative to the open file and reports "file not found". Keep
+  # this in sync with build.ps1 / compile_commands.json.
   Add: [/std:c++latest, /Isrc, /Ithird_party]

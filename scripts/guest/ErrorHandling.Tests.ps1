@@ -21,7 +21,7 @@ BeforeAll {
 
 Describe 'error-handling' {
 
-    # 11.04 step 4. The formatError renderer (src/io/error.cpp std::formatter<Error>)
+    # 11.04 step 4. The formatError renderer (src/win32.cpp std::formatter<Error>)
     # must emit <file>:<line> + the native code (hr=0x… / err=N) + FORMAT_MESSAGE text
     # when available, and NEVER garbage on an undocumented code (systemMessage empty →
     # loc+hex with no trailing text, which fails the quality bar rather than printing
@@ -64,7 +64,7 @@ Describe 'error-handling' {
             }
 
             # (b) the quality predicate is a real bar, not a rubber stamp. The lines
-            # below mirror src/io/error.cpp's formatter<Error> output shapes exactly.
+            # below mirror src/win32.cpp's formatter<Error> output shapes exactly.
             $genuine = '[ERROR] switchTo failed: vd_bridge.cpp:340 (hr=0x8001010E): ' +
                        'The application called an interface that was marshalled for a different thread.'
             $garbageUnstructured = '[ERROR] something went catastrophically wrong'
