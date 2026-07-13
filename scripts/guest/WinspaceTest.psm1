@@ -728,7 +728,15 @@ function Register-ConflictingHotkey {
     param(
         [uint32]$Modifiers = 0x4001,   # MOD_NOREPEAT(0x4000)|MOD_ALT(0x0001)
         [uint32]$Vk = 0x31,            # '1'
-        [int]$ReadyTimeoutSec = 8
+        # 45s (was 8): the helper is a SEPARATE powershell child, and reaching its
+        # Set-Content 'ready' costs process spawn + PS runtime init + the Add-Type
+        # P/Invoke JIT before the first line runs. Measured on this guest: ~10s warm,
+        # ~24s cold (a freshly-reverted -Fresh snapshot) — so 8s timed out in setup
+        # before the child ever reported, killing it mid-spawn and leaving no ready
+        # file. Same cold-guest reality Start-TestWindow accounts for (12->30s there);
+        # the generous ceiling only bites a genuine hang — a healthy child polls ready
+        # the instant the file appears.
+        [int]$ReadyTimeoutSec = 45
     )
     $readyFile = Join-Path (Get-WinspaceRoot) 'conflict.ready'
     if (Test-Path $readyFile) { Remove-Item $readyFile -Force }

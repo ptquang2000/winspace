@@ -199,7 +199,14 @@ function Invoke-GuestRunner {
     $guestCmd = ConvertTo-BypassLaunch -InnerCmd $inner
     # exec -it propagates the guest exit code; a failing suite is surfaced by the XML
     # summary, so swallow the non-zero here rather than aborting the copy-back.
-    try { Invoke-Vmctl exec -it $Vm $guestCmd } catch { Write-Host $_.Exception.Message -ForegroundColor DarkYellow }
+    # | Out-Null is load-bearing: `vmctl exec -it` writes the guest's stdout back, and
+    # if it leaks into this function's output stream it fuses with the returned path
+    # (`@(guest-line, …, $LocalXml)`). Under -Fresh the caller adds that return to a
+    # List[string] as the per-seam XML PATH — the array collapses to one space-joined
+    # string, Test-Path fails in Merge-JUnitXml, the seam is silently dropped, and the
+    # summary reads `total 0` (a false green that masks real failures). The JUnit XML,
+    # copied back next, is the only result channel; guest stdout is noise here.
+    try { Invoke-Vmctl exec -it $Vm $guestCmd | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor DarkYellow }
     try { Invoke-Vmctl cp -o "${Vm}:$guestXml" $LocalXml | Out-Null } catch { return $null }
     return (Test-Path $LocalXml) ? $LocalXml : $null
 }
