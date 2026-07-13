@@ -920,9 +920,7 @@ inline bool is_removed_tiling_name(std::string_view name) {
         "movewindow", "maximize", "resizeactive", "togglefloat", "movetomonitor",
         // settings
         "min_tile_width", "min_tile_height"};
-    for (const std::string_view r : removed)
-        if (name == r) return true;
-    return false;
+    return std::ranges::contains(removed, name);
 }
 
 inline std::string removed_tiling_message(std::string_view name) {
