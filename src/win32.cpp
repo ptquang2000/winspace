@@ -108,9 +108,9 @@ inline void error(std::format_string<Args...> fmt, Args&&... args) {
 
 }  // namespace lg
 
-// Widen-in-reverse: convert a wide string to UTF-8 narrow. Diagnostics are narrow
-// now; the sole wide source is FormatMessageW's (possibly localized) text.
-inline std::string narrow(std::wstring_view w) {
+// Convert a wide (UTF-16) string to UTF-8. Diagnostics are narrow now; the sole
+// wide source is FormatMessageW's (possibly localized) text.
+inline std::string toUtf8(std::wstring_view w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
                                       nullptr, 0, nullptr, nullptr);
@@ -120,10 +120,10 @@ inline std::string narrow(std::wstring_view w) {
     return out;
 }
 
-// UTF-8 narrow → wide (UTF-16), the inverse of narrow(). The launcher needs it to
-// hand a config command line (stored as UTF-8 bytes) to CreateProcessW; no other
-// caller today. Empty in → empty out (MultiByteToWideChar rejects a zero length).
-inline std::wstring widen(std::string_view s) {
+// UTF-8 → wide (UTF-16), the inverse of toUtf8(). The launcher needs it to hand a
+// config command line (stored as UTF-8 bytes) to CreateProcessW; no other caller
+// today. Empty in → empty out (MultiByteToWideChar rejects a zero length).
+inline std::wstring toWide(std::string_view s) {
     if (s.empty()) return {};
     const int n =
         MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -247,7 +247,7 @@ inline std::string systemMessage(DWORD code) {
     while (!text.empty() &&
            (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' '))
         text.remove_suffix(1);
-    return narrow(text);
+    return toUtf8(text);
 }
 
 // Render a 32-bit code as 0xXXXXXXXX.
@@ -334,11 +334,11 @@ using Microsoft::WRL::ComPtr;
 // The dedicated task folder and its logon-task settings (ADR-0013). The folder is
 // per-machine (`\winspace`) but holds one task PER USER, named by the account, so
 // two accounts on one machine never collide.
-inline constexpr const wchar_t* k_folderPath = L"\\winspace";
-inline constexpr const wchar_t* k_rootPath = L"\\";
-inline constexpr const wchar_t* k_author = L"winspace";
-inline constexpr const wchar_t* k_noTimeLimit = L"PT0S";   // ExecutionTimeLimit: unbounded
-inline constexpr const wchar_t* k_restartEvery = L"PT1M";  // RestartInterval: one minute
+inline constexpr std::wstring_view k_folderPath = L"\\winspace";
+inline constexpr std::wstring_view k_rootPath = L"\\";
+inline constexpr std::wstring_view k_author = L"winspace";
+inline constexpr std::wstring_view k_noTimeLimit = L"PT0S";   // ExecutionTimeLimit: unbounded
+inline constexpr std::wstring_view k_restartEvery = L"PT1M";  // RestartInterval: one minute
 inline constexpr LONG k_restartCount = 3;
 
 // The Task Scheduler 2.0 signature returns an HRESULT of ERROR_FILE_NOT_FOUND when
@@ -349,7 +349,7 @@ inline constexpr HRESULT k_fileNotFound = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUN
 // scope exit so a build with a dozen strings leaks none.
 struct Bstr {
     BSTR value;
-    explicit Bstr(const wchar_t* s) : value(SysAllocString(s)) {}
+    explicit Bstr(std::wstring_view s) : value(SysAllocStringLen(s.data(), static_cast<UINT>(s.size()))) {}
     ~Bstr() { SysFreeString(value); }
     Bstr(const Bstr&) = delete;
     Bstr& operator=(const Bstr&) = delete;
@@ -377,9 +377,12 @@ inline bool isFileNotFound(const Error& e) {
 // `\winspace\<username>` nor where the delete path looks, silently breaking the
 // per-user-named invariant — so the caller surfaces it to degrade-log instead.
 inline std::expected<std::wstring, Error> currentUserName() {
-    wchar_t buf[UNLEN + 1];
+    std::wstring buf(UNLEN + 1, L'\0');  // OS writes into the returned object directly
     DWORD size = UNLEN + 1;
-    if (GetUserNameW(buf, &size)) return std::wstring(buf, size - 1);  // size counts the null
+    if (GetUserNameW(buf.data(), &size)) {
+        buf.resize(size - 1);  // size counts the null
+        return buf;
+    }
     const DWORD code = GetLastError();
     return std::unexpected(Error{Win32Error{code}, std::source_location::current()});
 }
@@ -388,10 +391,14 @@ inline std::expected<std::wstring, Error> currentUserName() {
 // logon rather than any user's. Built from %USERDOMAIN% + the account name; falls
 // back to the bare account name if the domain is unavailable.
 inline std::wstring currentUserId(const std::wstring& user) {
-    wchar_t domain[256];
-    const DWORD n = GetEnvironmentVariableW(L"USERDOMAIN", domain, 256);
-    if (n == 0 || n >= 256) return user;
-    return std::wstring(domain, n) + L'\\' + user;
+    std::wstring domain(256, L'\0');
+    const DWORD n =
+        GetEnvironmentVariableW(L"USERDOMAIN", domain.data(), static_cast<DWORD>(domain.size()));
+    if (n == 0 || n >= domain.size()) return user;
+    domain.resize(n);  // build domain\user in place, then move out
+    domain += L'\\';
+    domain += user;
+    return domain;
 }
 
 // The running binary's full path (GetModuleFileNameW) — the task's exec action, so
@@ -452,7 +459,7 @@ inline std::expected<Success, Error> buildDefinition(ITaskDefinition* def,
     if (!trigger) return std::unexpected(trigger.error());
     auto logon = ok([&](ILogonTrigger** pp) { return (*trigger)->QueryInterface(IID_PPV_ARGS(pp)); });
     if (!logon) return std::unexpected(logon.error());
-    record(ok((*logon)->put_UserId(Bstr(userId.c_str()))));
+    record(ok((*logon)->put_UserId(Bstr(userId))));
 
     auto actions = ok([&](IActionCollection** pp) { return def->get_Actions(pp); });
     if (!actions) return std::unexpected(actions.error());
@@ -460,7 +467,7 @@ inline std::expected<Success, Error> buildDefinition(ITaskDefinition* def,
     if (!action) return std::unexpected(action.error());
     auto exec = ok([&](IExecAction** pp) { return (*action)->QueryInterface(IID_PPV_ARGS(pp)); });
     if (!exec) return std::unexpected(exec.error());
-    record(ok((*exec)->put_Path(Bstr(exePath.c_str()))));
+    record(ok((*exec)->put_Path(Bstr(exePath))));
 
     return result;
 }
@@ -493,7 +500,7 @@ inline std::expected<Success, Error> syncAutostart(bool enabled) {
 
     const std::expected<std::wstring, Error> user = currentUserName();
     if (!user) return std::unexpected(user.error());
-    Bstr taskName(user->c_str());
+    Bstr taskName(*user);
 
     if (!enabled) {
         // Resolve the `\winspace` folder; if it is absent there is nothing to delete
@@ -670,7 +677,7 @@ inline std::optional<std::string> readFile(const std::filesystem::path& path) {
 // reaches here; reload passes SeedPolicy::NoSeed so a deleted file stays deleted
 // and the last good config keeps running (the ADR-0012 asymmetry).
 inline void seedDefaultConfig(const std::filesystem::path& path) {
-    const std::string shown = narrow(path.wstring());
+    const std::string shown = toUtf8(path.wstring());
 
     std::error_code ec;
     if (std::filesystem::exists(path, ec)) return;
@@ -678,7 +685,7 @@ inline void seedDefaultConfig(const std::filesystem::path& path) {
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         lg::warn("config: cannot create {}: {}; using built-in defaults",
-                 narrow(path.parent_path().wstring()), ec.message());
+                 toUtf8(path.parent_path().wstring()), ec.message());
         return;
     }
     std::ofstream out(path, std::ios::binary);
@@ -1041,27 +1048,27 @@ inline WindowIdentity probeIdentity(HWND h) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (const HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-        wchar_t buf[MAX_PATH];
-        DWORD len = static_cast<DWORD>(std::size(buf));
-        if (QueryFullProcessImageNameW(proc, 0, buf, &len)) {
-            const std::wstring_view full(buf, len);
+        std::array<wchar_t, MAX_PATH> buf;
+        DWORD len = static_cast<DWORD>(buf.size());
+        if (QueryFullProcessImageNameW(proc, 0, buf.data(), &len)) {
+            const std::wstring_view full(buf.data(), len);
             const size_t slash = full.find_last_of(L"\\/");
-            id.exe = narrow(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
+            id.exe = toUtf8(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
         }
         CloseHandle(proc);
     }
 
     // class: GetClassNameW into a fixed buffer (class names are short).
-    wchar_t cls[256];
-    if (const int n = GetClassNameW(h, cls, static_cast<int>(std::size(cls))); n > 0)
-        id.windowClass = narrow(std::wstring_view(cls, static_cast<size_t>(n)));
+    std::array<wchar_t, 256> cls;
+    if (const int n = GetClassNameW(h, cls.data(), static_cast<int>(cls.size())); n > 0)
+        id.windowClass = toUtf8(std::wstring_view(cls.data(), static_cast<size_t>(n)));
 
     // title: sized by GetWindowTextLengthW, then filled (GetWindowTextW writes at
     // most size-1 chars + a null, so the buffer needs the extra slot).
     if (const int len = GetWindowTextLengthW(h); len > 0) {
         std::wstring title(static_cast<size_t>(len) + 1, L'\0');
         const int got = GetWindowTextW(h, title.data(), len + 1);
-        id.title = narrow(std::wstring_view(title.data(), static_cast<size_t>(got)));
+        id.title = toUtf8(std::wstring_view(title.data(), static_cast<size_t>(got)));
     }
     return id;
 }
@@ -1623,7 +1630,7 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
     }
 
     Resolved winner = *found;
-    const std::string iidName = narrow(bridge_detail::guidToWString(*winner.iid));
+    const std::string iidName = toUtf8(bridge_detail::guidToWString(*winner.iid));
     switch (winner.variant) {
         case VdVariant::W24H2:
             lg::info("virtual desktop bridge: matched IID {} ({}) — 24H2 variant", iidName,
@@ -1895,7 +1902,7 @@ private:
                     // are closed immediately, fully detaching the child so it outlives
                     // winspace; on failure we degrade-and-log and continue — one bad
                     // entry never takes down the WM or blocks the others.
-                    std::wstring cmdline = widen(l.command);
+                    std::wstring cmdline = toWide(l.command);
                     STARTUPINFOW si{};
                     si.cb = sizeof(si);
                     PROCESS_INFORMATION pi{};
