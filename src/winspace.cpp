@@ -108,14 +108,27 @@ struct WindowIdentity {
     std::string title;
 };
 
+// One Display and whether it already carries an Eligible window on the current
+// Workspace — the occupancy fact the Spread round-trip probes. Built by the Worker
+// (which enumerates Displays and windows), consumed by the pure Reducer, which
+// picks the first `!occupied` Display as the Empty Display. The subject window is
+// excluded upstream by the Worker, so its own opening Display reads `!occupied`
+// (ADR-0015 exclude-self) and never defeats its own placement.
+struct DisplayOccupancy {
+    MonitorId id{};
+    bool occupied = false;
+};
+
 // The one match field a WindowRule names. exe/class compare exact and
 // ASCII-case-insensitive; title is a std::regex_search (substring, case-sensitive).
 enum class Field { Exe, Class, Title };
 
 // The action a matching WindowRule applies (ADR-0009 extension):
 // Place pins the window to a target Workspace on Appeared (the original behavior);
-// Ignore excludes the window from Spatial focus (it is never a focus target).
-enum class RuleAction { Place, Ignore };
+// Ignore excludes the window from Spatial focus (it is never a focus target);
+// Spread relocates the window onto an Empty Display on Appeared — the lone action
+// that writes geometry, the bounded ADR-0007 carve-out ADR-0015 records.
+enum class RuleAction { Place, Ignore, Spread };
 
 // A parsed `windowrule = <action>, <field>:<pattern>`. Lives in the core next to WindowAttrs; the parser (Seam 2)
 // compiles these and the reducer matches against them. For Exe/Class, `pattern` is
@@ -203,6 +216,18 @@ struct Vanished {
     WindowId id{};
 };
 
+// Phase two of the Spread round-trip (ADR-0015), mirroring focus's FocusResolve
+// (ADR-0008): an Effect cannot hand data back to the pure Reducer, so the probed
+// Display occupancy re-enters as a second Event. Posted by the Worker after it
+// executes ResolveSpread — `subject` is the window to place, `displays` lists every
+// Display with its occupied flag (the subject already excluded from the count). The
+// Reducer picks the first Empty (`!occupied`) Display and emits PositionWindow, or
+// nothing (overflow) if every Display is occupied.
+struct SpreadResolve {
+    WindowId subject{};
+    std::vector<DisplayOccupancy> displays;
+};
+
 // Launcher lifecycle Events. Started = the spine posted it once the
 // Worker HWND exists; it makes the Reducer emit a LaunchApp for EVERY exec entry.
 // Reloaded = config was reloaded; it emits
@@ -219,12 +244,13 @@ struct Reloaded {};
 struct Reload {};
 
 using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
-                           Appeared, Vanished, Started, Reloaded, Reload>;
+                           Appeared, Vanished, SpreadResolve, Started, Reloaded, Reload>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
-// Worker thread against the COM bridge; the Reducer itself performs no I/O. No
-// Effect writes window geometry (ADR-0007) — `focus` reads rects, never moves a
-// window.
+// Worker thread against the COM bridge; the Reducer itself performs no I/O. Exactly
+// one Effect writes window geometry — PositionWindow, emitted only by Spread, the
+// single bounded exception to ADR-0007's ban (ADR-0015); every other Effect leaves
+// geometry untouched (`focus` reads rects, never moves a window).
 struct SwitchToWorkspace {
     int logical = 0;  // Logical workspace number — resolved to a GUID in the bridge
 };
@@ -259,6 +285,27 @@ struct MoveWindowToWorkspace {
     int logical = 0;
 };
 
+// Phase one of the Spread round-trip (ADR-0015), mirroring ResolveFocus: ask the
+// Worker to probe Display occupancy and post SpreadResolve back. Emitted when a
+// Spread rule matches an Eligible Appeared; the Reducer decides no geometry yet
+// (the pure function cannot enumerate Displays), it only asks. `subject` is the
+// window to place, carried through the round-trip so the eventual PositionWindow
+// names it.
+struct ResolveSpread {
+    WindowId subject{};
+};
+
+// Relocate a window onto a Display's work area (ADR-0015) — winspace's ONLY
+// geometry write. Emitted only by Spread's SpreadResolve reduction. The Worker
+// executes it with a single SetWindowPos onto `target`'s work area at the window's
+// natural size (never resized or snapped); it happens once, at placement, and
+// winspace never touches the rect again — there is no layout() and no continuous
+// maintenance. The bounded reversal of ADR-0007 that ADR-0015 records.
+struct PositionWindow {
+    WindowId id{};
+    MonitorId target{};
+};
+
 // Launch a detached child process (ADR-0011). The Worker runs `command`
 // through one CreateProcessW and closes both handles — launch-only, no PID kept,
 // no Workspace assigned (placement is a paired `windowrule`). `command` is the
@@ -286,8 +333,8 @@ struct SyncAutostart {
 };
 
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
-                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, LaunchApp,
-                            ReloadConfig, SyncAutostart>;
+                            MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, ResolveSpread,
+                            PositionWindow, LaunchApp, ReloadConfig, SyncAutostart>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -312,6 +359,15 @@ constexpr bool operator==(const MoveForegroundWindowToWorkspace& a,
 }
 constexpr bool operator==(const MoveWindowToWorkspace& a, const MoveWindowToWorkspace& b) {
     return a.id == b.id && a.logical == b.logical;
+}
+constexpr bool operator==(const ResolveSpread& a, const ResolveSpread& b) {
+    return a.subject == b.subject;
+}
+constexpr bool operator==(const PositionWindow& a, const PositionWindow& b) {
+    return a.id == b.id && a.target == b.target;
+}
+constexpr bool operator==(const DisplayOccupancy& a, const DisplayOccupancy& b) {
+    return a.id == b.id && a.occupied == b.occupied;
 }
 inline bool operator==(const LaunchApp& a, const LaunchApp& b) {
     return a.command == b.command;
@@ -592,16 +648,25 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.placed.insert(a.attrs.id);
                 std::vector<Effect> effects;
                 // The window has been evaluated, so it is now `placed` regardless of
-                // match. If its first match is an Ignore rule, record the id in
-                // `ignored` (no move Effect — winspace never acts on it); if a Place
-                // rule, emit the move. A non-match does neither.
+                // match. On its first match: an Ignore rule records the id in
+                // `ignored` (no Effect — winspace never acts on it); a Place rule emits
+                // the Workspace move; a Spread rule emits ResolveSpread to start the
+                // Empty-Display probe round-trip (ADR-0015) — no geometry yet, the pure
+                // Reducer cannot enumerate Displays. A non-match does none of these.
                 if (s.rules)
                     if (const WindowRule* rule = matchRule(*s.rules, a.identity)) {
-                        if (rule->action == RuleAction::Ignore)
-                            next.ignored.insert(a.attrs.id);
-                        else
-                            effects.push_back(
-                                Effect{MoveWindowToWorkspace{a.attrs.id, rule->workspace}});
+                        switch (rule->action) {
+                            case RuleAction::Ignore:
+                                next.ignored.insert(a.attrs.id);
+                                break;
+                            case RuleAction::Place:
+                                effects.push_back(
+                                    Effect{MoveWindowToWorkspace{a.attrs.id, rule->workspace}});
+                                break;
+                            case RuleAction::Spread:
+                                effects.push_back(Effect{ResolveSpread{a.attrs.id}});
+                                break;
+                        }
                     }
                 return {next, std::move(effects)};
             },
@@ -614,6 +679,20 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 next.placed.erase(v.id);
                 next.ignored.erase(v.id);
                 return {next, {}};
+            },
+            // Phase two of the Spread round-trip (ADR-0015): the probed Display
+            // occupancy has re-entered as an Event. Pick the first Empty
+            // (`!occupied`) Display and emit exactly one PositionWindow onto it; if
+            // every Display is occupied (overflow) emit nothing — the window is left
+            // where the OS opened it, never forced onto the focused Display. State is
+            // untouched: place-once was already recorded when the subject Appeared, so
+            // this phase persists nothing (mirroring FocusResolve). The subject's own
+            // Display was excluded upstream by the Worker, so it reads `!occupied` and
+            // never defeats its own placement (exclude-self).
+            [&](const SpreadResolve& sr) -> ReduceResult {
+                for (const DisplayOccupancy& d : sr.displays)
+                    if (!d.occupied) return {s, {Effect{PositionWindow{sr.subject, d.id}}}};
+                return {s, {}};
             },
             // Startup: emit a LaunchApp for EVERY exec entry, in config
             // order (exec-once + exec alike), then one SyncAutostart carrying the
@@ -673,7 +752,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
 //   * `$name = tokens` variable definitions, referenced as `$name`
 //   * `bind = MODS, KEY, dispatcher, args`  (dispatcher in { workspace, quit,
 //     focus, movetoworkspace, movetoworkspacesilent, reload })
-//   * `windowrule = <action>, <field>:<pattern>`  (action in { workspace N, ignore })
+//   * `windowrule = <action>, <field>:<pattern>`  (action in { workspace N, ignore, spread })
 //   * `exec` / `exec-once = <verbatim command>`
 //   * `start_at_login = <bool>`
 // A name removed when tiling was dropped (ADR-0007) — a dispatcher such as
@@ -1117,8 +1196,9 @@ inline ParseResult parse(std::string_view text) {
         }
 
         // `windowrule = <action>, <field>:<pattern>` — where <action> is
-        // `workspace N` (Place a matching app on a Workspace on Appeared) or
-        // `ignore` (exclude it from Spatial focus). NO $var expansion: a
+        // `workspace N` (Place a matching app on a Workspace on Appeared),
+        // `ignore` (exclude it from Spatial focus), or `spread` (relocate it onto
+        // an Empty Display on Appeared, ADR-0015). NO $var expansion: a
         // title regex may end in `$` (the end-anchor), which expand_vars would
         // misread as a reference.
         if (lhs == "windowrule") {
@@ -1134,8 +1214,8 @@ inline ParseResult parse(std::string_view text) {
             const std::string_view action = trim(rhs.substr(0, comma));
             const std::string_view spec = rhs.substr(comma + 1);
 
-            // Action is `workspace N` (Place) or `ignore`; any other Hyprland form is
-            // unsupported (diagnosed, not aborting the file).
+            // Action is `workspace N` (Place), `ignore`, or `spread`; any other
+            // Hyprland form is unsupported (diagnosed, not aborting the file).
             const auto atoks = split_ws(action);
             WindowRule rule;
             if (!atoks.empty() && atoks[0] == "workspace") {
@@ -1158,10 +1238,12 @@ inline ParseResult parse(std::string_view text) {
                 rule.workspace = n;
             } else if (!atoks.empty() && atoks[0] == "ignore") {
                 rule.action = RuleAction::Ignore;  // no workspace number
+            } else if (!atoks.empty() && atoks[0] == "spread") {
+                rule.action = RuleAction::Spread;  // no workspace number; targets an Empty Display
             } else {
                 result.diagnostics.push_back(
                     {line_no, "unsupported windowrule action '" + std::string(action) +
-                                  "' (only 'workspace N' or 'ignore')"});
+                                  "' (only 'workspace N', 'ignore', or 'spread')"});
                 continue;
             }
 

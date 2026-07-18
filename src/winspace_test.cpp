@@ -361,6 +361,12 @@ WindowRule titleRule(int ws, const std::string& pattern) {
 WindowRule ignoreExeRule(std::string exe) {
     return WindowRule{Field::Exe, RuleAction::Ignore, 0, std::move(exe), std::regex{}};
 }
+
+// A Spread-action rule. workspace is unused for Spread (it targets an Empty
+// Display, not a Workspace), so 0.
+WindowRule spreadExeRule(std::string exe) {
+    return WindowRule{Field::Exe, RuleAction::Spread, 0, std::move(exe), std::regex{}};
+}
 WindowRule ignoreTitleRule(const std::string& pattern) {
     return WindowRule{Field::Title, RuleAction::Ignore, 0, pattern, std::regex(pattern)};
 }
@@ -559,6 +565,102 @@ TEST_CASE("Vanished clears an ignored id so the window becomes a focus target ag
     const auto after = reduce(gone.state, FocusResolve{Direction::Right, {origin, dock}, origin});
     REQUIRE(single_effect<winspace::SetForegroundWindow>(after) ==
             winspace::SetForegroundWindow{WindowId{2}});
+}
+
+// ── windowrule spread action + the Empty-Display round-trip (ADR-0015) ────────
+//
+// Spread is a two-phase Probe round-trip mirroring Spatial focus (ADR-0008): an
+// Eligible Appeared matching a Spread rule emits a ResolveSpread request (no
+// geometry yet — the pure Reducer cannot enumerate Displays), and the probed
+// occupancy re-enters as a SpreadResolve Event the Reducer turns into a single
+// PositionWindow (or nothing, on overflow). These feed synthetic Events and assert
+// on the emitted Effect, exactly like the focus and rules tests — the whole
+// decision surface is pure and testable here with no live windows.
+
+TEST_CASE("an Appeared matching a Spread rule emits exactly ResolveSpread{thatId} and no geometry", "[reducer][rules][spread]") {
+    const State s = stateWith({spreadExeRule("term.exe")});
+
+    const auto r = reduce(s, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+
+    // Phase one asks the Worker to probe occupancy; it decides no target and writes
+    // no geometry yet.
+    REQUIRE(single_effect<ResolveSpread>(r) == ResolveSpread{WindowId{7}});
+}
+
+TEST_CASE("a Spread window is place-once — a repeat Appeared for the placed id emits nothing", "[reducer][rules][spread]") {
+    const State s = stateWith({spreadExeRule("term.exe")});
+
+    const auto first = reduce(s, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+    REQUIRE(single_effect<ResolveSpread>(first) == ResolveSpread{WindowId{7}});
+
+    // Same id again (an uncloak), reduced against the state the first Appeared left:
+    // it is already `placed`, so Spread never re-probes — a dragged window is not
+    // yanked back.
+    const auto second = reduce(first.state, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+    REQUIRE(second.effects.empty());
+}
+
+TEST_CASE("SpreadResolve with one Empty Display emits PositionWindow targeting it", "[reducer][rules][spread]") {
+    // Two Displays occupied, one empty; the Reducer picks the empty one.
+    const SpreadResolve sr{WindowId{7},
+                           {{MonitorId{10}, true}, {MonitorId{20}, false}, {MonitorId{30}, true}}};
+
+    const auto r = reduce(State{}, sr);
+
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
+}
+
+TEST_CASE("SpreadResolve with every Display occupied emits nothing (overflow → no placement)", "[reducer][rules][spread]") {
+    const SpreadResolve sr{WindowId{7}, {{MonitorId{10}, true}, {MonitorId{20}, true}}};
+
+    const auto r = reduce(State{}, sr);
+
+    // Overflow: no Empty Display, so no Effect — the window is left where the OS
+    // opened it, never forced onto the focused Display.
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("the subject's own Display never counts as occupied (exclude-self)", "[reducer][rules][spread]") {
+    // The Worker excludes the subject when it builds occupancy, so the subject's own
+    // opening Display arrives here flagged !occupied. This asserts the Reducer honors
+    // that flag: with the subject the only window and its Display reported empty, that
+    // Display is chosen rather than read as occupied and defeating placement.
+    const SpreadResolve sr{WindowId{7}, {{MonitorId{20}, false}}};
+
+    const auto r = reduce(State{}, sr);
+
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
+}
+
+TEST_CASE("an Ineligible Appeared matching a Spread rule probes nothing; a later Eligible edge does", "[reducer][rules][spread]") {
+    const State s = stateWith({spreadExeRule("term.exe")});
+
+    // First edge: cloaked → Ineligible. Emits nothing AND must not burn place-once.
+    Appeared cloaked = appeared(WindowId{7}, "term.exe", "cls", "Terminal");
+    cloaked.attrs.cloaked = true;
+    const auto first = reduce(s, cloaked);
+    REQUIRE(first.effects.empty());
+
+    // Second edge for the SAME id, now Eligible (UNCLOAKED) — the probe fires here.
+    const auto second = reduce(first.state, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+    REQUIRE(single_effect<ResolveSpread>(second) == ResolveSpread{WindowId{7}});
+}
+
+TEST_CASE("SpreadResolve leaves State untouched and picks the first Empty Display in list order", "[reducer][rules][spread]") {
+    State s;
+    s.currentWorkspace = 3;
+    s.placed = {WindowId{7}};  // already placed when the subject Appeared
+
+    // Two Empty Displays: the FIRST in list order wins (deterministic, best-effort).
+    const SpreadResolve sr{WindowId{7},
+                           {{MonitorId{10}, true}, {MonitorId{20}, false}, {MonitorId{30}, false}}};
+
+    const auto r = reduce(s, sr);
+
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
+    // Phase two persists nothing — place-once was recorded back on Appeared.
+    REQUIRE(r.state.currentWorkspace == 3);
+    REQUIRE(r.state.placed == std::unordered_set<WindowId>{WindowId{7}});
 }
 
 // ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────
@@ -1121,6 +1223,50 @@ TEST_CASE("a windowrule ignore with a missing or empty pattern is diagnosed", "[
     const auto emptyTitle = parse("windowrule = ignore, title:\n");
     REQUIRE(emptyTitle.config.rules.empty());
     REQUIRE(emptyTitle.diagnostics.size() == 1);
+}
+
+// ── windowrule spread action (ADR-0015) ──────────────────────────────────────
+
+TEST_CASE("windowrule spread parses to a Spread-action rule for each match field", "[config]") {
+    const auto result = parse(
+        "windowrule = spread, exe:Term.exe\n"
+        "windowrule = spread, class:CASCADIA_HOSTING_WINDOW_CLASS\n"
+        "windowrule = spread, title:^Term\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 3);
+
+    // Spread carries no workspace number; the match field/pattern parse exactly as a
+    // Place or Ignore rule (exe/class lowercased, title compiled).
+    REQUIRE(result.config.rules[0].action == RuleAction::Spread);
+    REQUIRE(result.config.rules[0].field == Field::Exe);
+    REQUIRE(result.config.rules[0].pattern == "term.exe");  // lowercased
+
+    REQUIRE(result.config.rules[1].action == RuleAction::Spread);
+    REQUIRE(result.config.rules[1].field == Field::Class);
+    REQUIRE(result.config.rules[1].pattern == "cascadia_hosting_window_class");
+
+    REQUIRE(result.config.rules[2].action == RuleAction::Spread);
+    REQUIRE(result.config.rules[2].field == Field::Title);
+    REQUIRE(std::regex_search(std::string("Terminal"), result.config.rules[2].regex));
+}
+
+TEST_CASE("spread is a recognized action, not swallowed by the removed-with-tiling Diagnostic", "[config]") {
+    // `spread` is a real action (it is NOT in the removed-tiling name list), so it
+    // parses cleanly rather than earning a targeted or generic Diagnostic.
+    const auto result = parse("windowrule = spread, exe:foo.exe\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].action == RuleAction::Spread);
+}
+
+TEST_CASE("a malformed spread windowrule is diagnosed, not silently no-op'd", "[config]") {
+    // Missing the field colon — a typo must still surface a Diagnostic.
+    const auto result = parse("windowrule = spread, foo.exe\n");
+
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
 }
 
 // ── start_at_login setting ───────────────────────────────────────────────────
