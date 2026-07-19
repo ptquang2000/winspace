@@ -2431,6 +2431,26 @@ inline Command commandFromCmdLine(const wchar_t* cmdLine) {
     return parseCommand(args);
 }
 
+// A scoped COM apartment for the headless install/uninstall commands. Unlike the WM's
+// STA Worker (which owns its own CoInitializeEx), these run on the bare wWinMain thread,
+// and their direct (no-Orchestrator) path drives Task Scheduler 2.0 via syncAutostart's
+// CoCreateInstance — which returns CO_E_NOTINITIALIZED on a thread with no apartment.
+// Apartment-threaded to mirror the Worker (ADR-0013); a one-shot task sync needs no
+// message pump. A failed init is left to surface as syncAutostart's error (exit 1, the
+// signal Scoop reads); CoUninitialize is gated on a successful init so teardown balances.
+class ComApartment {
+public:
+    ComApartment() { m_ok = ok(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)).has_value(); }
+    ~ComApartment() {
+        if (m_ok) CoUninitialize();
+    }
+    ComApartment(const ComApartment&) = delete;
+    ComApartment& operator=(const ComApartment&) = delete;
+
+private:
+    bool m_ok = false;
+};
+
 // The headless `winspace install` command (ADR-0019). Make OS autostart match the
 // config's start_at_login — NEVER enabling it unbidden: the flag stays the single
 // source of truth. Hybrid: a live Orchestrator holds the authoritative (possibly
@@ -2445,7 +2465,9 @@ inline int runInstall() {
     }
     // No Orchestrator: read start_at_login from config (self-seeding a first-run
     // default) and sync the task directly. A false flag deletes/leaves-absent the
-    // task, so a fresh install never starts seizing logon hooks.
+    // task, so a fresh install never starts seizing logon hooks. The direct path owns
+    // the COM apartment syncAutostart's Task Scheduler calls require.
+    const ComApartment com;
     const LoadedConfig cfg = loadConfig();
     if (const auto synced = syncAutostart(cfg.startAtLogin); !synced) {
         lg::warn("install: direct autostart sync (enabled={}) failed: {}", cfg.startAtLogin,
@@ -2470,6 +2492,9 @@ inline int runUninstall() {
         stopOrchestrator(orchestrator);
         return removed ? 0 : 1;
     }
+    // No Orchestrator: remove the task directly. Owns the COM apartment syncAutostart's
+    // Task Scheduler calls require (the wWinMain thread has none of its own).
+    const ComApartment com;
     if (const auto removed = syncAutostart(false); !removed) {
         lg::warn("uninstall: direct autostart removal failed: {}", removed.error());
         return 1;
