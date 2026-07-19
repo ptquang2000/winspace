@@ -132,6 +132,18 @@ inline std::wstring toWide(std::string_view s) {
     return out;
 }
 
+// Strip leading and trailing ASCII horizontal whitespace (space, tab) from a wide
+// view — the adapter-side analog of the core's trim() (which stays char-only, this
+// TU being the sole wchar_t world). Drop leading whitespace, then trailing off the
+// reversed remainder; reverse_iterator::base() unwraps back to the const wchar_t*
+// bounds. Returns a view into the same buffer; no alloc.
+inline std::wstring_view trim(std::wstring_view v) {
+    const auto ws = [](wchar_t c) { return c == L' ' || c == L'\t'; };
+    auto front = v | std::views::drop_while(ws);
+    auto back = front | std::views::reverse | std::views::drop_while(ws);
+    return std::wstring_view(back.end().base(), back.begin().base());
+}
+
 // ── the error vocabulary ─────────────────────────────────────────────────────
 
 // The success value for the previously-void expecteds. A named empty type keeps
@@ -2413,21 +2425,21 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
 
 // Narrow wWinMain's wide command tail (the arguments AFTER the program name —
 // wWinMain's lpCmdLine excludes it) to UTF-8 tokens and hand them to the pure
-// parseCommand. Whitespace-split is sufficient: the two verbs are single bare
-// words with no paths or quoting, and any quoted/multi-token line is Other anyway
-// (handled by parseCommand's size check). Keeping the argv extraction here leaves
-// the core wchar_t-free and shell32-free — no CommandLineToArgvW needed.
+// parseCommand. Space-split is sufficient: the two verbs are single bare words with
+// no paths or quoting, and any quoted/multi-token line is Other anyway (handled by
+// parseCommand's size check). Keeping the argv extraction here leaves the core
+// wchar_t-free and shell32-free — no CommandLineToArgvW needed.
 inline Command commandFromCmdLine(const wchar_t* cmdLine) {
-    const auto isSep = [](wchar_t c) { return c == L' ' || c == L'\t'; };
-    std::vector<std::string> args;
-    const std::wstring line = cmdLine ? cmdLine : L"";
-    size_t i = 0;
-    while (i < line.size()) {
-        while (i < line.size() && isSep(line[i])) ++i;      // skip separators
-        const size_t start = i;
-        while (i < line.size() && !isSep(line[i])) ++i;     // take one token
-        if (i > start) args.push_back(toUtf8(std::wstring_view(line).substr(start, i - start)));
-    }
+    const std::wstring_view line = cmdLine ? cmdLine : L"";
+    // Split on spaces, trim any stray whitespace (e.g. tabs) around each token, drop
+    // the empties that runs of separators leave, narrow the survivors to UTF-8, and
+    // collect into the argv parseCommand expects.
+    const std::vector<std::string> args =
+        line | std::views::split(L' ') |
+        std::views::transform([](auto&& tok) { return trim(std::wstring_view(tok)); }) |
+        std::views::filter([](std::wstring_view v) { return !v.empty(); }) |
+        std::views::transform([](std::wstring_view v) { return toUtf8(v); }) |
+        std::ranges::to<std::vector>();
     return parseCommand(args);
 }
 
