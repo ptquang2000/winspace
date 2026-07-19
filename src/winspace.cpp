@@ -119,6 +119,15 @@ struct DisplayOccupancy {
     bool occupied = false;
 };
 
+// One probed window: the (attrs, identity) pair — the same pair an Appeared
+// carries, batched per window for the `tile` sweep (ADR-0016). Unlike the focus
+// sweep (WindowAttrs only), tile must also match rules, so it gathers the identity
+// strings too. TileResolve carries a vector of these back to the pure Reducer.
+struct ProbedWindow {
+    WindowAttrs attrs;
+    WindowIdentity identity;
+};
+
 // The one match field a WindowRule names. exe/class compare exact and
 // ASCII-case-insensitive; title is a std::regex_search (substring, case-sensitive).
 enum class Field { Exe, Class, Title };
@@ -130,19 +139,42 @@ enum class Field { Exe, Class, Title };
 // that writes geometry, the bounded ADR-0007 carve-out ADR-0015 records.
 enum class RuleAction { Place, Ignore, Spread };
 
+// A Slot: a symbolic named fraction of a Display work area (ADR-0016), the
+// optional geometry target of a Place WindowRule. It is NOT a stored rect —
+// winspace computes the rect live from the target Display's work area at write
+// time (rectForSlot) and forgets it, so nothing can go stale (ADR-0007's
+// stale-rect rejection answered by construction). Named in config as kebab-case
+// tokens (left-half, top-left-quarter, maximized, …). `maximized` is special-cased
+// at the adapter to OS SW_MAXIMIZE; the rest become a SetWindowPos to their rect.
+enum class Slot {
+    LeftHalf,
+    RightHalf,
+    TopHalf,
+    BottomHalf,
+    TopLeftQuarter,
+    TopRightQuarter,
+    BottomLeftQuarter,
+    BottomRightQuarter,
+    Maximized,
+};
+
 // A parsed `windowrule = <action>, <field>:<pattern>`. Lives in the core next to WindowAttrs; the parser (Seam 2)
 // compiles these and the reducer matches against them. For Exe/Class, `pattern` is
 // the (lowercased, trimmed) literal to compare; for Title, `regex` is the compiled
 // pattern and `pattern` keeps the source text (diagnostics only). `workspace` is
-// the target Logical number for a Place rule (unused for Ignore). std::regex makes
-// this copyable-but-not-cheap, which is why State holds the rule list behind a
-// shared_ptr (O(1) per-event State copies).
+// the target Logical number for a Place rule (unused for Ignore). `slot` is the
+// optional geometry target of a Place rule (ADR-0016) — nullopt is exactly the
+// pre-ADR-0016 behavior (Workspace pin only, no geometry), so all existing configs
+// are unaffected; meaningless on an Ignore rule (the parser diagnoses `slot` there).
+// std::regex makes this copyable-but-not-cheap, which is why State holds the rule
+// list behind a shared_ptr (O(1) per-event State copies).
 struct WindowRule {
     Field field{};
     RuleAction action = RuleAction::Place;
     int workspace = 0;
     std::string pattern;
     std::regex regex;
+    std::optional<Slot> slot;
 };
 
 // A parsed `exec = <cmd>` / `exec-once = <cmd>` launch entry (ADR-0011).
@@ -189,6 +221,16 @@ struct FocusResolve {
     reducer::Direction dir{};
     std::vector<WindowAttrs> candidates;    // the full probed set, unfiltered
     std::optional<WindowAttrs> origin;      // the foreground window; nullopt => no-op
+};
+
+// The `tile` dispatcher (ADR-0016) — a two-phase Probe sweep mirroring Spatial
+// focus (FocusMove → ResolveFocus → FocusResolve). Tile is what the Hotkey thread
+// posts (the bind fired); the Worker runs the sweep and posts TileResolve back to
+// itself with the probed windows. Unlike the focus sweep, tile gathers identity
+// too (it must match rules), so its payload is ProbedWindows, not bare WindowAttrs.
+struct Tile {};
+struct TileResolve {
+    std::vector<ProbedWindow> windows;  // the full probed set, unfiltered
 };
 
 // movetoworkspace / movetoworkspacesilent: move the FOREGROUND window
@@ -244,13 +286,16 @@ struct Reloaded {};
 struct Reload {};
 
 using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
-                           Appeared, Vanished, SpreadResolve, Started, Reloaded, Reload>;
+                           Appeared, Vanished, SpreadResolve, Started, Reloaded, Reload, Tile,
+                           TileResolve>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
-// Worker thread against the COM bridge; the Reducer itself performs no I/O. Exactly
-// one Effect writes window geometry — PositionWindow, emitted only by Spread, the
-// single bounded exception to ADR-0007's ban (ADR-0015); every other Effect leaves
-// geometry untouched (`focus` reads rects, never moves a window).
+// Worker thread against the COM bridge; the Reducer itself performs no I/O. Two
+// Effects write window geometry — the bounded exceptions to ADR-0007's ban:
+// SpreadWindow, emitted only by Spread onto an Empty Display (ADR-0015), and
+// PositionWindow, the Slot writer emitted by a Slot-bearing Place rule and by
+// `tile` (ADR-0016); every other Effect leaves geometry untouched (`focus` reads
+// rects, never moves a window).
 struct SwitchToWorkspace {
     int logical = 0;  // Logical workspace number — resolved to a GUID in the bridge
 };
@@ -264,6 +309,11 @@ struct ResolveFocus {
 struct SetForegroundWindow {
     WindowId id{};
 };
+
+// ResolveTile asks the Worker to run the tile Probe sweep (EnumWindows, gathering
+// attrs AND identity per window) and post TileResolve back — the tile counterpart
+// of ResolveFocus (ADR-0016). Carries nothing: the sweep needs no argument.
+struct ResolveTile {};
 
 // Move the foreground window to a Logical workspace (resolved to a GUID in the
 // bridge, ADR-0010; the target is materialized on demand WITHOUT switching). The
@@ -289,21 +339,36 @@ struct MoveWindowToWorkspace {
 // Worker to probe Display occupancy and post SpreadResolve back. Emitted when a
 // Spread rule matches an Eligible Appeared; the Reducer decides no geometry yet
 // (the pure function cannot enumerate Displays), it only asks. `subject` is the
-// window to place, carried through the round-trip so the eventual PositionWindow
+// window to place, carried through the round-trip so the eventual SpreadWindow
 // names it.
 struct ResolveSpread {
     WindowId subject{};
 };
 
-// Relocate a window onto a Display's work area (ADR-0015) — winspace's ONLY
-// geometry write. Emitted only by Spread's SpreadResolve reduction. The Worker
-// executes it with a single SetWindowPos onto `target`'s work area at the window's
-// natural size (never resized or snapped); it happens once, at placement, and
-// winspace never touches the rect again — there is no layout() and no continuous
-// maintenance. The bounded reversal of ADR-0007 that ADR-0015 records.
-struct PositionWindow {
+// Relocate a window onto a Display's work area (ADR-0015) — a bounded geometry
+// write. Emitted only by Spread's SpreadResolve reduction. The Worker executes it
+// with a single SetWindowPos onto `target`'s work area at the window's natural size
+// (never resized or snapped); it happens once, at placement, and winspace never
+// touches the rect again — there is no layout() and no continuous maintenance. The
+// bounded reversal of ADR-0007 that ADR-0015 records. Distinct from PositionWindow
+// (ADR-0016): Spread moves to a whole Display at natural size; a Slot writes a
+// computed fraction of the window's own monitor.
+struct SpreadWindow {
     WindowId id{};
     MonitorId target{};
+};
+
+// Position a SPECIFIC window into a symbolic Slot (ADR-0016) — the Slot
+// geometry-writing Effect, a bounded reopening of ADR-0007's geometry ban. The
+// Reducer only ever names the Slot; it never computes or sees a rect. The adapter
+// (positionWindow) resolves the window's monitor work area, applies the pure
+// rectForSlot, compensates the visible frame, and writes with SetWindowPos (or OS
+// SW_MAXIMIZE for the Maximized Slot). Emitted on two paths — a Slot-bearing Place
+// rule matching on Appeared (before the MoveWindowToWorkspace), and the `tile`
+// sweep — never continuously (no stored rect, nothing to go stale).
+struct PositionWindow {
+    WindowId id{};
+    Slot slot{};
 };
 
 // Launch a detached child process (ADR-0011). The Worker runs `command`
@@ -334,7 +399,8 @@ struct SyncAutostart {
 
 using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
                             MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, ResolveSpread,
-                            PositionWindow, LaunchApp, ReloadConfig, SyncAutostart>;
+                            SpreadWindow, PositionWindow, ResolveTile, LaunchApp, ReloadConfig,
+                            SyncAutostart>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
@@ -347,6 +413,7 @@ constexpr bool operator==(const Exit&, const Exit&) { return true; }
 constexpr bool operator==(const ResolveFocus& a, const ResolveFocus& b) {
     return a.dir == b.dir;
 }
+constexpr bool operator==(const ResolveTile&, const ResolveTile&) { return true; }
 constexpr bool operator==(const SetForegroundWindow& a, const SetForegroundWindow& b) {
     return a.id == b.id;
 }
@@ -363,11 +430,14 @@ constexpr bool operator==(const MoveWindowToWorkspace& a, const MoveWindowToWork
 constexpr bool operator==(const ResolveSpread& a, const ResolveSpread& b) {
     return a.subject == b.subject;
 }
-constexpr bool operator==(const PositionWindow& a, const PositionWindow& b) {
+constexpr bool operator==(const SpreadWindow& a, const SpreadWindow& b) {
     return a.id == b.id && a.target == b.target;
 }
 constexpr bool operator==(const DisplayOccupancy& a, const DisplayOccupancy& b) {
     return a.id == b.id && a.occupied == b.occupied;
+}
+constexpr bool operator==(const PositionWindow& a, const PositionWindow& b) {
+    return a.id == b.id && a.slot == b.slot;
 }
 inline bool operator==(const LaunchApp& a, const LaunchApp& b) {
     return a.command == b.command;
@@ -596,6 +666,44 @@ inline const WindowRule* matchRule(const std::vector<WindowRule>& rules,
     return nullptr;
 }
 
+// ── slot geometry: the pure rect arithmetic (ADR-0016) ───────────────────────
+
+// Compute the rect a Slot names within a Display work area — the fiddliest part
+// of the feature, deliberately pure so it is unit-tested with no Win32 (the
+// internal seam ADR-0016 calls out). `workArea` is the target monitor's work area
+// (taskbar already excluded — the adapter reads it via GetMonitorInfo). Halves
+// split at the integer midpoint and quarters meet on that same shared midpoint, so
+// the four quarters tile the area with no gap and no overlapping interior; a stray
+// odd pixel lands consistently on the right/bottom half. `maximized` returns the
+// full work area (the adapter still prefers OS SW_MAXIMIZE for it — this rect is
+// the fallback and the value the unit tests assert). No DPI or frame delta enters
+// here; the adapter compensates the visible frame after calling this.
+constexpr Rect rectForSlot(Slot slot, const Rect& workArea) {
+    const int midX = workArea.left + (workArea.right - workArea.left) / 2;
+    const int midY = workArea.top + (workArea.bottom - workArea.top) / 2;
+    switch (slot) {
+        case Slot::LeftHalf:
+            return {workArea.left, workArea.top, midX, workArea.bottom};
+        case Slot::RightHalf:
+            return {midX, workArea.top, workArea.right, workArea.bottom};
+        case Slot::TopHalf:
+            return {workArea.left, workArea.top, workArea.right, midY};
+        case Slot::BottomHalf:
+            return {workArea.left, midY, workArea.right, workArea.bottom};
+        case Slot::TopLeftQuarter:
+            return {workArea.left, workArea.top, midX, midY};
+        case Slot::TopRightQuarter:
+            return {midX, workArea.top, workArea.right, midY};
+        case Slot::BottomLeftQuarter:
+            return {workArea.left, midY, midX, workArea.bottom};
+        case Slot::BottomRightQuarter:
+            return {midX, midY, workArea.right, workArea.bottom};
+        case Slot::Maximized:
+            return workArea;
+    }
+    return workArea;  // unreachable for a valid Slot
+}
+
 // ── the seam ────────────────────────────────────────────────────────────────
 
 inline ReduceResult reduce(const State& s, const Event& e) {
@@ -660,6 +768,16 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                                 next.ignored.insert(a.attrs.id);
                                 break;
                             case RuleAction::Place:
+                                // A Slot-bearing Place rule (ADR-0016) positions the
+                                // window FIRST — while it is still visible on the
+                                // current Desktop — then the workspace move
+                                // cloaks-and-moves it. Geometry is per-HWND and
+                                // Virtual-Desktop-independent, so it survives the move;
+                                // this ordering is the lower-risk choice and a named
+                                // acceptance check.
+                                if (rule->slot)
+                                    effects.push_back(
+                                        Effect{PositionWindow{a.attrs.id, *rule->slot}});
                                 effects.push_back(
                                     Effect{MoveWindowToWorkspace{a.attrs.id, rule->workspace}});
                                 break;
@@ -682,7 +800,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             },
             // Phase two of the Spread round-trip (ADR-0015): the probed Display
             // occupancy has re-entered as an Event. Pick the first Empty
-            // (`!occupied`) Display and emit exactly one PositionWindow onto it; if
+            // (`!occupied`) Display and emit exactly one SpreadWindow onto it; if
             // every Display is occupied (overflow) emit nothing — the window is left
             // where the OS opened it, never forced onto the focused Display. State is
             // untouched: place-once was already recorded when the subject Appeared, so
@@ -693,7 +811,7 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 if (const auto d = std::ranges::find_if(
                         sr.displays, [](const DisplayOccupancy& e) { return !e.occupied; });
                     d != sr.displays.end())
-                    return {s, {Effect{PositionWindow{sr.subject, d->id}}}};
+                    return {s, {Effect{SpreadWindow{sr.subject, d->id}}}};
                 return {s, {}};
             },
             // Startup: emit a LaunchApp for EVERY exec entry, in config
@@ -731,6 +849,30 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             // Reloaded{} to itself. Not to be confused with Reloaded{} above.
             [&](const Reload&) -> ReduceResult {
                 return {s, {Effect{ReloadConfig{}}}};
+            },
+            // Phase one of the tile round-trip (ADR-0016), mirroring FocusMove: ask
+            // the Worker to run the Probe sweep. State is untouched — tile is an
+            // explicit, stateless re-tile that persists nothing.
+            [&](const Tile&) -> ReduceResult {
+                return {s, {Effect{ResolveTile{}}}};
+            },
+            // Phase two: the probed windows have re-entered as an Event. Emit one
+            // PositionWindow per window that is Eligible AND whose first-match is a
+            // Slot-bearing Place rule; emit nothing else. Stateless and geometry-only
+            // (ADR-0016): it consults no `placed` set (deliberately re-placeable),
+            // never moves a window between Workspaces, and leaves State unchanged.
+            // "Current Workspace only" falls out for free — windows on other Virtual
+            // Desktops are DWM-cloaked → Ineligible → skipped here.
+            [&](const TileResolve& tr) -> ReduceResult {
+                std::vector<Effect> effects;
+                if (s.rules)
+                    for (const ProbedWindow& w : tr.windows) {
+                        if (!isEligible(w.attrs)) continue;
+                        const WindowRule* rule = matchRule(*s.rules, w.identity);
+                        if (rule && rule->action == RuleAction::Place && rule->slot)
+                            effects.push_back(Effect{PositionWindow{w.attrs.id, *rule->slot}});
+                    }
+                return {s, std::move(effects)};
             },
         },
         e);
@@ -829,6 +971,7 @@ enum class Dispatcher : uint8_t {
     MoveToWorkspace,        // movetoworkspace N — move + follow (switch to N)
     MoveToWorkspaceSilent,  // movetoworkspacesilent N — move, stay on current
     Reload,                 // reload — re-read + re-apply the config file
+    Tile,                   // tile — re-place every open window into its Slot (ADR-0016)
 };
 
 // A parsed bind line. `arg` carries the workspace number for Workspace and the two
@@ -986,6 +1129,7 @@ inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
     if (t == "movetoworkspace") return Dispatcher::MoveToWorkspace;
     if (t == "movetoworkspacesilent") return Dispatcher::MoveToWorkspaceSilent;
     if (t == "reload") return Dispatcher::Reload;
+    if (t == "tile") return Dispatcher::Tile;
     return std::nullopt;
 }
 
@@ -1017,6 +1161,41 @@ inline std::optional<config::Direction> parse_direction(std::string_view t) {
     if (iequals(t, "up")) return config::Direction::Up;
     if (iequals(t, "down")) return config::Direction::Down;
     return std::nullopt;
+}
+
+// The nine Slot vocabulary tokens (ADR-0016), matched case-insensitively like the
+// direction words. This table is the SINGLE source of truth: parse_slot resolves
+// the `slot <name>` suffix through it, and slot_vocabulary() renders it for the
+// diagnostic message — so adding a Slot can never leave the parser and the error
+// text out of sync.
+inline constexpr std::pair<std::string_view, Slot> k_slot_names[] = {
+    {"left-half", Slot::LeftHalf},
+    {"right-half", Slot::RightHalf},
+    {"top-half", Slot::TopHalf},
+    {"bottom-half", Slot::BottomHalf},
+    {"top-left-quarter", Slot::TopLeftQuarter},
+    {"top-right-quarter", Slot::TopRightQuarter},
+    {"bottom-left-quarter", Slot::BottomLeftQuarter},
+    {"bottom-right-quarter", Slot::BottomRightQuarter},
+    {"maximized", Slot::Maximized},
+};
+
+inline std::optional<Slot> parse_slot(std::string_view t) {
+    for (const auto& [name, slot] : k_slot_names)
+        if (iequals(t, name)) return slot;
+    return std::nullopt;
+}
+
+// The vocabulary rendered as `a|b|c…` for a per-line Diagnostic (cold path — an
+// unknown slot name only). Built from k_slot_names so it never drifts from what
+// parse_slot actually accepts.
+inline std::string slot_vocabulary() {
+    std::string out;
+    for (const auto& [name, slot] : k_slot_names) {
+        if (!out.empty()) out += '|';
+        out += name;
+    }
+    return out;
 }
 
 // Substitute every `$name` reference from `vars`. On an undefined reference,
@@ -1238,8 +1417,44 @@ inline ParseResult parse(std::string_view text) {
                     continue;
                 }
                 rule.workspace = n;
+
+                // Optional `slot <name>` suffix (ADR-0016), living inside the
+                // `workspace N` action clause. Absent → nullopt → exactly the
+                // pre-ADR-0016 Workspace-pin behavior. A present-but-malformed slot
+                // is a per-line Diagnostic that skips only this rule (per-line
+                // degrade, consistent with the rest of the parser).
+                if (atoks.size() >= 3) {
+                    if (atoks[2] != "slot") {
+                        result.diagnostics.push_back(
+                            {line_no, "unexpected token '" + std::string(atoks[2]) +
+                                          "' in windowrule workspace action (expected 'slot')"});
+                        continue;
+                    }
+                    if (atoks.size() < 4) {
+                        result.diagnostics.push_back(
+                            {line_no, "windowrule slot needs a name (" + slot_vocabulary() + ")"});
+                        continue;
+                    }
+                    const auto slot = parse_slot(atoks[3]);
+                    if (!slot) {
+                        result.diagnostics.push_back(
+                            {line_no, "unknown slot '" + std::string(atoks[3]) +
+                                          "' (expected " + slot_vocabulary() + ")"});
+                        continue;
+                    }
+                    rule.slot = *slot;
+                }
             } else if (!atoks.empty() && atoks[0] == "ignore") {
                 rule.action = RuleAction::Ignore;  // no workspace number
+                // `slot` is Place-only — a Slot on an Ignore rule is a meaningless
+                // combination, flagged rather than silently dropped (ADR-0016).
+                if (atoks.size() > 1 && atoks[1] == "slot") {
+                    result.diagnostics.push_back(
+                        {line_no,
+                         "slot is not valid on an 'ignore' windowrule (slot places a "
+                         "window; ignore only excludes it from focus)"});
+                    continue;
+                }
             } else if (!atoks.empty() && atoks[0] == "spread") {
                 rule.action = RuleAction::Spread;  // no workspace number; targets an Empty Display
             } else {
