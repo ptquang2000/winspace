@@ -1,6 +1,15 @@
 # Spread: a bounded one-shot geometry write to place a window on an empty display
 
-**Status:** Accepted (2026-07-18)
+**Status:** **Retired by [ADR-0020](0020-distribute-auto-tile-every-eligible-window.md)** (2026-07-19).
+Originally Accepted (2026-07-18) and numbered 0015; **renumbered to 0021** to resolve a
+numbering collision with the FancyZones ADR (which keeps 0015). The `Spread` `RuleAction`,
+the `SpreadWindow` Effect, the `spread` config token, and the "overflow → no placement"
+behavior recorded here are all **gone**: ADR-0020 makes distribution automatic for *every*
+eligible window (not a per-rule opt-in), folds `SpreadWindow` into a unified `PositionWindow`
+carrying an optional target Display, and replaces the boolean "Empty Display" with a
+count-balanced "least-occupied Display." The two-phase Probe round-trip and the
+stateless/place-once/exclude-self shape below **survive** — ADR-0020 generalizes them rather
+than discarding them. This file is kept for history; read ADR-0020 for current behavior.
 
 [ADR-0007](0007-drop-tiling-no-window-geometry.md) declared that winspace owns **no
 window geometry** — "never moves or sizes a window: no `layout()`, no `PositionWindow`
@@ -39,18 +48,20 @@ rejected for *this* behavior:
   and is **place-once**: recorded in the existing `placed` set (ADR-0009), erased on
   `Vanished`, never re-asserted on uncloak or reload. A window the user later drags is **not**
   yanked back.
-- **A new geometry Effect** — `PositionWindow{ WindowId id, MonitorId target }` — is added to
-  the `Effect` variant. The Worker executes it with a single `SetWindowPos` onto `target`'s
-  work area. This is winspace's **only** geometry write; it happens **once**, at placement,
-  and winspace never touches the rect again. There is no `layout()`, no continuous
+- **A new geometry Effect** — `SpreadWindow{ WindowId id, MonitorId target }` — is added to
+  the `Effect` variant. (Named `PositionWindow` in this ADR as first written; renamed to
+  `SpreadWindow` when [ADR-0016](0016-bounded-window-geometry-rule-targeted-place-once.md)
+  introduced its own `PositionWindow{ WindowId, Slot }` and the two had to coexist.) The Worker
+  executes it with a single `SetWindowPos` onto `target`'s work area. It happens **once**, at
+  placement, and winspace never touches the rect again. There is no `layout()`, no continuous
   maintenance, no location-change hook. The ADR-0007 ban is reduced from "never" to "never,
-  except one bounded write emitted only by Spread."
+  except bounded writes emitted only by Spread (and, per ADR-0016, Slot placement)."
 - **Empty Display is computed statelessly, via a two-phase Probe round-trip** mirroring
   Spatial focus (ADR-0008) — the pure Reducer cannot enumerate windows, so when a Spread rule
   matches it emits a `ProbeDisplays`-style request; the adapter enumerates top-level windows,
   maps each Eligible one's rect to its `MonitorId` (`MonitorFromRect`), and posts the set of
   **occupied** Displays back as an Event; the pure Reducer then picks a `MonitorId` **not** in
-  that set and emits `PositionWindow`. **No occupancy is persisted** — the deferred
+  that set and emits `SpreadWindow`. **No occupancy is persisted** — the deferred
   per-Display occupancy model (the one Reaping still waits on) is **not** built here.
 - **Exclude self.** The subject window has already appeared *somewhere*, so the enumeration
   drops its own `WindowId`; otherwise its opening monitor reads as occupied.
@@ -80,11 +91,11 @@ rejected for *this* behavior:
   overflow is already a benign no-op, this is accepted; guaranteed spread would require the
   rejected persisted model.
 - **The geometry ban of ADR-0007 is partially reversed, by design and bounded.** A future
-  reader who finds `PositionWindow` after reading ADR-0007's "no `PositionWindow` Effect" should
+  reader who finds `SpreadWindow` after reading ADR-0007's "no `PositionWindow` Effect" should
   read this ADR. The reversal is one Effect, emitted only by Spread, one-shot, place-once —
   categorically not the continuous auto-tiling ADR-0007 killed.
 - **The Reducer stays pure.** The occupancy read is an adapter Probe; picking the target from
-  the occupied set is a pure function of `(occupied Displays, subject id)`. Only `PositionWindow`
+  the occupied set is a pure function of `(occupied Displays, subject id)`. Only `SpreadWindow`
   is new I/O, executed by the Worker.
 - **Spread is not re-asserted on reload** — consistent with Place-once and the Ignore-set: a
   Spread rule added at reload takes effect for a matching window only when it next `Appears`.

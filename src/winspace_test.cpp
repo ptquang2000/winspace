@@ -361,12 +361,6 @@ WindowRule titleRule(int ws, const std::string& pattern) {
 WindowRule ignoreExeRule(std::string exe) {
     return WindowRule{Field::Exe, RuleAction::Ignore, 0, std::move(exe), std::regex{}};
 }
-
-// A Spread-action rule. workspace is unused for Spread (it targets an Empty
-// Display, not a Workspace), so 0.
-WindowRule spreadExeRule(std::string exe) {
-    return WindowRule{Field::Exe, RuleAction::Spread, 0, std::move(exe), std::regex{}};
-}
 WindowRule ignoreTitleRule(const std::string& pattern) {
     return WindowRule{Field::Title, RuleAction::Ignore, 0, pattern, std::regex(pattern)};
 }
@@ -430,8 +424,9 @@ TEST_CASE("exe matching is ASCII case-insensitive and exact (not substring)", "[
     const auto hit = reduce(s, appeared(WindowId{1}, "SLACK.EXE", "cls", "t"));
     REQUIRE(single_effect<MoveWindowToWorkspace>(hit) == MoveWindowToWorkspace{WindowId{1}, 5});
 
+    // A near-miss matches no rule, so it is Distributed rather than left alone.
     const auto miss = reduce(s, appeared(WindowId{2}, "slack.exe.bak", "cls", "t"));
-    REQUIRE(miss.effects.empty());
+    REQUIRE(single_effect<ResolveDistribute>(miss) == ResolveDistribute{WindowId{2}});
 }
 
 TEST_CASE("an ineligible Appeared emits nothing and is not placed; a later eligible edge pins", "[reducer][rules]") {
@@ -449,11 +444,12 @@ TEST_CASE("an ineligible Appeared emits nothing and is not placed; a later eligi
     REQUIRE(single_effect<MoveWindowToWorkspace>(second) == MoveWindowToWorkspace{WindowId{7}, 2});
 }
 
-TEST_CASE("an eligible non-matching Appeared is placed and never re-evaluated", "[reducer][rules]") {
+TEST_CASE("an eligible non-matching Appeared is Distributed and never re-evaluated", "[reducer][rules]") {
     const State s = stateWith({exeRule(2, "slack.exe")});
 
+    // No rule matches, so the window is Distributed (place-once still burns).
     const auto first = reduce(s, appeared(WindowId{7}, "notepad.exe", "cls", "t"));
-    REQUIRE(first.effects.empty());
+    REQUIRE(single_effect<ResolveDistribute>(first) == ResolveDistribute{WindowId{7}});
 
     // Even a now-matching identity for the same id emits nothing — it is placed.
     const auto second = reduce(first.state, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
@@ -480,26 +476,190 @@ TEST_CASE("title matching is substring and case-sensitive", "[reducer][rules]") 
                               appeared(WindowId{1}, "e", "c", "Slack | general"));
         REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{1}, 3});
     }
-    // title:^Slack$ does NOT match "Slack | general" (anchored whole-title).
+    // title:^Slack$ does NOT match "Slack | general" (anchored whole-title) — so the
+    // window matches no rule and is Distributed.
     {
         const auto r = reduce(stateWith({titleRule(3, "^Slack$")}),
                               appeared(WindowId{2}, "e", "c", "Slack | general"));
-        REQUIRE(r.effects.empty());
+        REQUIRE(single_effect<ResolveDistribute>(r) == ResolveDistribute{WindowId{2}});
     }
-    // title:slack does NOT match "Slack" (case-sensitive).
+    // title:slack does NOT match "Slack" (case-sensitive) — Distributed.
     {
         const auto r = reduce(stateWith({titleRule(3, "slack")}),
                               appeared(WindowId{3}, "e", "c", "Slack"));
-        REQUIRE(r.effects.empty());
+        REQUIRE(single_effect<ResolveDistribute>(r) == ResolveDistribute{WindowId{3}});
     }
 }
 
-TEST_CASE("an Appeared with no rules seeded emits nothing but still places the id", "[reducer][rules]") {
-    // A default State has a null rules handle; matching must be skipped safely.
+TEST_CASE("an Appeared with no rules seeded still Distributes and places the id", "[reducer][rules]") {
+    // A default State has a null rules handle; matching is skipped safely, so the
+    // window matches nothing and is Distributed — and place-once still records the id.
     const auto first = reduce(State{}, appeared(WindowId{1}, "slack.exe", "cls", "Slack"));
-    REQUIRE(first.effects.empty());
+    REQUIRE(single_effect<ResolveDistribute>(first) == ResolveDistribute{WindowId{1}});
     const auto second = reduce(first.state, appeared(WindowId{1}, "slack.exe", "cls", "Slack"));
     REQUIRE(second.effects.empty());
+}
+
+// ── windowrule slot placement on Appeared (ADR-0016) ─────────────────────────
+
+namespace {
+// An exe Place rule carrying a Slot geometry target.
+WindowRule exeSlotRule(int ws, std::string exe, Slot slot) {
+    return WindowRule{Field::Exe, RuleAction::Place, ws, std::move(exe), std::regex{}, slot};
+}
+}  // namespace
+
+TEST_CASE("an Appeared matching a Slot-bearing Place rule emits PositionWindow then the move", "[reducer][rules][slot]") {
+    const State s = stateWith({exeSlotRule(2, "code.exe", Slot::RightHalf)});
+
+    const auto r = reduce(s, appeared(WindowId{7}, "code.exe", "cls", "Code"));
+
+    // Two Effects, in this exact order: position while still on the current
+    // Desktop, THEN cloak-and-move to the workspace (ADR-0016 emission order).
+    REQUIRE(r.effects.size() == 2);
+    REQUIRE(std::holds_alternative<PositionWindow>(r.effects[0]));
+    REQUIRE(std::get<PositionWindow>(r.effects[0]) ==
+            PositionWindow{WindowId{7}, std::nullopt, Slot::RightHalf});
+    REQUIRE(std::holds_alternative<MoveWindowToWorkspace>(r.effects[1]));
+    REQUIRE(std::get<MoveWindowToWorkspace>(r.effects[1]) == MoveWindowToWorkspace{WindowId{7}, 2});
+}
+
+TEST_CASE("a matched workspace-only rule (no slot) still emits only the move", "[reducer][rules][slot]") {
+    // Regression: a rule without a slot behaves exactly as before ADR-0016.
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto r = reduce(s, appeared(WindowId{7}, "slack.exe", "cls", "Slack"));
+
+    REQUIRE(single_effect<MoveWindowToWorkspace>(r) == MoveWindowToWorkspace{WindowId{7}, 2});
+}
+
+TEST_CASE("a Slot-bearing Place rule places the id once — a later edge is a no-op", "[reducer][rules][slot]") {
+    const State s = stateWith({exeSlotRule(2, "code.exe", Slot::Maximized)});
+
+    const auto first = reduce(s, appeared(WindowId{7}, "code.exe", "cls", "Code"));
+    REQUIRE(first.effects.size() == 2);
+
+    // Place-once: the same id again emits nothing (no re-position, no re-move).
+    const auto second = reduce(first.state, appeared(WindowId{7}, "code.exe", "cls", "Code"));
+    REQUIRE(second.effects.empty());
+}
+
+// ── tile dispatcher: the full-pipeline rebalance (ADR-0016, ADR-0020) ─────────
+
+namespace {
+// A probed window for the tile sweep: a fully-Eligible attrs (from `eligible`)
+// paired with the given identity, sharing the id as the adapter mints it. `probed`
+// puts it on the default monitor; `probedOn` names the monitor for balancing tests.
+ProbedWindow probedOn(WindowId id, std::string exe, std::string cls, std::string title,
+                      MonitorId monitor) {
+    return ProbedWindow{eligible(id, monitor),
+                        WindowIdentity{id, std::move(exe), std::move(cls), std::move(title)}};
+}
+ProbedWindow probed(WindowId id, std::string exe, std::string cls, std::string title) {
+    return probedOn(id, std::move(exe), std::move(cls), std::move(title), kMon);
+}
+}  // namespace
+
+TEST_CASE("a Tile Event emits exactly ResolveTile and touches no State", "[reducer][tile]") {
+    const State s = stateWith({exeSlotRule(2, "code.exe", Slot::LeftHalf)});
+
+    const auto r = reduce(s, Tile{});
+
+    REQUIRE(single_effect<ResolveTile>(r) == ResolveTile{});
+    // Stateless: the placed/ignored sets and workspace are untouched.
+    REQUIRE(r.state.placed.empty());
+    REQUIRE(r.state.currentWorkspace == s.currentWorkspace);
+}
+
+TEST_CASE("TileResolve places each Eligible Slot-matched window to its Slot on its own monitor", "[reducer][tile]") {
+    const State s = stateWith({exeSlotRule(2, "code.exe", Slot::LeftHalf),
+                               exeSlotRule(3, "slack.exe", Slot::RightHalf)});
+
+    // Three windows: two Eligible + Slot-matched, one matched-but-Ineligible
+    // (cloaked → on another Workspace, skipped for free).
+    ProbedWindow code = probed(WindowId{1}, "code.exe", "cls", "Code");
+    ProbedWindow slack = probed(WindowId{2}, "slack.exe", "cls", "Slack");
+    ProbedWindow cloakedCode = probed(WindowId{4}, "code.exe", "cls", "Code");
+    cloakedCode.attrs.cloaked = true;  // Ineligible — on another Virtual Desktop
+
+    const auto r = reduce(s, TileResolve{{code, slack, cloakedCode}, {kMon}});
+
+    // A Slot rule places to its Slot on its own monitor (target nullopt); the cloaked
+    // window is skipped. No MoveWindowToWorkspace ever (no cross-Workspace teleport).
+    REQUIRE(r.effects.size() == 2);
+    REQUIRE(std::get<PositionWindow>(r.effects[0]) ==
+            PositionWindow{WindowId{1}, std::nullopt, Slot::LeftHalf});
+    REQUIRE(std::get<PositionWindow>(r.effects[1]) ==
+            PositionWindow{WindowId{2}, std::nullopt, Slot::RightHalf});
+
+    // Stateless: no id entered `placed` (tile is deliberately re-placeable).
+    REQUIRE(r.state.placed.empty());
+}
+
+TEST_CASE("TileResolve never moves an Ignore-matched window", "[reducer][tile]") {
+    // Ignore widens to "don't touch at all": counted as occupancy but never placed.
+    const State s = stateWith({ignoreExeRule("dock.exe")});
+
+    const auto r = reduce(s, TileResolve{{probed(WindowId{1}, "dock.exe", "cls", "Dock")}, {kMon}});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("TileResolve leaves a workspace-only Place window put (counted, not moved)", "[reducer][tile]") {
+    // A workspace-only Place rule pins Workspace, not geometry — tile never teleports
+    // a window between Workspaces, so it emits no Effect for it (but still counts it).
+    const State s = stateWith({exeRule(2, "slack.exe")});
+
+    const auto r = reduce(s, TileResolve{{probed(WindowId{1}, "slack.exe", "cls", "Slack")}, {kMon}});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("TileResolve Distributes each free window, maximized, on a single display", "[reducer][tile]") {
+    // No rules → every window is free. One display → each maximizes in place (target
+    // nullopt, since its own display always ties for least-occupied).
+    const auto r = reduce(State{}, TileResolve{{probed(WindowId{1}, "code.exe", "cls", "Code")}, {kMon}});
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{1}, std::nullopt, Slot::Maximized});
+}
+
+TEST_CASE("TileResolve balances free windows across displays, including empty ones", "[reducer][tile]") {
+    const MonitorId monA{1}, monB{2};
+    // Two free windows both currently on monA; tile spreads them across both displays.
+    ProbedWindow w1 = probedOn(WindowId{1}, "a.exe", "cls", "A", monA);
+    ProbedWindow w2 = probedOn(WindowId{2}, "b.exe", "cls", "B", monA);
+
+    const auto r = reduce(State{}, TileResolve{{w1, w2}, {monA, monB}});
+
+    REQUIRE(r.effects.size() == 2);
+    // w1: monA ties the min (both 0) → stays put (nullopt); monA's count becomes 1.
+    REQUIRE(std::get<PositionWindow>(r.effects[0]) ==
+            PositionWindow{WindowId{1}, std::nullopt, Slot::Maximized});
+    // w2: monA is now 1, monB still 0 → monB is least-occupied → moved there.
+    REQUIRE(std::get<PositionWindow>(r.effects[1]) ==
+            PositionWindow{WindowId{2}, monB, Slot::Maximized});
+}
+
+TEST_CASE("TileResolve counts a fixed window's occupancy so a free window balances away from it", "[reducer][tile]") {
+    const MonitorId monA{1}, monB{2};
+    const State s = stateWith({exeRule(5, "pinned.exe")});  // workspace-only Place
+    // A pinned window on monA (counted, not moved) and a free window also on monA.
+    ProbedWindow pinned = probedOn(WindowId{1}, "pinned.exe", "cls", "P", monA);
+    ProbedWindow freeW = probedOn(WindowId{2}, "free.exe", "cls", "F", monA);
+
+    const auto r = reduce(s, TileResolve{{pinned, freeW}, {monA, monB}});
+
+    // Only the free window is placed; monA already carries the pinned window (count 1)
+    // so the empty monB wins and the free window moves there.
+    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{2}, monB, Slot::Maximized});
+}
+
+TEST_CASE("TileResolve with no displays enumerated still places free windows in place", "[reducer][tile]") {
+    // Degenerate: no Displays reported → pickDistributeTarget yields nullopt, so each
+    // free window maximizes on its current monitor rather than being dropped.
+    const auto r = reduce(State{}, TileResolve{{probed(WindowId{1}, "code.exe", "cls", "Code")}, {}});
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{1}, std::nullopt, Slot::Maximized});
 }
 
 // ── windowrule ignore action + the ignored set ───────────────────────────────
@@ -567,100 +727,133 @@ TEST_CASE("Vanished clears an ignored id so the window becomes a focus target ag
             winspace::SetForegroundWindow{WindowId{2}});
 }
 
-// ── windowrule spread action + the Empty-Display round-trip (ADR-0015) ────────
+// ── Distribute: auto-placement round-trip + pickDistributeTarget (ADR-0020) ───
 //
-// Spread is a two-phase Probe round-trip mirroring Spatial focus (ADR-0008): an
-// Eligible Appeared matching a Spread rule emits a ResolveSpread request (no
-// geometry yet — the pure Reducer cannot enumerate Displays), and the probed
-// occupancy re-enters as a SpreadResolve Event the Reducer turns into a single
-// PositionWindow (or nothing, on overflow). These feed synthetic Events and assert
-// on the emitted Effect, exactly like the focus and rules tests — the whole
-// decision surface is pure and testable here with no live windows.
+// Distribute is a two-phase Probe round-trip mirroring Spatial focus (ADR-0008): an
+// Eligible Appeared matching NO rule emits a ResolveDistribute request (no geometry
+// yet — the pure Reducer cannot enumerate Displays), and the probed Display counts
+// re-enter as a DistributeResolve Event the Reducer turns into a single
+// PositionWindow (always — there is no overflow no-op). These feed synthetic Events
+// and assert on the emitted Effect; the balancing brain (pickDistributeTarget) is
+// unit-tested directly below, like rectForSlot, with no Win32.
 
-TEST_CASE("an Appeared matching a Spread rule emits exactly ResolveSpread{thatId} and no geometry", "[reducer][rules][spread]") {
-    const State s = stateWith({spreadExeRule("term.exe")});
-
-    const auto r = reduce(s, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
-
-    // Phase one asks the Worker to probe occupancy; it decides no target and writes
-    // no geometry yet.
-    REQUIRE(single_effect<ResolveSpread>(r) == ResolveSpread{WindowId{7}});
+TEST_CASE("an unmatched Eligible Appeared emits exactly ResolveDistribute{thatId} and no geometry", "[reducer][distribute]") {
+    // No rules seeded → nothing matches → Distribute. Phase one only asks the Worker
+    // to probe occupancy; it decides no target and writes no geometry yet.
+    const auto r = reduce(State{}, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+    REQUIRE(single_effect<ResolveDistribute>(r) == ResolveDistribute{WindowId{7}});
 }
 
-TEST_CASE("a Spread window is place-once — a repeat Appeared for the placed id emits nothing", "[reducer][rules][spread]") {
-    const State s = stateWith({spreadExeRule("term.exe")});
-
-    const auto first = reduce(s, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
-    REQUIRE(single_effect<ResolveSpread>(first) == ResolveSpread{WindowId{7}});
+TEST_CASE("a Distributed window is place-once — a repeat Appeared for the placed id emits nothing", "[reducer][distribute]") {
+    const auto first = reduce(State{}, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
+    REQUIRE(single_effect<ResolveDistribute>(first) == ResolveDistribute{WindowId{7}});
 
     // Same id again (an uncloak), reduced against the state the first Appeared left:
-    // it is already `placed`, so Spread never re-probes — a dragged window is not
-    // yanked back.
+    // it is already `placed`, so Distribute never re-probes — a dragged window is not
+    // yanked back (story 8).
     const auto second = reduce(first.state, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
     REQUIRE(second.effects.empty());
 }
 
-TEST_CASE("SpreadResolve with one Empty Display emits PositionWindow targeting it", "[reducer][rules][spread]") {
-    // Two Displays occupied, one empty; the Reducer picks the empty one.
-    const SpreadResolve sr{WindowId{7},
-                           {{MonitorId{10}, true}, {MonitorId{20}, false}, {MonitorId{30}, true}}};
-
-    const auto r = reduce(State{}, sr);
-
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
-}
-
-TEST_CASE("SpreadResolve with every Display occupied emits nothing (overflow → no placement)", "[reducer][rules][spread]") {
-    const SpreadResolve sr{WindowId{7}, {{MonitorId{10}, true}, {MonitorId{20}, true}}};
-
-    const auto r = reduce(State{}, sr);
-
-    // Overflow: no Empty Display, so no Effect — the window is left where the OS
-    // opened it, never forced onto the focused Display.
-    REQUIRE(r.effects.empty());
-}
-
-TEST_CASE("the subject's own Display never counts as occupied (exclude-self)", "[reducer][rules][spread]") {
-    // The Worker excludes the subject when it builds occupancy, so the subject's own
-    // opening Display arrives here flagged !occupied. This asserts the Reducer honors
-    // that flag: with the subject the only window and its Display reported empty, that
-    // Display is chosen rather than read as occupied and defeating placement.
-    const SpreadResolve sr{WindowId{7}, {{MonitorId{20}, false}}};
-
-    const auto r = reduce(State{}, sr);
-
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
-}
-
-TEST_CASE("an Ineligible Appeared matching a Spread rule probes nothing; a later Eligible edge does", "[reducer][rules][spread]") {
-    const State s = stateWith({spreadExeRule("term.exe")});
-
+TEST_CASE("an Ineligible unmatched Appeared probes nothing; a later Eligible edge Distributes", "[reducer][distribute]") {
     // First edge: cloaked → Ineligible. Emits nothing AND must not burn place-once.
     Appeared cloaked = appeared(WindowId{7}, "term.exe", "cls", "Terminal");
     cloaked.attrs.cloaked = true;
-    const auto first = reduce(s, cloaked);
+    const auto first = reduce(State{}, cloaked);
     REQUIRE(first.effects.empty());
 
     // Second edge for the SAME id, now Eligible (UNCLOAKED) — the probe fires here.
     const auto second = reduce(first.state, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
-    REQUIRE(single_effect<ResolveSpread>(second) == ResolveSpread{WindowId{7}});
+    REQUIRE(single_effect<ResolveDistribute>(second) == ResolveDistribute{WindowId{7}});
 }
 
-TEST_CASE("SpreadResolve leaves State untouched and picks the first Empty Display in list order", "[reducer][rules][spread]") {
+TEST_CASE("DistributeResolve maximizes the subject on the least-occupied Display", "[reducer][distribute]") {
+    // Subject sits on the busiest Display; the emptiest one wins.
+    const DistributeResolve dr{WindowId{7}, MonitorId{10},
+                               {{MonitorId{10}, 2}, {MonitorId{20}, 0}, {MonitorId{30}, 1}}};
+
+    const auto r = reduce(State{}, dr);
+
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, MonitorId{20}, Slot::Maximized});
+}
+
+TEST_CASE("DistributeResolve always places — no overflow no-op even when every Display carries windows", "[reducer][distribute]") {
+    // Every Display occupied; the subject is on the busier one. It still lands on the
+    // least-occupied Display (overlap accepted), never left where the OS opened it.
+    const DistributeResolve dr{WindowId{7}, MonitorId{10},
+                               {{MonitorId{10}, 2}, {MonitorId{20}, 1}}};
+
+    const auto r = reduce(State{}, dr);
+
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, MonitorId{20}, Slot::Maximized});
+}
+
+TEST_CASE("DistributeResolve keeps the subject put when its Display ties for least-occupied", "[reducer][distribute]") {
+    // The subject already sits on a least-occupied Display → target nullopt (its
+    // current monitor), only maximized, never jumped to another monitor (story 13).
+    const DistributeResolve dr{WindowId{7}, MonitorId{20},
+                               {{MonitorId{10}, 1}, {MonitorId{20}, 1}}};
+
+    const auto r = reduce(State{}, dr);
+
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, std::nullopt, Slot::Maximized});
+}
+
+TEST_CASE("DistributeResolve leaves State untouched (place-once was recorded on Appeared)", "[reducer][distribute]") {
     State s;
     s.currentWorkspace = 3;
     s.placed = {WindowId{7}};  // already placed when the subject Appeared
 
-    // Two Empty Displays: the FIRST in list order wins (deterministic, best-effort).
-    const SpreadResolve sr{WindowId{7},
-                           {{MonitorId{10}, true}, {MonitorId{20}, false}, {MonitorId{30}, false}}};
+    const DistributeResolve dr{WindowId{7}, MonitorId{10}, {{MonitorId{10}, 1}, {MonitorId{20}, 0}}};
 
-    const auto r = reduce(s, sr);
+    const auto r = reduce(s, dr);
 
-    REQUIRE(single_effect<PositionWindow>(r) == PositionWindow{WindowId{7}, MonitorId{20}});
-    // Phase two persists nothing — place-once was recorded back on Appeared.
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, MonitorId{20}, Slot::Maximized});
     REQUIRE(r.state.currentWorkspace == 3);
     REQUIRE(r.state.placed == std::unordered_set<WindowId>{WindowId{7}});
+}
+
+// ── pickDistributeTarget: the pure balancing decision (ADR-0020) ──────────────
+
+TEST_CASE("pickDistributeTarget picks the least-occupied Display", "[reducer][distribute]") {
+    const std::vector<DisplayOccupancy> counts{
+        {MonitorId{10}, 2}, {MonitorId{20}, 0}, {MonitorId{30}, 1}};
+    // The subject is on the busiest Display, so no tie keeps it put — the emptiest wins.
+    REQUIRE(pickDistributeTarget(counts, MonitorId{10}) == MonitorId{20});
+}
+
+TEST_CASE("pickDistributeTarget prefers the current Display when it ties for least-occupied", "[reducer][distribute]") {
+    const std::vector<DisplayOccupancy> counts{{MonitorId{10}, 1}, {MonitorId{20}, 1}};
+    // current ties the minimum → nullopt (keep it put, no pointless cross-monitor jump).
+    REQUIRE(pickDistributeTarget(counts, MonitorId{20}) == std::nullopt);
+}
+
+TEST_CASE("pickDistributeTarget breaks a tie by first-in-order when current is not least-occupied", "[reducer][distribute]") {
+    const std::vector<DisplayOccupancy> counts{
+        {MonitorId{10}, 0}, {MonitorId{20}, 2}, {MonitorId{30}, 0}};
+    // current (mon20) is the busiest; two Displays tie at 0 → the FIRST in order wins.
+    REQUIRE(pickDistributeTarget(counts, MonitorId{20}) == MonitorId{10});
+}
+
+TEST_CASE("pickDistributeTarget with the current Display absent picks the first least-occupied", "[reducer][distribute]") {
+    const std::vector<DisplayOccupancy> counts{{MonitorId{10}, 0}, {MonitorId{20}, 0}};
+    // current (mon99) is on none of the enumerated Displays → first least-occupied
+    // in order (story 14).
+    REQUIRE(pickDistributeTarget(counts, MonitorId{99}) == MonitorId{10});
+}
+
+TEST_CASE("pickDistributeTarget on a single Display keeps the window put", "[reducer][distribute]") {
+    const std::vector<DisplayOccupancy> counts{{MonitorId{10}, 3}};
+    // One display always ties itself for least-occupied → nullopt (maximize in place).
+    REQUIRE(pickDistributeTarget(counts, MonitorId{10}) == std::nullopt);
+}
+
+TEST_CASE("pickDistributeTarget with no Displays yields nullopt", "[reducer][distribute]") {
+    REQUIRE(pickDistributeTarget({}, MonitorId{10}) == std::nullopt);
 }
 
 // ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────
@@ -832,6 +1025,75 @@ TEST_CASE("startAtLogin round-trips through State and no Event emits an Effect f
 
     // A default State carries false through unchanged.
     REQUIRE_FALSE(reduce(State{}, WorkspaceSwitch{1}).state.startAtLogin);
+}
+
+// ── slot geometry: rectForSlot pure arithmetic (ADR-0016) ────────────────────
+//
+// The highest-value unit surface: the fraction arithmetic tested with no Win32.
+// A representative work area whose width and height are BOTH even, so the halves
+// split exactly and the quarters meet on a clean midpoint (odd-pixel handling is
+// its own case below). Origin is offset (100, 50) to prove the math respects a
+// work area that does not start at (0, 0) — e.g. a taskbar-inset or second monitor.
+
+namespace {
+// left=100 top=50 right=1300 bottom=850 → 1200 × 800, mid at (700, 450).
+constexpr Rect kWork{100, 50, 1300, 850};
+constexpr int kMidX = 700;
+constexpr int kMidY = 450;
+}  // namespace
+
+TEST_CASE("rectForSlot: halves split the work area on the midpoint", "[reducer][slot]") {
+    REQUIRE(rectForSlot(Slot::LeftHalf, kWork) == Rect{100, 50, kMidX, 850});
+    REQUIRE(rectForSlot(Slot::RightHalf, kWork) == Rect{kMidX, 50, 1300, 850});
+    REQUIRE(rectForSlot(Slot::TopHalf, kWork) == Rect{100, 50, 1300, kMidY});
+    REQUIRE(rectForSlot(Slot::BottomHalf, kWork) == Rect{100, kMidY, 1300, 850});
+}
+
+TEST_CASE("rectForSlot: the four quarters tile with no gap and no overlap", "[reducer][slot]") {
+    const Rect tl = rectForSlot(Slot::TopLeftQuarter, kWork);
+    const Rect tr = rectForSlot(Slot::TopRightQuarter, kWork);
+    const Rect bl = rectForSlot(Slot::BottomLeftQuarter, kWork);
+    const Rect br = rectForSlot(Slot::BottomRightQuarter, kWork);
+
+    REQUIRE(tl == Rect{100, 50, kMidX, kMidY});
+    REQUIRE(tr == Rect{kMidX, 50, 1300, kMidY});
+    REQUIRE(bl == Rect{100, kMidY, kMidX, 850});
+    REQUIRE(br == Rect{kMidX, kMidY, 1300, 850});
+
+    // Adjacent quarters share their common edge exactly — the seam between them is
+    // a zero-area line, so together they cover the whole work area with no gap and
+    // no overlapping interior.
+    REQUIRE(tl.right == tr.left);       // vertical seam, top row
+    REQUIRE(bl.right == br.left);       // vertical seam, bottom row
+    REQUIRE(tl.bottom == bl.top);       // horizontal seam, left column
+    REQUIRE(tr.bottom == br.top);       // horizontal seam, right column
+    // Outer edges reach the work-area bounds.
+    REQUIRE(tl.left == kWork.left);
+    REQUIRE(tr.right == kWork.right);
+    REQUIRE(bl.bottom == kWork.bottom);
+    REQUIRE(tl.top == kWork.top);
+}
+
+TEST_CASE("rectForSlot: maximized covers the full work area", "[reducer][slot]") {
+    REQUIRE(rectForSlot(Slot::Maximized, kWork) == kWork);
+}
+
+TEST_CASE("rectForSlot: an odd-sized work area lands the extra pixel consistently", "[reducer][slot]") {
+    // 1001 × 801 from the origin — an odd span on both axes. The midpoint uses
+    // integer division, so the left/top halves get the floor and the right/bottom
+    // halves absorb the extra pixel; the quarters still meet on the same midpoints.
+    constexpr Rect odd{0, 0, 1001, 801};
+    const int mx = 500;  // 0 + 1001/2
+    const int my = 400;  // 0 + 801/2
+    REQUIRE(rectForSlot(Slot::LeftHalf, odd) == Rect{0, 0, mx, 801});
+    REQUIRE(rectForSlot(Slot::RightHalf, odd) == Rect{mx, 0, 1001, 801});
+    REQUIRE(rectForSlot(Slot::TopHalf, odd) == Rect{0, 0, 1001, my});
+    REQUIRE(rectForSlot(Slot::BottomHalf, odd) == Rect{0, my, 1001, 801});
+    // Quarters still share the seam — no gap opens on the odd axis.
+    REQUIRE(rectForSlot(Slot::TopLeftQuarter, odd).right ==
+            rectForSlot(Slot::TopRightQuarter, odd).left);
+    REQUIRE(rectForSlot(Slot::TopLeftQuarter, odd).bottom ==
+            rectForSlot(Slot::BottomLeftQuarter, odd).top);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1225,48 +1487,99 @@ TEST_CASE("a windowrule ignore with a missing or empty pattern is diagnosed", "[
     REQUIRE(emptyTitle.diagnostics.size() == 1);
 }
 
-// ── windowrule spread action (ADR-0015) ──────────────────────────────────────
+// ── windowrule spread action retired (ADR-0020) ──────────────────────────────
 
-TEST_CASE("windowrule spread parses to a Spread-action rule for each match field", "[config]") {
+TEST_CASE("the retired spread action is diagnosed with a distribution-is-automatic message", "[config]") {
+    // ADR-0020 removed `spread`: distribution is now automatic for every eligible
+    // window. A ported config still carrying it earns a targeted diagnostic (naming
+    // automatic distribution) rather than becoming a rule.
     const auto result = parse(
         "windowrule = spread, exe:Term.exe\n"
-        "windowrule = spread, class:CASCADIA_HOSTING_WINDOW_CLASS\n"
-        "windowrule = spread, title:^Term\n");
+        "windowrule = workspace 2, exe:bar.exe\n");
+
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+    REQUIRE(result.diagnostics[0].message.find("automatic") != std::string::npos);
+    // No spread rule is produced; the following valid rule still parses.
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].pattern == "bar.exe");
+}
+
+// ── windowrule slot suffix (ADR-0016) ────────────────────────────────────────
+
+TEST_CASE("a windowrule with no slot parses to the no-slot state (regression guard)", "[config]") {
+    // Story 16: existing configs are unaffected — a slotless workspace rule keeps
+    // its exact meaning and its slot is nullopt.
+    const auto result = parse("windowrule = workspace 2, exe:slack.exe\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].action == RuleAction::Place);
+    REQUIRE(result.config.rules[0].workspace == 2);
+    REQUIRE_FALSE(result.config.rules[0].slot.has_value());
+}
+
+TEST_CASE("a valid slot suffix parses to the matching Slot", "[config]") {
+    const auto result = parse(
+        "windowrule = workspace 2 slot right-half, exe:slack.exe\n"
+        "windowrule = workspace 1 slot maximized, class:Chrome_WidgetWin_1\n"
+        "windowrule = workspace 3 slot top-left-quarter, title:^Term\n");
 
     REQUIRE(result.diagnostics.empty());
     REQUIRE(result.config.rules.size() == 3);
 
-    // Spread carries no workspace number; the match field/pattern parse exactly as a
-    // Place or Ignore rule (exe/class lowercased, title compiled).
-    REQUIRE(result.config.rules[0].action == RuleAction::Spread);
-    REQUIRE(result.config.rules[0].field == Field::Exe);
-    REQUIRE(result.config.rules[0].pattern == "term.exe");  // lowercased
+    REQUIRE(result.config.rules[0].workspace == 2);
+    REQUIRE(result.config.rules[0].slot == Slot::RightHalf);
 
-    REQUIRE(result.config.rules[1].action == RuleAction::Spread);
-    REQUIRE(result.config.rules[1].field == Field::Class);
-    REQUIRE(result.config.rules[1].pattern == "cascadia_hosting_window_class");
+    REQUIRE(result.config.rules[1].workspace == 1);
+    REQUIRE(result.config.rules[1].slot == Slot::Maximized);
 
-    REQUIRE(result.config.rules[2].action == RuleAction::Spread);
-    REQUIRE(result.config.rules[2].field == Field::Title);
-    REQUIRE(std::regex_search(std::string("Terminal"), result.config.rules[2].regex));
+    REQUIRE(result.config.rules[2].workspace == 3);
+    REQUIRE(result.config.rules[2].slot == Slot::TopLeftQuarter);
 }
 
-TEST_CASE("spread is a recognized action, not swallowed by the removed-with-tiling Diagnostic", "[config]") {
-    // `spread` is a real action (it is NOT in the removed-tiling name list), so it
-    // parses cleanly rather than earning a targeted or generic Diagnostic.
-    const auto result = parse("windowrule = spread, exe:foo.exe\n");
-
+TEST_CASE("slot names are matched case-insensitively", "[config]") {
+    const auto result = parse("windowrule = workspace 2 slot LEFT-HALF, exe:slack.exe\n");
     REQUIRE(result.diagnostics.empty());
     REQUIRE(result.config.rules.size() == 1);
-    REQUIRE(result.config.rules[0].action == RuleAction::Spread);
+    REQUIRE(result.config.rules[0].slot == Slot::LeftHalf);
 }
 
-TEST_CASE("a malformed spread windowrule is diagnosed, not silently no-op'd", "[config]") {
-    // Missing the field colon — a typo must still surface a Diagnostic.
-    const auto result = parse("windowrule = spread, foo.exe\n");
+TEST_CASE("an unknown slot name is diagnosed and skips only that rule", "[config]") {
+    // Story 14: a mistyped slot names the vocabulary and drops just its line — the
+    // following valid rule still parses.
+    const auto result = parse(
+        "windowrule = workspace 2 slot rihgt-half, exe:slack.exe\n"
+        "windowrule = workspace 3 slot left-half, exe:code.exe\n");
 
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].line == 1);
+    REQUIRE(result.diagnostics[0].message.find("rihgt-half") != std::string::npos);
+    // Only the good rule survives.
+    REQUIRE(result.config.rules.size() == 1);
+    REQUIRE(result.config.rules[0].workspace == 3);
+    REQUIRE(result.config.rules[0].slot == Slot::LeftHalf);
+}
+
+TEST_CASE("slot without a name is diagnosed", "[config]") {
+    const auto result = parse("windowrule = workspace 2 slot, exe:slack.exe\n");
     REQUIRE(result.config.rules.empty());
     REQUIRE(result.diagnostics.size() == 1);
+}
+
+TEST_CASE("a token other than slot after the workspace number is diagnosed", "[config]") {
+    const auto result = parse("windowrule = workspace 2 zzz right-half, exe:slack.exe\n");
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].message.find("zzz") != std::string::npos);
+}
+
+TEST_CASE("slot on an ignore rule is diagnosed", "[config]") {
+    // Story 15: slot is Place-only; on ignore it is a meaningless combination.
+    const auto result = parse("windowrule = ignore slot right-half, exe:dock.exe\n");
+    REQUIRE(result.config.rules.empty());
+    REQUIRE(result.diagnostics.size() == 1);
+    REQUIRE(result.diagnostics[0].message.find("ignore") != std::string::npos);
 }
 
 // ── start_at_login setting ───────────────────────────────────────────────────
@@ -1302,6 +1615,16 @@ TEST_CASE("the reload dispatcher parses as a zero-argument bind", "[config]") {
     REQUIRE(result.config.binds.size() == 1);
     REQUIRE(result.config.binds[0] ==
             Bind{Mod::Super | Mod::Shift, Key::R, Dispatcher::Reload, 0});
+}
+
+// ── tile dispatcher (ADR-0016) ───────────────────────────────────────────────
+
+TEST_CASE("the tile dispatcher parses as a zero-argument bind", "[config]") {
+    const auto result = parse("bind = SUPER, T, tile\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 1);
+    REQUIRE(result.config.binds[0] == Bind{Mod::Super, Key::T, Dispatcher::Tile, 0});
 }
 
 // ── removed-with-tiling diagnostics ──────────────────────────────────────────
