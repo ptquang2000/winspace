@@ -31,26 +31,31 @@
     prove geometry, not the cross-desktop pin (that is WindowRules.Tests.ps1's job).
 #>
 
-# Mirror of winspace::rectForSlot (src/winspace.cpp) in PowerShell — the same
-# integer midpoint arithmetic, so the harness computes the identical expected rect
-# the adapter targets. Only the Slots the seams below use are implemented.
-function Get-ExpectedSlotRect {
-    param([Parameter(Mandatory)]$WorkArea, [Parameter(Mandatory)][string]$Slot)
-    $midX = $WorkArea.left + [int][math]::Floor(($WorkArea.right - $WorkArea.left) / 2)
-    $midY = $WorkArea.top + [int][math]::Floor(($WorkArea.bottom - $WorkArea.top) / 2)
-    switch ($Slot) {
-        'left-half'   { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $midX; bottom = $WorkArea.bottom } }
-        'right-half'  { return [pscustomobject]@{ left = $midX; top = $WorkArea.top; right = $WorkArea.right; bottom = $WorkArea.bottom } }
-        'top-half'    { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $WorkArea.right; bottom = $midY } }
-        'bottom-half' { return [pscustomobject]@{ left = $WorkArea.left; top = $midY; right = $WorkArea.right; bottom = $WorkArea.bottom } }
-        'maximized'   { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $WorkArea.right; bottom = $WorkArea.bottom } }
-        default { throw "Get-ExpectedSlotRect: unhandled slot '$Slot'" }
-    }
-}
-
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot 'WinspaceTest.psm1') -Force
     Assert-InteractiveSession   # loud gate before any Trigger reaches the desktop
+
+    # Mirror of winspace::rectForSlot (src/winspace.cpp) in PowerShell — the same
+    # integer midpoint arithmetic, so the harness computes the identical expected rect
+    # the adapter targets. Only the Slots the seams below use are implemented. Defined
+    # HERE with the `script:` scope (not at file scope) so it is available in the run
+    # phase: Pester v5 executes top-level file code only during discovery, so a
+    # file-scope function is gone by the time an It block runs. The `script:` modifier
+    # lands it in the same scope the `$script:Slot*` vars below use — proven reachable
+    # from the It blocks.
+    function script:Get-ExpectedSlotRect {
+        param([Parameter(Mandatory)]$WorkArea, [Parameter(Mandatory)][string]$Slot)
+        $midX = $WorkArea.left + [int][math]::Floor(($WorkArea.right - $WorkArea.left) / 2)
+        $midY = $WorkArea.top + [int][math]::Floor(($WorkArea.bottom - $WorkArea.top) / 2)
+        switch ($Slot) {
+            'left-half'   { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $midX; bottom = $WorkArea.bottom } }
+            'right-half'  { return [pscustomobject]@{ left = $midX; top = $WorkArea.top; right = $WorkArea.right; bottom = $WorkArea.bottom } }
+            'top-half'    { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $WorkArea.right; bottom = $midY } }
+            'bottom-half' { return [pscustomobject]@{ left = $WorkArea.left; top = $midY; right = $WorkArea.right; bottom = $WorkArea.bottom } }
+            'maximized'   { return [pscustomobject]@{ left = $WorkArea.left; top = $WorkArea.top; right = $WorkArea.right; bottom = $WorkArea.bottom } }
+            default { throw "Get-ExpectedSlotRect: unhandled slot '$Slot'" }
+        }
+    }
 
     # A distinct title so the rule (and each seam's Oracle) keys on exactly this
     # window, never the runner console or a helper powershell.
