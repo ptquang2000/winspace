@@ -42,6 +42,16 @@ One physical monitor. All Displays switch Workspace together (global switch); ea
 stays on its own Display across a switch.
 _Avoid_: Monitor, Screen.
 
+**Empty Display**:
+A Display carrying **zero Eligible windows on the current Workspace**. "Empty" is about
+Eligible windows only — wallpaper, taskbar, and Ineligible windows never count, and a window
+parked on another Virtual Desktop does not occupy the Display while that Workspace is hidden.
+The target concept for the **Spread** WindowRule action: a matching window is relocated onto an
+Empty Display on `Appeared`, and when none remains the action is a no-op (**overflow → no
+placement** — the window is left Eligible and untouched wherever the OS opened it).
+_Avoid_: Free monitor, empty screen, Floating (there is no layout to float above — that term
+died with tiling, ADR-0007).
+
 ### The core seam
 
 **Reducer**:
@@ -145,13 +155,15 @@ inherits the *windows*, Adoption inherits the *desktops*.
 
 **WindowRule**:
 A parsed `windowrule` carrying one **action** — **Place** (`workspace N`, pin a matching app to
-a target Workspace on `Appeared`) or **Ignore** (exclude a matching window from Spatial focus).
+a target Workspace on `Appeared`), **Ignore** (exclude a matching window from Spatial focus), or
+**Spread** (`spread`, relocate a matching app onto an **Empty Display** on `Appeared`; see below).
 One rule names **one** match field and a pattern (`exe:…`, `class:…`, or `title:…`); `exe`/`class`
 match case-insensitively and exactly, `title` is a regex. Rules are evaluated in the fixed
 field precedence **exe → class → title** (config order breaks within-field ties), first match
 wins — and the winning rule's *action* is what applies (a window matching both an Ignore and a
-Place rule resolves by that same first-match order). **Place-once** / **Ignore-set** (see below)
-and Workspace-or-focus only — never geometry.
+Place rule resolves by that same first-match order). Place, Ignore and Spread are all keyed on
+`WindowIdentity`, fired on `Appeared`, and **place-once**. Spread is the **lone** action that
+writes geometry — the single bounded exception to ADR-0007 ([ADR-0015](docs/adr/0015-spread-bounded-geometry-write-to-empty-display.md)).
 _Avoid_: windowrulev2, layer rule.
 
 **WindowIdentity**:
@@ -182,6 +194,24 @@ never freezes focus navigation. Like Place-once, it is **not re-asserted on relo
 rule added at reload only takes effect for a matching window when it next `Appears`.
 _Avoid_: unmanaged, blacklist, Ineligible (an Ignored window IS Eligible — it is excluded by
 rule, not by the Eligibility gate).
+
+**Spread** *(the action)*:
+The third **WindowRule** action (`windowrule = exe:…, spread`): on a matching window's first
+Eligible `Appeared`, relocate it **once** onto an **Empty Display**. Parallel to **Place** but
+targeting a Display, not a Workspace, and — uniquely — it **writes geometry**. Empty Display is
+resolved **statelessly**: a Probe round-trip (mirroring Spatial focus, ADR-0008) enumerates the
+Displays that already carry an Eligible window on the current Workspace, and the Reducer picks one
+that carries none (the subject window excluded from the count). It is **place-once** (recorded in
+`placed`, erased on `Vanished`, never re-asserted on uncloak or reload — a dragged window is not
+yanked back). Two boundaries: **overflow → no placement** (no Empty Display left → emit nothing;
+the window is left where the OS opened it, never forced onto the focused Display), and
+**best-effort under bursts** (no persisted occupancy, so a simultaneous burst of matching windows
+may collide on one Empty Display — accepted, since overflow is a benign no-op). The move is the
+lone `PositionWindow` Effect — a single `SetWindowPos`, never a `layout()` — the bounded reversal
+of ADR-0007 that [ADR-0015](docs/adr/0015-spread-bounded-geometry-write-to-empty-display.md)
+records, the geometry twin of Place-once's bounded-state reversal (ADR-0009).
+_Avoid_: Tile, fill, distribute, balance (Spread relocates one window per Empty Display on
+`Appeared` — it is not a continuous layout that rebalances as windows come and go).
 
 ### Launcher
 
