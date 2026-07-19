@@ -901,9 +901,11 @@ inline ReduceResult reduce(const State& s, const Event& e) {
                 std::vector<Effect> effects;
                 // Baseline occupancy: every live Display at count 0. Fixed windows add
                 // to it; free windows are then balanced against it.
-                std::vector<DisplayOccupancy> counts;
-                counts.reserve(tr.displays.size());
-                for (const MonitorId d : tr.displays) counts.push_back({d, 0});
+                auto counts = tr.displays |
+                              std::views::transform([](MonitorId d) {
+                                  return DisplayOccupancy{d, 0};
+                              }) |
+                              std::ranges::to<std::vector>();
                 const auto bump = [&](MonitorId m) {
                     if (const auto d = std::ranges::find(counts, m, &DisplayOccupancy::id);
                         d != counts.end())
@@ -1243,9 +1245,11 @@ inline constexpr std::pair<std::string_view, Slot> k_slot_names[] = {
 };
 
 inline std::optional<Slot> parse_slot(std::string_view t) {
-    for (const auto& [name, slot] : k_slot_names)
-        if (iequals(t, name)) return slot;
-    return std::nullopt;
+    const auto it = std::ranges::find_if(
+        k_slot_names, [&](std::string_view name) { return iequals(t, name); },
+        &std::pair<std::string_view, Slot>::first);
+    if (it == std::ranges::end(k_slot_names)) return std::nullopt;
+    return it->second;
 }
 
 // The vocabulary rendered as `a|b|c…` for a per-line Diagnostic (cold path — an

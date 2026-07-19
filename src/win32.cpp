@@ -2190,10 +2190,10 @@ private:
                     // current monitor is captured separately so the Reducer's tie-break
                     // can prefer keeping it put.
                     const auto monitors = enumerateDisplays();
-                    std::vector<DisplayOccupancy> displays(monitors.size());
-                    std::ranges::transform(monitors, displays.begin(), [](MonitorId id) {
-                        return DisplayOccupancy{.id = id, .count = 0};
-                    });
+                    auto displays = monitors | std::views::transform([](MonitorId id) {
+                                        return DisplayOccupancy{.id = id, .count = 0};
+                                    }) |
+                                    std::ranges::to<std::vector>();
 
                     const auto windows = probeTopLevelWindows();
                     auto occupiedMonitors =
