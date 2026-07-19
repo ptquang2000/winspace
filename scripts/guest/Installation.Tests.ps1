@@ -8,7 +8,7 @@
     winspace_test.cpp ([command]). This seam proves only what that cannot: that the
     running binary actually enforces single-instance, that the headless commands
     genuinely drive the OS (register/remove the Logon task, quit a live
-    Orchestrator, release the exe's file lock), and that the hybrid
+    Primary, release the exe's file lock), and that the hybrid
     message-if-running / else-direct routing works both ways.
 
     Oracle policy (ADR-0005): assert on independent OS state — the Task Scheduler
@@ -49,7 +49,7 @@ start_at_login = false
 
     # The number of LIVE winspace WM processes running from the e2e exe — the
     # single-instance Oracle. Headless install/uninstall helpers are short-lived and
-    # -Wait'd out before any assertion, so this counts only persistent Orchestrators.
+    # -Wait'd out before any assertion, so this counts only persistent Primarys.
     function script:Get-RunningWinspaceCount {
         return @(Get-Process -Name 'winspace' -ErrorAction SilentlyContinue |
                 Where-Object { $_.Path -eq (Get-WinspaceExe) }).Count
@@ -80,7 +80,7 @@ AfterAll {
 Describe 'installation' {
 
     # Single-instance. The WM owns exclusive OS resources (hotkeys + the VD bridge),
-    # so a second bare `winspace` must detect the live Orchestrator and exit rather
+    # so a second bare `winspace` must detect the live Primary and exit rather
     # than raise a competing WM. Oracle: process count stays 1 and the second launch
     # exits promptly. NB: the second launch is NOT Start-Winspace — it never logs
     # 'adopted' (it exits before adoption), so it is launched directly and waited on.
@@ -89,14 +89,14 @@ Describe 'installation' {
         try {
             Set-WinspaceConfig -Content $script:ConfigOff | Out-Null
             $first = Start-Winspace
-            Get-RunningWinspaceCount | Should -Be 1 -Because 'the first launch is the sole Orchestrator'
+            Get-RunningWinspaceCount | Should -Be 1 -Because 'the first launch is the sole Primary'
 
             $second = Start-Process -FilePath (Get-WinspaceExe) -PassThru
             Wait-Until -Because 'the second (contending) launch to exit on the single-instance guard' -Condition {
                 $second.HasExited
             }
             $second.ExitCode | Should -Be 0 -Because 'starting winspace twice is a successful no-op, not an error'
-            $first.HasExited | Should -BeFalse -Because 'the original Orchestrator must survive the second launch'
+            $first.HasExited | Should -BeFalse -Because 'the original Primary must survive the second launch'
             Get-RunningWinspaceCount | Should -Be 1 -Because 'the second launch must not add a competing WM'
         } catch {
             Save-FailureScreenshot -Name 'installation-single-instance'
@@ -107,10 +107,10 @@ Describe 'installation' {
         }
     }
 
-    # `winspace install`, no Orchestrator, flag ON. The headless one-shot sync reads
+    # `winspace install`, no Primary, flag ON. The headless one-shot sync reads
     # the config directly and registers the per-user \winspace logon task. Oracle: the
     # task exists after the command; the command exits 0; no WM is left running.
-    It 'install with no orchestrator and start_at_login on registers the logon task' -Tag 'installation' {
+    It 'install with no primary and start_at_login on registers the logon task' -Tag 'installation' {
         try {
             Remove-WinspaceAutostartTask
             Set-WinspaceConfig -Content $script:ConfigOn | Out-Null
@@ -129,10 +129,10 @@ Describe 'installation' {
         }
     }
 
-    # `winspace install`, no Orchestrator, flag OFF — the never-enable-unbidden case.
+    # `winspace install`, no Primary, flag OFF — the never-enable-unbidden case.
     # With the task absent and the flag off, install must leave autostart untouched:
     # a fresh Scoop install does not start seizing logon hooks (user story 9).
-    It 'install with no orchestrator and start_at_login off never enables autostart' -Tag 'installation' {
+    It 'install with no primary and start_at_login off never enables autostart' -Tag 'installation' {
         try {
             Remove-WinspaceAutostartTask
             Set-WinspaceConfig -Content $script:ConfigOff | Out-Null
@@ -148,19 +148,19 @@ Describe 'installation' {
         }
     }
 
-    # `winspace install` WITH an Orchestrator running — the hybrid message path. The
-    # Orchestrator boots with the flag on (registering the task on Started), the task
+    # `winspace install` WITH a Primary running — the hybrid message path. The
+    # Primary boots with the flag on (registering the task on Started), the task
     # is then removed out-of-band, and `winspace install` fires: it must route a
-    # sync-autostart Control message to the LIVE Orchestrator, which re-registers the
+    # sync-autostart Control message to the LIVE Primary, which re-registers the
     # task from its own live flag. Oracle: the task reappears, no second WM is spawned,
-    # and the Orchestrator stays alive (install never quits it).
-    It 'install with an orchestrator running drives the live instance to re-sync (no second WM)' -Tag 'installation' {
+    # and the Primary stays alive (install never quits it).
+    It 'install with a primary running drives the live instance to re-sync (no second WM)' -Tag 'installation' {
         $winspace = $null
         try {
             Remove-WinspaceAutostartTask
             Set-WinspaceConfig -Content $script:ConfigOn | Out-Null
             $winspace = Start-Winspace
-            Wait-Until -Because 'the orchestrator to register the task on start' -Condition {
+            Wait-Until -Because 'the primary to register the task on start' -Condition {
                 $null -ne (Get-WinspaceAutostartTask)
             }
 
@@ -169,9 +169,9 @@ Describe 'installation' {
             Get-WinspaceAutostartTask | Should -BeNullOrEmpty -Because 'precondition: the task is gone before install'
 
             $code = Invoke-WinspaceCmd -Verb 'install'
-            $code | Should -Be 0 -Because 'messaging a live orchestrator succeeds'
+            $code | Should -Be 0 -Because 'messaging a live primary succeeds'
 
-            Wait-Until -Because 'the live orchestrator to re-register the task via the control channel' -Condition {
+            Wait-Until -Because 'the live primary to re-register the task via the control channel' -Condition {
                 $null -ne (Get-WinspaceAutostartTask)
             }
             $winspace.HasExited | Should -BeFalse -Because 'install must not stop the running WM'
@@ -184,33 +184,33 @@ Describe 'installation' {
         }
     }
 
-    # `winspace uninstall` WITH an Orchestrator running — the file-lock release path,
+    # `winspace uninstall` WITH a Primary running — the file-lock release path,
     # and the `quit` Control message via the clean shutdown path. The command must
-    # remove the task AND stop the live Orchestrator so its exe unlocks. Oracle: the
+    # remove the task AND stop the live Primary so its exe unlocks. Oracle: the
     # task is gone, the process exits, and the exe becomes renamable (the lock is
     # released iff no process holds the image).
-    It 'uninstall with an orchestrator running removes the task and stops the WM (exe unlocks)' -Tag 'installation' {
+    It 'uninstall with a primary running removes the task and stops the WM (exe unlocks)' -Tag 'installation' {
         $winspace = $null
         try {
             Remove-WinspaceAutostartTask
             Set-WinspaceConfig -Content $script:ConfigOn | Out-Null
             $winspace = Start-Winspace
-            Wait-Until -Because 'the orchestrator to register the task on start' -Condition {
+            Wait-Until -Because 'the primary to register the task on start' -Condition {
                 $null -ne (Get-WinspaceAutostartTask)
             }
             $null = $winspace.Handle   # settle HasExited/ExitCode queries
 
             $code = Invoke-WinspaceCmd -Verb 'uninstall'
-            $code | Should -Be 0 -Because 'uninstall messaging a live orchestrator succeeds'
+            $code | Should -Be 0 -Because 'uninstall messaging a live primary succeeds'
 
-            Wait-Until -Because 'the orchestrator to exit via the clean quit path' -Condition {
+            Wait-Until -Because 'the primary to exit via the clean quit path' -Condition {
                 $winspace.HasExited
             }
             Get-WinspaceAutostartTask | Should -BeNullOrEmpty `
                 -Because 'uninstall removes the \winspace\<user> logon task unconditionally'
-            Get-RunningWinspaceCount | Should -Be 0 -Because 'uninstall stops the running Orchestrator'
+            Get-RunningWinspaceCount | Should -Be 0 -Because 'uninstall stops the running Primary'
             Test-ExeUnlocked | Should -BeTrue `
-                -Because 'the stopped Orchestrator released its image lock — the exe is now deletable'
+                -Because 'the stopped Primary released its image lock — the exe is now deletable'
         } catch {
             Save-FailureScreenshot -Name 'installation-uninstall-running'
             throw
@@ -219,11 +219,11 @@ Describe 'installation' {
         }
     }
 
-    # `winspace uninstall` with NO Orchestrator — the direct path. With a task present
+    # `winspace uninstall` with NO Primary — the direct path. With a task present
     # (seeded by an on-launch) and nothing running, uninstall removes the task
     # directly; a second uninstall with the task already gone is a clean no-op
     # (ERROR_FILE_NOT_FOUND counted as success).
-    It 'uninstall with no orchestrator removes the task directly, then is a clean no-op' -Tag 'installation' {
+    It 'uninstall with no primary removes the task directly, then is a clean no-op' -Tag 'installation' {
         $seed = $null
         try {
             # Seed a genuinely-registered task via an on-launch, then stop the WM so

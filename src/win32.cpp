@@ -1694,7 +1694,7 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
 //
 // The out-of-band surface ADR-0019 adds beside the Reducer's Event stream. It is
 // deliberately NOT part of window management: a Control message crosses a process
-// boundary into the Orchestrator's message-only window carrying a SCALAR request
+// boundary into the Primary's message-only window carrying a SCALAR request
 // (never the in-process Event* pointer), and mutates OS artifacts (the Logon
 // task) or lifecycle (quit) outside `reduce`. The install / uninstall commands
 // (the app section) are the only senders; the Worker's wndProc (below) is the
@@ -1702,25 +1702,25 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
 //
 // Discovery is by the Worker window's class name under HWND_MESSAGE — the same
 // message-only window that receives in-process Event posts is what a second
-// process finds to prove an Orchestrator is live. The named mutex is the
+// process finds to prove a Primary is live. The named mutex is the
 // race-free single-instance gate; the window is the addressable control target.
 
 namespace winspace::io {
 
 // The Worker's message-only window class. Shared so the Worker registers/creates
-// under it AND another process can FindWindowEx it to locate the Orchestrator.
+// under it AND another process can FindWindowEx it to locate the Primary.
 inline constexpr std::wstring_view k_workerClassName = L"winspace.worker";
 
 // The single-instance mutex. `Local\` scopes it to the interactive session, so
-// two logged-in accounts on one machine each get their own Orchestrator (matching
+// two logged-in accounts on one machine each get their own Primary (matching
 // the per-user Logon task) and never collide.
-inline constexpr std::wstring_view k_orchestratorMutexName = L"Local\\winspace.orchestrator";
+inline constexpr std::wstring_view k_primaryMutexName = L"Local\\winspace.primary";
 
 // The three cross-process Control requests, carried as the SCALAR wParam of the
 // registered Control message. Values are explicit so the on-the-wire meaning is
 // stable regardless of enum layout.
 enum class Control : WPARAM {
-    SyncAutostart = 1,    // make the Logon task match the Orchestrator's live start_at_login
+    SyncAutostart = 1,    // make the Logon task match the Primary's live start_at_login
     RemoveAutostart = 2,  // delete the Logon task (uninstall)
     Quit = 3,             // graceful shutdown via the clean Shift+Q path
 };
@@ -1735,50 +1735,50 @@ inline UINT controlMessage() {
     return id;
 }
 
-// Discover a live Orchestrator: the Worker's message-only window, found by class
+// Discover a live Primary: the Worker's message-only window, found by class
 // under HWND_MESSAGE. WINEVENT_SKIPOWNPROCESS is irrelevant here — a bare
 // `winspace` command runs in its OWN process, so the window it finds (if any) is
-// genuinely the separate Orchestrator's. Null when none is running.
-inline HWND findOrchestrator() {
+// genuinely the separate Primary's. Null when none is running.
+inline HWND findPrimary() {
     return FindWindowExW(HWND_MESSAGE, nullptr, k_workerClassName.data(), nullptr);
 }
 
 // How long a command waits on a graceful quit before force-killing a wedged
-// Orchestrator (ADR-0019). Long enough for the RAII teardown of the Hotkey/Hook
+// Primary (ADR-0019). Long enough for the RAII teardown of the Hotkey/Hook
 // threads to run, short enough that a stuck instance never blocks scoop update.
 inline constexpr DWORD k_quitTimeoutMs = 5000;
 // The per-message SendMessageTimeout budget for the autostart mutations, so a hung
-// Orchestrator's UI thread cannot wedge the command indefinitely.
+// Primary's UI thread cannot wedge the command indefinitely.
 inline constexpr DWORD k_controlSendTimeoutMs = 5000;
 
-// Send a Control request to a live Orchestrator and wait for it to be handled.
+// Send a Control request to a live Primary and wait for it to be handled.
 // SendMessageTimeout blocks until the Worker's wndProc returns — i.e. the
 // autostart mutation completed — but abandons the wait if the target hangs
-// (SMTO_ABORTIFHUNG) so a wedged Orchestrator degrades rather than blocks. Returns
+// (SMTO_ABORTIFHUNG) so a wedged Primary degrades rather than blocks. Returns
 // true iff the message was delivered and processed within the budget.
-inline bool sendControl(HWND orchestrator, Control request) {
+inline bool sendControl(HWND primary, Control request) {
     DWORD_PTR result = 0;
-    return SendMessageTimeoutW(orchestrator, controlMessage(), static_cast<WPARAM>(request), 0,
+    return SendMessageTimeoutW(primary, controlMessage(), static_cast<WPARAM>(request), 0,
                                SMTO_ABORTIFHUNG, k_controlSendTimeoutMs, &result) != 0;
 }
 
-// Stop a running Orchestrator so its exe unlocks (ADR-0019). Ask for a graceful
+// Stop a running Primary so its exe unlocks (ADR-0019). Ask for a graceful
 // quit down the clean Shift+Q path, then wait on the process handle; if it does
 // not exit within the timeout it is wedged — force-kill as the last-resort
 // fallback (the one place this codebase resorts to OS-level force). Resolving the
 // PID BEFORE requesting quit avoids a race where the window is gone before we look.
-inline void stopOrchestrator(HWND orchestrator) {
+inline void stopPrimary(HWND primary) {
     DWORD pid = 0;
-    GetWindowThreadProcessId(orchestrator, &pid);
+    GetWindowThreadProcessId(primary, &pid);
     const HANDLE proc = pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr;
 
     // Post (don't Send) quit: the window is about to be destroyed, so we do not
     // want to block inside its wndProc — we wait on the process handle instead.
-    PostMessageW(orchestrator, controlMessage(), static_cast<WPARAM>(Control::Quit), 0);
+    PostMessageW(primary, controlMessage(), static_cast<WPARAM>(Control::Quit), 0);
 
     if (!proc) return;  // no handle to wait on — best effort, the quit was posted
     if (WaitForSingleObject(proc, k_quitTimeoutMs) != WAIT_OBJECT_0) {
-        lg::warn("uninstall: orchestrator did not exit within {}ms; force-killing", k_quitTimeoutMs);
+        lg::warn("uninstall: primary did not exit within {}ms; force-killing", k_quitTimeoutMs);
         TerminateProcess(proc, 1);
     }
     CloseHandle(proc);
@@ -1925,7 +1925,7 @@ public:
 
 private:
     // The message-only window class, shared with the control section so another
-    // process can FindWindowEx this exact window to reach the Orchestrator.
+    // process can FindWindowEx this exact window to reach the Primary.
     static constexpr std::wstring_view k_className = k_workerClassName;
 
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -1962,7 +1962,7 @@ private:
     void onControl(Control request) {
         switch (request) {
             case Control::SyncAutostart:
-                // Make the Logon task match the Orchestrator's LIVE flag — the
+                // Make the Logon task match the Primary's LIVE flag — the
                 // authoritative single source of truth (possibly just reloaded),
                 // so a running WM never needs its config re-read from disk. Same
                 // declarative executor as the SyncAutostart Effect; degrade-and-log.
@@ -2443,7 +2443,7 @@ using ComApartment = std::unique_ptr<void, decltype([](void*) { CoUninitialize()
 
 // Enter an apartment for the headless install/uninstall commands. Unlike the WM's STA
 // Worker (which owns its own CoInitializeEx), these run on the bare wWinMain thread, and
-// their direct (no-Orchestrator) path drives Task Scheduler 2.0 via syncAutostart's
+// their direct (no-Primary) path drives Task Scheduler 2.0 via syncAutostart's
 // CoCreateInstance — which returns CO_E_NOTINITIALIZED on a thread with no apartment.
 // Apartment-threaded to mirror the Worker (ADR-0013); a one-shot task sync needs no
 // message pump. A failed init yields an empty guard, leaving the failure to surface as
@@ -2456,17 +2456,17 @@ inline ComApartment enterComApartment() {
 
 // The headless `winspace install` command (ADR-0019). Make OS autostart match the
 // config's start_at_login — NEVER enabling it unbidden: the flag stays the single
-// source of truth. Hybrid: a live Orchestrator holds the authoritative (possibly
+// source of truth. Hybrid: a live Primary holds the authoritative (possibly
 // reloaded) flag, so ask IT to sync via a Control message; with none running,
 // load/self-seed the config exactly as the WM does and perform the one-shot sync
 // directly. The Scoop post_install hook invokes this to re-stamp the Logon task to
 // the new versioned location on every update (the moved-binary self-heal) without
 // launching the WM. Returns 0 on success, non-zero so Scoop can read a failure.
 inline int runInstall() {
-    if (const HWND orchestrator = findOrchestrator()) {
-        return sendControl(orchestrator, Control::SyncAutostart) ? 0 : 1;
+    if (const HWND primary = findPrimary()) {
+        return sendControl(primary, Control::SyncAutostart) ? 0 : 1;
     }
-    // No Orchestrator: read start_at_login from config (self-seeding a first-run
+    // No Primary: read start_at_login from config (self-seeding a first-run
     // default) and sync the task directly. A false flag deletes/leaves-absent the
     // task, so a fresh install never starts seizing logon hooks. The direct path owns
     // the COM apartment syncAutostart's Task Scheduler calls require.
@@ -2481,21 +2481,21 @@ inline int runInstall() {
 }
 
 // The headless `winspace uninstall` command (ADR-0019). Remove the
-// `\winspace\<user>` Logon task UNCONDITIONALLY and stop any running Orchestrator
-// so the exe unlocks for deletion. Hybrid: a live Orchestrator removes the task
+// `\winspace\<user>` Logon task UNCONDITIONALLY and stop any running Primary
+// so the exe unlocks for deletion. Hybrid: a live Primary removes the task
 // (remove-autostart) and then is asked to quit gracefully (with a force-kill
 // timeout fallback); with none running, remove the task directly. The Scoop
 // pre_uninstall hook invokes this so uninstall never orphans the task nor fails on
 // the running-process file lock. An absent task counts as success (clean no-op).
 inline int runUninstall() {
-    if (const HWND orchestrator = findOrchestrator()) {
+    if (const HWND primary = findPrimary()) {
         // Remove the task FIRST (while the STA COM thread is still alive to run it),
         // then stop the process so its image unlocks.
-        const bool removed = sendControl(orchestrator, Control::RemoveAutostart);
-        stopOrchestrator(orchestrator);
+        const bool removed = sendControl(primary, Control::RemoveAutostart);
+        stopPrimary(primary);
         return removed ? 0 : 1;
     }
-    // No Orchestrator: remove the task directly. Owns the COM apartment syncAutostart's
+    // No Primary: remove the task directly. Owns the COM apartment syncAutostart's
     // Task Scheduler calls require (the wWinMain thread has none of its own).
     const ComApartment com = enterComApartment();
     if (const auto removed = syncAutostart(false); !removed) {
@@ -2510,15 +2510,15 @@ inline int runUninstall() {
 inline int runApp() {
     // Single-instance guard (ADR-0019). The WM owns EXCLUSIVE OS resources — the
     // global hotkeys and the COM Virtual Desktop bridge — so a second `winspace`
-    // must not raise a competing Orchestrator. The named mutex is the race-free
+    // must not raise a competing Primary. The named mutex is the race-free
     // gate: if it already exists another instance owns the session, so exit 0
     // (starting winspace twice is a successful no-op, not an error — user story 4).
-    // The Orchestrator's message-only window is the addressable control target the
+    // The Primary's message-only window is the addressable control target the
     // install/uninstall commands find; the mutex closes the two-launches-at-once
     // race the window discovery alone cannot.
-    const UniqueHandle instanceMutex(CreateMutexW(nullptr, TRUE, k_orchestratorMutexName.data()));
+    const UniqueHandle instanceMutex(CreateMutexW(nullptr, TRUE, k_primaryMutexName.data()));
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        lg::info("app: an orchestrator is already running; exiting (single-instance)");
+        lg::info("app: a primary is already running; exiting (single-instance)");
         return 0;  // the guard closes our reference; the live owner keeps the mutex
     }
     // Owner (or CreateMutex failed — degrade to unguarded rather than refuse to start).

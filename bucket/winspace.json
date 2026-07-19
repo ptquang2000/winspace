@@ -34,11 +34,11 @@
     "pre_uninstall": [
         "# Remove the \\winspace\\<user> Logon task and gracefully stop the running",
         "# instance so the exe unlocks for deletion (ADR-0019). 'winspace uninstall' is",
-        "# hybrid: it messages a live Orchestrator (remove-autostart + graceful quit,",
+        "# hybrid: it messages a live Primary (remove-autostart + graceful quit,",
         "# with a force-kill timeout fallback) or removes the task directly when none is",
         "# running. An absent task counts as success, so this is a clean no-op on a",
         "# half-installed app. Running the exe does not need write access, so invoking",
-        "# it while the Orchestrator still holds the image lock is fine.",
+        "# it while the Primary still holds the image lock is fine.",
         "$exe = Join-Path $dir 'winspace.exe'",
         "if (Test-Path $exe) { Start-Process -FilePath $exe -ArgumentList 'uninstall' -Wait }"
     ],

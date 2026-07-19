@@ -25,7 +25,7 @@ The constraints that steer the choice:
    (`~\scoop\apps\winspace\<version>\`) with a `current` junction, and `scoop update`
    **deletes the old versioned dir**. This interacts with autostart (ADR-0013 bakes an
    absolute exe path into the Logon task) and with the running process's file lock — handled
-   in [ADR-0019](0019-single-instance-orchestrator-and-control-channel.md), not here.
+   in [ADR-0019](0019-single-instance-primary-and-control-channel.md), not here.
 3. **Solo project, early days.** No community-bucket review process is worth taking on before
    the first release exists.
 
@@ -77,7 +77,7 @@ The constraints that steer the choice:
   its CI artifact, and the manifest that points at it are all one repo.
 - Scoop's versioned-dir/`current`-junction layout and its file-swap-on-update behavior are
   load-bearing for autostart correctness and the running-process file lock; those are the
-  subject of [ADR-0019](0019-single-instance-orchestrator-and-control-channel.md).
+  subject of [ADR-0019](0019-single-instance-primary-and-control-channel.md).
 - `PROVISIONING.md`'s redist step is dropped by [ADR-0018](0018-release-links-crt-statically.md),
   not here — but the self-contained artifact is what lets the Scoop package declare **no**
   `depends`.
