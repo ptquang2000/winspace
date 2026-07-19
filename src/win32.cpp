@@ -1924,20 +1924,26 @@ private:
                     // parked on other Virtual Desktops never count (Empty is
                     // same-Workspace by construction). The subject is excluded so its
                     // own opening Display never reads as occupied and defeats placement.
-                    std::vector<DisplayOccupancy> displays;
-                    for (const MonitorId id : enumerateDisplays())
-                        displays.push_back(DisplayOccupancy{id, false});
-                    for (const WindowAttrs& a : probeTopLevelWindows()) {
-                        if (!isEligible(a) || a.id == rs.subject) continue;
-                        const RECT rc{a.rect.left, a.rect.top, a.rect.right, a.rect.bottom};
-                        const MonitorId mon =
-                            toMonitorId(MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST));
-                        for (DisplayOccupancy& d : displays)
-                            if (d.id == mon) {
-                                d.occupied = true;
-                                break;
-                            }
-                    }
+                    const auto monitors = enumerateDisplays();
+                    std::vector<DisplayOccupancy> displays(monitors.size());
+                    std::ranges::transform(monitors, displays.begin(), [](MonitorId id) {
+                        return DisplayOccupancy{.id = id, .occupied = false};
+                    });
+
+                    const auto windows = probeTopLevelWindows();
+                    auto occupiedMonitors =
+                        windows | std::views::filter([&](const WindowAttrs& a) {
+                            return isEligible(a) && a.id != rs.subject;
+                        }) | std::views::transform([](const WindowAttrs& a) {
+                            const RECT rc{a.rect.left, a.rect.top, a.rect.right, a.rect.bottom};
+                            return toMonitorId(MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST));
+                        });
+                    for (const MonitorId mon : occupiedMonitors)
+                        if (const auto d = std::ranges::find_if(
+                                displays, [&](const DisplayOccupancy& e) { return e.id == mon; });
+                            d != displays.end())
+                            d->occupied = true;
+
                     postEvent(m_hwnd, new Event{SpreadResolve{rs.subject, std::move(displays)}});
                 },
                 [&](const PositionWindow& pw) {
@@ -1949,24 +1955,18 @@ private:
                     // happens once, at placement; winspace never touches the rect again.
                     // Degrade-and-log throughout (ADR-0004): a bad monitor, HWND, or a
                     // failed SetWindowPos logs and returns, never crashes the WM.
-                    MONITORINFO mi{};
-                    mi.cbSize = sizeof(mi);
-                    if (!GetMonitorInfoW(toHmonitor(pw.target), &mi)) {
-                        lg::warn("spread: GetMonitorInfo failed for target display");
-                        return;
-                    }
                     const HWND h = toHwnd(pw.id);
-                    RECT r{};
-                    if (!GetWindowRect(h, &r)) {
+                    if (MONITORINFO mi{.cbSize = sizeof(MONITORINFO)};
+                        !GetMonitorInfoW(toHmonitor(pw.target), &mi)) {
+                        lg::warn("spread: GetMonitorInfo failed for target display");
+                    } else if (RECT r{}; !GetWindowRect(h, &r)) {
                         lg::warn("spread: GetWindowRect failed; leaving window in place");
-                        return;
-                    }
-                    const int w = r.right - r.left;
-                    const int ht = r.bottom - r.top;
-                    if (const auto moved = ok(SetWindowPos(h, nullptr, mi.rcWork.left, mi.rcWork.top,
-                                                           w, ht, SWP_NOZORDER | SWP_NOACTIVATE));
-                        !moved)
+                    } else if (const auto moved = ok(SetWindowPos(
+                                   h, nullptr, mi.rcWork.left, mi.rcWork.top, r.right - r.left,
+                                   r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE));
+                               !moved) {
                         lg::warn("spread: SetWindowPos failed: {}", moved.error());
+                    }
                 },
                 [&](const LaunchApp& l) {
                     // Launch-only (ADR-0011): start a detached child and

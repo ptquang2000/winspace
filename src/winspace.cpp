@@ -690,8 +690,10 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             // Display was excluded upstream by the Worker, so it reads `!occupied` and
             // never defeats its own placement (exclude-self).
             [&](const SpreadResolve& sr) -> ReduceResult {
-                for (const DisplayOccupancy& d : sr.displays)
-                    if (!d.occupied) return {s, {Effect{PositionWindow{sr.subject, d.id}}}};
+                if (const auto d = std::ranges::find_if(
+                        sr.displays, [](const DisplayOccupancy& e) { return !e.occupied; });
+                    d != sr.displays.end())
+                    return {s, {Effect{PositionWindow{sr.subject, d->id}}}};
                 return {s, {}};
             },
             // Startup: emit a LaunchApp for EVERY exec entry, in config
