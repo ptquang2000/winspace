@@ -20,11 +20,14 @@ gate), but the items here are its assumptions.
 | 2 | **VMware Tools** installed and running | `vmctl cp` / `exec` ride the Tools (VIX) backend. No Tools → no deploy, no runner. |
 | 3 | **Autologon enabled** | After a snapshot revert the VM restarts; without autologon it sits at the lock screen with **no interactive session**, and `SendInput` has nowhere to inject. |
 | 4 | **Pester v5** installed for the guest user | The Guest runner (`Invoke-WinspaceSeams`) runs the seam files through Pester and emits JUnit XML. |
-| 5 | **VC++ x64 redistributable** installed | Release winspace links the CRT dynamically (`/MD`); the redist supplies `VCRUNTIME140.dll` / `ucrtbase` in a clean guest. (Debug `/MDd` is rejected host-side and never deployed.) |
-| 6 | **`C:\winspace-e2e\` directory exists** | The deploy root the host copies the exe + guest module into. |
-| 7 | **1-desktop baseline** | Each seam stages its own precondition from a known floor; the create-on-demand seam drives 1 → 3 desktops, then asserts a +1 delta. |
-| 8 | **`vmctl auth` credentials registered on the host** | Guest ops (`cp`, `exec`) authenticate with the guest user. Registered on the **host**, not baked into the snapshot. |
-| 9 | **No hotkey policy — stock shell** | The seeded default is `$mod = ALT`; `Alt+<n>` / `Alt+Shift+<n>` / `Alt+<letter>` all register via `RegisterHotKey` on an **unmodified** Windows 11 (ADR-0014). Nothing needs freeing — do **not** apply `NoWinKeys` or any other policy. The native VD hotkeys (`Win+Ctrl+D` / `Win+Ctrl+F4`) the seams use to stage desktops are OS-level and always available. |
+| 5 | **`C:\winspace-e2e\` directory exists** | The deploy root the host copies the exe + guest module into. |
+| 6 | **1-desktop baseline** | Each seam stages its own precondition from a known floor; the create-on-demand seam drives 1 → 3 desktops, then asserts a +1 delta. |
+| 7 | **`vmctl auth` credentials registered on the host** | Guest ops (`cp`, `exec`) authenticate with the guest user. Registered on the **host**, not baked into the snapshot. |
+| 8 | **No hotkey policy — stock shell** | The seeded default is `$mod = ALT`; `Alt+<n>` / `Alt+Shift+<n>` / `Alt+<letter>` all register via `RegisterHotKey` on an **unmodified** Windows 11 (ADR-0014). Nothing needs freeing — do **not** apply `NoWinKeys` or any other policy. The native VD hotkeys (`Win+Ctrl+D` / `Win+Ctrl+F4`) the seams use to stage desktops are OS-level and always available. |
+
+> No **VC++ redistributable** is needed: the Release build links the CRT statically (`/MT`,
+> [ADR-0018](../docs/adr/0018-release-links-crt-statically.md)), so the deployed exe is
+> self-contained. (Debug `/MDd` is rejected host-side and never deployed.)
 
 ## One-time steps
 
@@ -58,29 +61,24 @@ Install-Module Pester -MinimumVersion 5.0 -Force -SkipPublisherCheck -Scope AllU
 Import-Module Pester -MinimumVersion 5.0    # confirm it loads
 ```
 
-### 4. VC++ x64 redistributable
-Install the latest **Microsoft Visual C++ Redistributable (x64)** (`vc_redist.x64.exe`). Sanity-check
-that a Release winspace runs (it exits only on `$mod SHIFT+Q`, so just confirm it launches without a
-missing-DLL dialog).
-
-### 5. Deploy root + 1-desktop baseline
+### 4. Deploy root + 1-desktop baseline
 
 ```powershell
 New-Item -ItemType Directory -Force -Path 'C:\winspace-e2e'
 # Collapse to a single Virtual Desktop: close extras with Win+Ctrl+F4 until one remains.
 ```
 
-### 6. Register credentials *(host)*
+### 5. Register credentials *(host)*
 
 ```powershell
 vmctl auth set win11-24h2 --user test --password test
 ```
 
-### 7. Capture the baseline snapshot — **logged in**
+### 6. Capture the baseline snapshot — **logged in**
 With the guest booted, auto-logged-in, sitting on a single desktop:
 
 ```powershell
-vmctl snapshot commit win11-24h2 winspace-e2e -m "e2e baseline: autologon, Tools, Pester, redist, 1 desktop"
+vmctl snapshot commit win11-24h2 winspace-e2e -m "e2e baseline: autologon, Tools, Pester, 1 desktop"
 ```
 
 The snapshot **name** must be `winspace-e2e` (the orchestrator's default `-Snapshot`). This is the

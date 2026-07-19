@@ -1,0 +1,59 @@
+{
+    "version": "0.0.1",
+    "description": "A Windows 11 workspace + focus manager that leans on OS-native facilities and stays off the input critical path.",
+    "homepage": "https://github.com/ptquang2000/winspace",
+    "license": "Unlicense",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/ptquang2000/winspace/releases/download/v0.0.1/winspace-0.0.1-x64.zip"
+        }
+    },
+    "bin": "winspace.exe",
+    "pre_install": [
+        "# Stop any running winspace before Scoop swaps files on disk (ADR-0019): a",
+        "# running winspace.exe locks its own image, so scoop update/uninstall fails",
+        "# while it runs. Bounded to THIS app's install root, and it leaves the",
+        "# autostart Logon task UNTOUCHED, so a failed update never disables autostart",
+        "# (post_install re-stamps it). Graceful control-channel quit is reserved for",
+        "# 'winspace uninstall' (pre_uninstall), where a real removal warrants it; a",
+        "# background update force-stops, and the OS reclaims the hotkeys/hooks on exit.",
+        "$appRoot = Split-Path $dir -Parent",
+        "Get-Process -Name 'winspace' -ErrorAction SilentlyContinue |",
+        "    Where-Object { $_.Path -and $_.Path.StartsWith($appRoot, [System.StringComparison]::OrdinalIgnoreCase) } |",
+        "    ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }"
+    ],
+    "post_install": [
+        "# Re-stamp the autostart Logon task to this new versioned location if the",
+        "# user's start_at_login is on (the moved-binary self-heal, ADR-0019) WITHOUT",
+        "# launching the WM. 'winspace install' respects the config flag as the single",
+        "# source of truth and never enables autostart on its own. Stop-and-leave-stopped:",
+        "# no restart on update; autostart (if enabled) brings winspace back next logon.",
+        "$exe = Join-Path $dir 'winspace.exe'",
+        "if (Test-Path $exe) { Start-Process -FilePath $exe -ArgumentList 'install' -Wait }"
+    ],
+    "pre_uninstall": [
+        "# Remove the \\winspace\\<user> Logon task and gracefully stop the running",
+        "# instance so the exe unlocks for deletion (ADR-0019). 'winspace uninstall' is",
+        "# hybrid: it messages a live Primary (remove-autostart + graceful quit,",
+        "# with a force-kill timeout fallback) or removes the task directly when none is",
+        "# running. An absent task counts as success, so this is a clean no-op on a",
+        "# half-installed app. Running the exe does not need write access, so invoking",
+        "# it while the Primary still holds the image lock is fine.",
+        "$exe = Join-Path $dir 'winspace.exe'",
+        "if (Test-Path $exe) { Start-Process -FilePath $exe -ArgumentList 'uninstall' -Wait }"
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/ptquang2000/winspace/releases/download/v$version/winspace-$version-x64.zip"
+            }
+        }
+    },
+    "notes": [
+        "winspace is installed but NOT started, and autostart is left as your config dictates.",
+        "Run 'winspace' to start the window manager in the background.",
+        "Config lives at %USERPROFILE%\\.config\\winspace\\winspace.conf (self-seeded on first run) and survives update/uninstall.",
+        "To start winspace at logon, set 'start_at_login = true' in your config, then run 'winspace install'."
+    ]
+}

@@ -86,7 +86,11 @@ if ($Config -eq 'debug') {
     $cfgLink = @('/DEBUG')
 }
 else {
-    $cfgCompile = @('/O2', '/DNDEBUG', '/MD')
+    # Release links the CRT STATICALLY (/MT, ADR-0018) so the distributed exe is
+    # self-contained — no VC++ redistributable, no `depends` in the Scoop manifest,
+    # no missing-DLL dialog on a clean box. Debug keeps /MDd (above) for the faster
+    # incremental story and is never distributed.
+    $cfgCompile = @('/O2', '/DNDEBUG', '/MT')
     $cfgLink = @()
 }
 

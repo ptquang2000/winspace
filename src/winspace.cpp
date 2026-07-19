@@ -1349,3 +1349,44 @@ inline ParseResult parse(std::string_view text) {
 }
 
 }  // namespace winspace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [core section] command
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pure command-intent parsing (ADR-0019) — core (pure, no <windows.h>).
+//
+// winspace.exe has one no-arg mode (the WM) and two headless subcommands the
+// Scoop package invokes around its file swap. wWinMain narrows the wide command
+// line to UTF-8 argument tokens (the program name dropped) and hands them to this
+// pure mapper BEFORE any window or thread exists, so command routing is a
+// unit-testable decision with zero I/O — the same altitude as the Reducer, and
+// the only NEW place pure logic is added by this feature.
+//
+// Deliberately small and total: no args -> Run (the WM, unchanged); exactly
+// "install" or "uninstall" as the sole token -> that headless command; anything
+// else -> Other (an unknown verb, or a known verb with stray arguments). The
+// spine treats Other as a usage error rather than silently starting the WM, so a
+// typo (`winspace instal`) never seizes the session hooks.
+
+namespace winspace {
+
+enum class Command { Run, Install, Uninstall, Other };
+
+constexpr bool operator==(Command a, Command b) {
+    return static_cast<int>(a) == static_cast<int>(b);
+}
+
+// Map already-narrowed argument tokens (argv without the program name) to a
+// Command. Total and allocation-free; the I/O layer owns the wide->narrow
+// narrowing, so the core stays wchar_t-free.
+inline Command parseCommand(const std::vector<std::string>& args) {
+    if (args.empty()) return Command::Run;
+    if (args.size() == 1) {
+        if (args[0] == "install") return Command::Install;
+        if (args[0] == "uninstall") return Command::Uninstall;
+    }
+    return Command::Other;
+}
+
+}  // namespace winspace

@@ -304,6 +304,49 @@ falls out of those same two lifecycle Events. Failures degrade-and-log (ADR-0004
 never blocks or crashes the running WM.
 _Avoid_: RegisterAutostart/RemoveAutostart (it is one declarative Effect, not a transition pair).
 
+### Distribution & the Primary
+
+Terms for how winspace is installed and for the single-process guarantee that packaging
+relies on. See [ADR-0017](docs/adr/0017-distribution-via-self-bucketed-scoop-package.md),
+[ADR-0018](docs/adr/0018-release-links-crt-statically.md), and
+[ADR-0019](docs/adr/0019-single-instance-primary-and-control-channel.md).
+
+**Primary**:
+The single running winspace instance — the one process that owns the global hotkeys, the COM
+Virtual Desktop bridge, and the OS autostart state for a user session. winspace is
+**single-instance by construction**: a bare `winspace` launch that finds a live one exits
+rather than contend for the same exclusive OS resources. The **install / uninstall command**s
+address their **Control messages** to it.
+_Avoid_: orchestrator (it read as coordinating many parts, and collided with the test
+harness's *host orchestrator*), daemon, server, main process, bare "instance" (Primary IS the
+one canonical instance — the qualifier is the point).
+
+**Control message**:
+An out-of-band request sent to the running **Primary** from *another* winspace process —
+`sync-autostart`, `remove-autostart`, or `quit`. **Distinct from an Event**: an Event is
+in-process data the Hotkey/Hook threads hand to the **Reducer** and flows through `reduce`; a
+Control message crosses a process boundary into the Primary's message-only window (a
+scalar payload, never a pointer) and mutates OS artifacts or lifecycle **outside** the Event
+stream. When no Primary is running, the sending command does the work itself instead.
+_Avoid_: IPC call, RPC, signal, command (reserved for the CLI subcommands below).
+
+**install / uninstall command**:
+The two headless winspace subcommands the **Scoop package** invokes around its file swap,
+parsed in `wWinMain` before the WM starts. **`winspace install`** makes OS autostart match the
+config's `start_at_login` — it **never turns autostart on by itself**. **`winspace uninstall`**
+removes the **Logon task** and stops the running **Primary** so the binary unlocks for
+deletion. Each is **hybrid**: it sends a **Control message** to a live Primary, or if none
+is running performs the same **SyncAutostart**-family mutation directly.
+_Avoid_: setup, register/unregister (that is the Logon task, one layer down), service install.
+
+**Scoop package**:
+winspace's distribution unit — a Scoop manifest (`bucket/winspace.json`, in this repo, which
+doubles as its own bucket) pointing at a zipped, statically-linked (ADR-0018) Release exe on a
+GitHub Release. Exposed as a `bin` shim (`winspace` on PATH), no shortcut, no auto-launch on
+install; its `pre_install` / `post_install` / `pre_uninstall` hooks drive the **install /
+uninstall command**s.
+_Avoid_: installer, MSI, setup package.
+
 ### Threads
 
 **Hotkey thread**:

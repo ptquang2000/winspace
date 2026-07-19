@@ -1409,3 +1409,43 @@ TEST_CASE("one parse returns binds, rules, and execs together", "[config]") {
     REQUIRE(result.config.execs.size() == 1);
     REQUIRE(result.config.execs[0] == ExecEntry{"firefox", true});
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [command tests] command-intent parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Tests for the pure command-intent parser (ADR-0019). The argv ->
+// {Run|Install|Uninstall|Other} decision is a pure function, so it is proven
+// here at the highest point without the VM — command routing is correct before a
+// single window or thread exists. The I/O layer's narrowing and dispatch are
+// covered by the Installation VM Smoke seam.
+
+TEST_CASE("no arguments is the Run (WM) command", "[command]") {
+    REQUIRE(parseCommand({}) == Command::Run);
+}
+
+TEST_CASE("the sole token 'install' is the Install command", "[command]") {
+    REQUIRE(parseCommand({"install"}) == Command::Install);
+}
+
+TEST_CASE("the sole token 'uninstall' is the Uninstall command", "[command]") {
+    REQUIRE(parseCommand({"uninstall"}) == Command::Uninstall);
+}
+
+TEST_CASE("an unknown single verb is Other, never Run", "[command]") {
+    REQUIRE(parseCommand({"start"}) == Command::Other);
+    REQUIRE(parseCommand({"reload"}) == Command::Other);
+    REQUIRE(parseCommand({"instal"}) == Command::Other);  // a typo must not fall through to Run
+}
+
+TEST_CASE("install/uninstall with a stray extra argument is Other, not the command", "[command]") {
+    REQUIRE(parseCommand({"install", "now"}) == Command::Other);
+    REQUIRE(parseCommand({"uninstall", "--force"}) == Command::Other);
+}
+
+TEST_CASE("the verbs are matched case-sensitively and exactly", "[command]") {
+    // The Scoop hooks invoke the lowercase verbs verbatim; anything else is Other.
+    REQUIRE(parseCommand({"Install"}) == Command::Other);
+    REQUIRE(parseCommand({"INSTALL"}) == Command::Other);
+    REQUIRE(parseCommand({"install "}) == Command::Other);
+}

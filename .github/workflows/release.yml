@@ -1,0 +1,71 @@
+# Release-on-tag (ADR-0017). Pushing a vX.Y.Z tag builds the self-contained
+# (static-CRT, ADR-0018) Release exe on windows-latest, zips it, and publishes a
+# GitHub Release with the asset. The Scoop manifest (bucket/winspace.json) then
+# points at that asset; `checkver`/`autoupdate` regenerate version/url/hash from
+# the release. Free — the repo is public.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub Release and upload the asset
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Derive the version from the tag
+        id: version
+        shell: pwsh
+        # v0.0.1 -> 0.0.1; the zip and Release both key off this.
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build the Release exe (static CRT)
+        shell: pwsh
+        # build.ps1 assumes an x64 Native Tools environment (cl.exe on PATH);
+        # vcvars64.bat supplies it. Locate it via vswhere so the runner's VS
+        # edition/path is not hard-coded. windows-latest ships the MSVC toolchain.
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          cmd /c "call `"$vcvars`" && pwsh -NoProfile -File build.ps1 -Config release"
+          if ($LASTEXITCODE -ne 0) { throw "release build failed ($LASTEXITCODE)" }
+
+      - name: Zip the exe
+        id: zip
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $zip = "winspace-$version-x64.zip"
+          Compress-Archive -Path build/release/winspace.exe -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA256($zip) = $hash"
+
+      - name: Publish the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "${{ steps.zip.outputs.zip }}"
+          $lines = @(
+            "SHA256 ($zip) = ${{ steps.zip.outputs.sha256 }}"
+            ""
+            "Install via Scoop:"
+            ""
+            "    scoop bucket add winspace https://github.com/ptquang2000/winspace"
+            "    scoop install winspace"
+          )
+          Set-Content -Path notes.md -Value $lines -Encoding utf8
+          gh release create "${{ github.ref_name }}" $zip --title "${{ github.ref_name }}" --notes-file notes.md
