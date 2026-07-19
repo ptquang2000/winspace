@@ -579,6 +579,27 @@ function Set-DesktopCount {
             (Get-VdState).Count -eq $before + 1
         }
     }
+    # Win+Ctrl+D commits the desktop COUNT to the registry before it commits the
+    # active-desktop SWITCH to the just-created (last) desktop, so a caller that reads
+    # CurrentGuid the instant the count settles can still observe the PREVIOUS desktop's
+    # GUID — surfaced as an intermittent `CurrentGuid | Should -Be <last>` precondition
+    # failure (the failure screenshot caught the "Desktop N" switch OSD still animating).
+    # Every caller expects the active desktop to be the last one built (the seams then
+    # assert exactly that), and the teardown-to-1 + build-up path always ends by creating
+    # the target-th desktop last, so wait for that switch to land before returning.
+    # Only a multi-desktop build-up has a switch to wait on; with a single desktop
+    # (or a cold registry whose GUID list is still empty) there is no switch race.
+    if ($Count -gt 1) {
+        Wait-Until -Because 'the active desktop to settle on the last-created desktop' -Condition {
+            $s = Get-VdState
+            # @() forces array context (a single-GUID list unwraps to a bare string, and
+            # a scalar [-1] would index the GUID's last CHARACTER). Gate on the list having
+            # reached the target length first, so [-1] never indexes a not-yet-populated
+            # (possibly empty) array and reads the genuine last desktop's GUID.
+            $guids = @($s.Guids)
+            ($guids.Count -ge $Count) -and ($s.CurrentGuid -eq $guids[-1])
+        }
+    }
 }
 
 # ── poll, never sleep: wait for the Oracle to reach a condition ──────────────

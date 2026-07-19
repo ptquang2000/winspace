@@ -32,24 +32,58 @@ BeforeAll {
     # intermittent cold-guest failure, not the Start-TestWindow / Origin timeouts.
     Get-Process -Name 'Widgets' -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # Distribute (ADR-0020) auto-maximizes every UNMATCHED eligible window. Left
+    # unmanaged, BOTH fixture windows would be maximized to identical full-work-area
+    # rects — neither is spatially "ahead" of the other, so `focus right` resolves to
+    # nothing (resolveFocus finds no Candidate) and the foreground can never move: the
+    # seam would deadlock waiting on the right window. The fixtures must therefore keep
+    # (a) the rects they open at (so left/right is a real spatial relation) AND (b)
+    # their standing as focus Candidates.
+    #
+    # An `ignore` rule (the obvious first reach) fails (b): ADR-0020 widened Ignore to
+    # "don't touch at all", which drops the window as a Spatial-focus target — resolveFocus
+    # skips every id in `ignored` (winspace.cpp). A workspace-only Place rule (NO slot) is
+    # exactly right on all three counts: a matched rule opts the window OUT of Distribute
+    # (so it is never maximized); a slot-less Place emits no PositionWindow (so the window
+    # stays byte-for-byte where it opened); and being Place — not Ignore — it remains a
+    # focus Candidate. On this single desktop the rule's workspace 1 IS the current one,
+    # so the Workspace move is a no-op. Title matches by regex_search (substring), so the
+    # single `winspace-focus` pattern covers both `-left` and `-right`. The `focus` binds
+    # are re-declared here (Alt+H/J/K/L, identical to the seeded default) because a custom
+    # config replaces the default whole; the chord under test (Alt+L → focus right) is
+    # unchanged. A double-quoted here-string escapes `$mod so it survives to the file.
+    $script:FocusConfig = @"
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
+bind = `$mod, H, focus, left
+bind = `$mod, J, focus, down
+bind = `$mod, K, focus, up
+bind = `$mod, L, focus, right
+windowrule = workspace 1, title:winspace-focus
+"@
 }
 
 AfterAll {
     Set-RunnerConsoleVisible $true
+    Clear-WinspaceConfig   # restore built-in-default behaviour for later seams
 }
 
 Describe 'spatial-focus' {
 
-    # The seeded default config (src/win32.cpp) binds vim-style $mod + h/j/k/l
-    # to `focus` (Alt+L → focus right), where $mod = ALT (ADR-0014). Alt+<letter>
-    # registers on stock Windows 11 with no policy — verified by direct RegisterHotKey
-    # probe on this guest. This seam drives the real default `focus right` binding.
+    # The config binds vim-style $mod + h/j/k/l to `focus` (Alt+L → focus right),
+    # where $mod = ALT (ADR-0014), identical to the seeded default (src/win32.cpp).
+    # Alt+<letter> registers on stock Windows 11 with no policy — verified by direct
+    # RegisterHotKey probe on this guest. The paired `workspace 1` Place rules keep the
+    # two fixtures out of Distribute while leaving their rects and focus candidacy
+    # intact (see $script:FocusConfig for the full rationale).
     It 'focus-right: a "focus right" chord moves the foreground to the window on the right' -Tag 'spatial-focus' {
         $winspace = $null
         $left = $null
         $right = $null
         try {
-            Set-DesktopCount 1
+            Set-DesktopCount 1   # single desktop: the rules' workspace 1 is the current one
+            Set-WinspaceConfig -Content $script:FocusConfig | Out-Null
             $winspace = Start-Winspace
 
             # Two eligible windows side by side, well clear of the screen edges. Open
