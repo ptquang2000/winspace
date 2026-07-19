@@ -1709,12 +1709,12 @@ namespace winspace::io {
 
 // The Worker's message-only window class. Shared so the Worker registers/creates
 // under it AND another process can FindWindowEx it to locate the Orchestrator.
-inline constexpr const wchar_t* k_workerClassName = L"winspace.worker";
+inline constexpr std::wstring_view k_workerClassName = L"winspace.worker";
 
 // The single-instance mutex. `Local\` scopes it to the interactive session, so
 // two logged-in accounts on one machine each get their own Orchestrator (matching
 // the per-user Logon task) and never collide.
-inline constexpr const wchar_t* k_orchestratorMutexName = L"Local\\winspace.orchestrator";
+inline constexpr std::wstring_view k_orchestratorMutexName = L"Local\\winspace.orchestrator";
 
 // The three cross-process Control requests, carried as the SCALAR wParam of the
 // registered Control message. Values are explicit so the on-the-wire meaning is
@@ -1740,7 +1740,7 @@ inline UINT controlMessage() {
 // `winspace` command runs in its OWN process, so the window it finds (if any) is
 // genuinely the separate Orchestrator's. Null when none is running.
 inline HWND findOrchestrator() {
-    return FindWindowExW(HWND_MESSAGE, nullptr, k_workerClassName, nullptr);
+    return FindWindowExW(HWND_MESSAGE, nullptr, k_workerClassName.data(), nullptr);
 }
 
 // How long a command waits on a graceful quit before force-killing a wedged
@@ -1872,13 +1872,13 @@ public:
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = &Worker::wndProc;
         wc.hInstance = instance;
-        wc.lpszClassName = k_className;
+        wc.lpszClassName = k_className.data();
         RegisterClassExW(&wc);  // harmless if already registered; CreateWindow still succeeds
 
         // HWND_MESSAGE → a message-only window: no pixels, no taskbar button, no
         // Alt-Tab entry. It exists solely to receive posted Events. Created in
         // the ctor so hwnd() is valid before run() (and before any producer posts).
-        m_hwnd = CreateWindowExW(0, k_className, nullptr, 0, 0, 0, 0, 0,
+        m_hwnd = CreateWindowExW(0, k_className.data(), nullptr, 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, instance, this);
         // A null HWND is the fatal signal the spine acts on (via workerThreadMain);
         // checkWin32 here just names WHY it failed. Snapshot GetLastError immediately,
@@ -1926,7 +1926,7 @@ public:
 private:
     // The message-only window class, shared with the control section so another
     // process can FindWindowEx this exact window to reach the Orchestrator.
-    static constexpr const wchar_t* k_className = k_workerClassName;
+    static constexpr std::wstring_view k_className = k_workerClassName;
 
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (msg == WM_NCCREATE) {
@@ -2431,25 +2431,28 @@ inline Command commandFromCmdLine(const wchar_t* cmdLine) {
     return parseCommand(args);
 }
 
-// A scoped COM apartment for the headless install/uninstall commands. Unlike the WM's
-// STA Worker (which owns its own CoInitializeEx), these run on the bare wWinMain thread,
-// and their direct (no-Orchestrator) path drives Task Scheduler 2.0 via syncAutostart's
+// A Win32 kernel HANDLE (mutex, event, …) closed by CloseHandle at scope exit. The
+// managed type is void because HANDLE already is void*; a null handle (a failed create)
+// carries no ownership, so its deleter never runs.
+using UniqueHandle = std::unique_ptr<void, decltype([](HANDLE h) { CloseHandle(h); })>;
+
+// A scoped COM apartment, released by CoUninitialize at scope exit. Held pointer-free: a
+// non-null sentinel means "we performed a matched CoInitializeEx and must undo it", null
+// means we did not (so CoUninitialize is skipped). The sentinel is a flag, never read.
+using ComApartment = std::unique_ptr<void, decltype([](void*) { CoUninitialize(); })>;
+
+// Enter an apartment for the headless install/uninstall commands. Unlike the WM's STA
+// Worker (which owns its own CoInitializeEx), these run on the bare wWinMain thread, and
+// their direct (no-Orchestrator) path drives Task Scheduler 2.0 via syncAutostart's
 // CoCreateInstance — which returns CO_E_NOTINITIALIZED on a thread with no apartment.
 // Apartment-threaded to mirror the Worker (ADR-0013); a one-shot task sync needs no
-// message pump. A failed init is left to surface as syncAutostart's error (exit 1, the
-// signal Scoop reads); CoUninitialize is gated on a successful init so teardown balances.
-class ComApartment {
-public:
-    ComApartment() { m_ok = ok(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)).has_value(); }
-    ~ComApartment() {
-        if (m_ok) CoUninitialize();
-    }
-    ComApartment(const ComApartment&) = delete;
-    ComApartment& operator=(const ComApartment&) = delete;
-
-private:
-    bool m_ok = false;
-};
+// message pump. A failed init yields an empty guard, leaving the failure to surface as
+// syncAutostart's error (exit 1, the signal Scoop reads).
+inline ComApartment enterComApartment() {
+    static char token;  // a stable non-null address used only as the "initialized" flag
+    const bool initialized = ok(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)).has_value();
+    return ComApartment(initialized ? &token : nullptr);
+}
 
 // The headless `winspace install` command (ADR-0019). Make OS autostart match the
 // config's start_at_login — NEVER enabling it unbidden: the flag stays the single
@@ -2467,7 +2470,7 @@ inline int runInstall() {
     // default) and sync the task directly. A false flag deletes/leaves-absent the
     // task, so a fresh install never starts seizing logon hooks. The direct path owns
     // the COM apartment syncAutostart's Task Scheduler calls require.
-    const ComApartment com;
+    const ComApartment com = enterComApartment();
     const LoadedConfig cfg = loadConfig();
     if (const auto synced = syncAutostart(cfg.startAtLogin); !synced) {
         lg::warn("install: direct autostart sync (enabled={}) failed: {}", cfg.startAtLogin,
@@ -2494,7 +2497,7 @@ inline int runUninstall() {
     }
     // No Orchestrator: remove the task directly. Owns the COM apartment syncAutostart's
     // Task Scheduler calls require (the wWinMain thread has none of its own).
-    const ComApartment com;
+    const ComApartment com = enterComApartment();
     if (const auto removed = syncAutostart(false); !removed) {
         lg::warn("uninstall: direct autostart removal failed: {}", removed.error());
         return 1;
@@ -2513,18 +2516,15 @@ inline int runApp() {
     // The Orchestrator's message-only window is the addressable control target the
     // install/uninstall commands find; the mutex closes the two-launches-at-once
     // race the window discovery alone cannot.
-    const HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, k_orchestratorMutexName);
+    const UniqueHandle instanceMutex(CreateMutexW(nullptr, TRUE, k_orchestratorMutexName.data()));
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         lg::info("app: an orchestrator is already running; exiting (single-instance)");
-        CloseHandle(instanceMutex);  // release our reference; the live owner keeps the mutex
-        return 0;
+        return 0;  // the guard closes our reference; the live owner keeps the mutex
     }
-    // Owner (or CreateMutex failed — degrade to unguarded rather than refuse to
-    // start). Held for the process lifetime; the OS destroys the mutex when this
-    // last handle closes at exit, so a later relaunch is unguarded again as intended.
-    const auto releaseMutex = [&] {
-        if (instanceMutex) CloseHandle(instanceMutex);
-    };
+    // Owner (or CreateMutex failed — degrade to unguarded rather than refuse to start).
+    // Held for the process lifetime by the UniqueHandle above; the OS destroys the mutex
+    // when this last handle closes at scope exit, so a later relaunch is unguarded again
+    // as intended.
 
     // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
     // message-only HWND included), so it leads runApp. This puts the process and
@@ -2557,7 +2557,6 @@ inline int runApp() {
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
         workerThread.join();
-        releaseMutex();
         return 1;  // Worker could not create its window — nothing can proceed
     }
 
@@ -2603,7 +2602,6 @@ inline int runApp() {
 
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.
     workerThread.join();
-    releaseMutex();
     return 0;
 }
 
