@@ -46,9 +46,11 @@ the `SetWindowPos` write** — the one thing ADR-0007 removed.
 
 winspace reintroduces window geometry as **one further bounded write Effect**, driven
 only by rule matches and an explicit command, never continuously. (This ADR was drafted
-against a base without [ADR-0015](0015-spread-bounded-geometry-write-to-empty-display.md)'s
-Spread; on integration both landed, so `PositionWindow` is one of **two** bounded geometry
-Effects — the Slot writer here, and Spread's `SpreadWindow` onto an Empty Display.)
+against a base without [ADR-0021](0021-spread-bounded-geometry-write-to-empty-display.md)'s
+Spread (originally numbered 0015); on integration both landed, so `PositionWindow` was one of
+**two** bounded geometry Effects — the Slot writer here, and Spread's `SpreadWindow` onto an
+Empty Display. (Both were later unified into a single `PositionWindow` by
+[ADR-0020](0020-distribute-auto-tile-every-eligible-window.md), which retired Spread.)
 
 - **`WindowRule` Place gains an optional geometry target — a `Slot`.** A Place rule
   becomes `exe: → workspace N [+ slot S]`. A `Slot` is a **symbolic named fraction

@@ -1,6 +1,15 @@
 # Spread: a bounded one-shot geometry write to place a window on an empty display
 
-**Status:** Accepted (2026-07-18)
+**Status:** **Retired by [ADR-0020](0020-distribute-auto-tile-every-eligible-window.md)** (2026-07-19).
+Originally Accepted (2026-07-18) and numbered 0015; **renumbered to 0021** to resolve a
+numbering collision with the FancyZones ADR (which keeps 0015). The `Spread` `RuleAction`,
+the `SpreadWindow` Effect, the `spread` config token, and the "overflow → no placement"
+behavior recorded here are all **gone**: ADR-0020 makes distribution automatic for *every*
+eligible window (not a per-rule opt-in), folds `SpreadWindow` into a unified `PositionWindow`
+carrying an optional target Display, and replaces the boolean "Empty Display" with a
+count-balanced "least-occupied Display." The two-phase Probe round-trip and the
+stateless/place-once/exclude-self shape below **survive** — ADR-0020 generalizes them rather
+than discarding them. This file is kept for history; read ADR-0020 for current behavior.
 
 [ADR-0007](0007-drop-tiling-no-window-geometry.md) declared that winspace owns **no
 window geometry** — "never moves or sizes a window: no `layout()`, no `PositionWindow`

@@ -1050,10 +1050,11 @@ inline std::vector<WindowAttrs> probeTopLevelWindows() {
 }
 
 // Every Display, as the opaque MonitorId the core reasons over — the substrate for
-// Spread's Empty-Display decision (ADR-0015). EnumDisplayMonitors walks the live
-// monitor set; the callback stamps each HMONITOR into a MonitorId. No occupancy is
-// read here (that is the window sweep's job); this is only the set of Displays the
-// Reducer chooses among.
+// Distribute's and tile's least-occupied-Display decision (ADR-0020, was Spread's
+// Empty-Display decision under ADR-0021). EnumDisplayMonitors walks the live monitor
+// set; the callback stamps each HMONITOR into a MonitorId. No occupancy is read here
+// (that is the window sweep's job); this is only the set of Displays the Reducer
+// chooses among.
 inline std::vector<MonitorId> enumerateDisplays() {
     std::vector<MonitorId> out;
     EnumDisplayMonitors(
@@ -1132,22 +1133,40 @@ inline std::vector<ProbedWindow> probeTopLevelWindowsWithIdentity() {
     return out;
 }
 
-// Position a window into a Slot (ADR-0016) — the single geometry-writing adapter,
-// the sole place ADR-0007's geometry ban is reopened, funnelled through one seam so
-// the reversal stays auditable. It resolves the window's monitor work area
-// (MONITOR_DEFAULTTONEAREST, so a multi-monitor window uses the taskbar-excluded
-// work area of the monitor it is on, at that monitor's DPI), computes the target
-// rect via the PURE rectForSlot, compensates Win11's invisible resize border /
-// drop-shadow so the VISIBLE frame lands flush to the Slot, and writes with
-// SetWindowPos. The Maximized Slot is special-cased to OS SW_MAXIMIZE so the window
-// is genuinely maximized (restore button, snap layouts), not merely filling the
-// work area. Degrade-and-log on any failure (ADR-0004) — geometry never crashes.
-inline void positionWindow(WindowId id, Slot slot) {
+// Position a window into a Slot, optionally on a target Display (ADR-0016,
+// generalized by ADR-0020) — the single geometry-writing adapter, the sole place
+// ADR-0007's geometry ban is reopened, funnelled through one seam so the reversal
+// stays auditable. The destination monitor is `target` (Distribute's chosen
+// Display) when set, else the window's current monitor via MONITOR_DEFAULTTONEAREST
+// (a Slot rule on its own Display). It resolves that monitor's taskbar-excluded work
+// area (at the monitor's DPI), computes the target rect via the PURE rectForSlot,
+// compensates Win11's invisible resize border / drop-shadow so the VISIBLE frame
+// lands flush to the Slot, and writes with SetWindowPos. The Maximized Slot is
+// special-cased to OS SW_MAXIMIZE so the window is genuinely maximized (restore
+// button, snap layouts); with a target Display the window is MOVED onto it first
+// (SW_MAXIMIZE maximizes on whichever monitor the window currently occupies), so the
+// OS reports it maximized on the target. Degrade-and-log on any failure (ADR-0004) —
+// geometry never crashes.
+inline void positionWindow(WindowId id, std::optional<MonitorId> target, Slot slot) {
     const HWND h = toHwnd(id);
     if (!h) return;
 
-    // Maximized → true OS maximize; no rect to compute or compensate.
+    // Destination monitor: the explicit target, else the window's current monitor.
+    const HMONITOR mon =
+        target ? toHmonitor(*target) : MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+
+    // Maximized → true OS maximize. With a target Display, restore then move the
+    // window's origin onto that Display's work area BEFORE maximizing, so SW_MAXIMIZE
+    // fills the target monitor rather than the one the window opened on.
     if (slot == Slot::Maximized) {
+        if (target) {
+            if (IsIconic(h) || IsZoomed(h)) ShowWindow(h, SW_RESTORE);
+            if (MONITORINFO mi{.cbSize = sizeof(MONITORINFO)}; GetMonitorInfoW(mon, &mi))
+                SetWindowPos(h, nullptr, mi.rcWork.left, mi.rcWork.top, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            else
+                lg::warn("positionWindow: GetMonitorInfo failed for target — maximizing in place");
+        }
         ShowWindow(h, SW_MAXIMIZE);
         return;
     }
@@ -1156,7 +1175,6 @@ inline void positionWindow(WindowId id, Slot slot) {
     // SetWindowPos on a zoomed/iconic window is overridden the moment it restores.
     if (IsIconic(h) || IsZoomed(h)) ShowWindow(h, SW_RESTORE);
 
-    const HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(mon, &mi)) {
@@ -1164,7 +1182,7 @@ inline void positionWindow(WindowId id, Slot slot) {
         return;
     }
     const Rect workArea{mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom};
-    const Rect target = rectForSlot(slot, workArea);
+    const Rect slotRect = rectForSlot(slot, workArea);
 
     // Visible-frame compensation (ADR-0016): GetWindowRect includes Win11's
     // invisible resize border, but DWMWA_EXTENDED_FRAME_BOUNDS is the visible frame
@@ -1183,10 +1201,10 @@ inline void positionWindow(WindowId id, Slot slot) {
         insetB = wr.bottom - fr.bottom;
     }
 
-    const int x = target.left - insetL;
-    const int y = target.top - insetT;
-    const int width = (target.right - target.left) + insetL + insetR;
-    const int height = (target.bottom - target.top) + insetT + insetB;
+    const int x = slotRect.left - insetL;
+    const int y = slotRect.top - insetT;
+    const int width = (slotRect.right - slotRect.left) + insetL + insetR;
+    const int height = (slotRect.bottom - slotRect.top) + insetT + insetB;
 
     if (const auto set =
             ok(SetWindowPos(h, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE));
@@ -2111,12 +2129,15 @@ private:
                                                              probeForeground()}});
                 },
                 [&](const ResolveTile&) {
-                    // Phase one of the tile round-trip (ADR-0016), mirroring
-                    // ResolveFocus: run the Probe sweep — gathering attrs AND
-                    // identity per window, since tile must match rules — and post it
-                    // back as a TileResolve the Reducer turns into PositionWindow
-                    // Effects. The Worker stays a mechanical executor.
-                    postEvent(m_hwnd, new Event{TileResolve{probeTopLevelWindowsWithIdentity()}});
+                    // Phase one of the tile round-trip (ADR-0016, generalized by
+                    // ADR-0020), mirroring ResolveFocus: run the Probe sweep —
+                    // gathering attrs AND identity per window, since tile must match
+                    // rules — plus the live Display list, so the Reducer can balance
+                    // free windows across all monitors (including empty ones) in one
+                    // pure pass. Post it back as a TileResolve. The Worker stays a
+                    // mechanical executor.
+                    postEvent(m_hwnd, new Event{TileResolve{probeTopLevelWindowsWithIdentity(),
+                                                            enumerateDisplays()}});
                 },
                 [&](const SetForegroundWindow& sf) {
                     // Bare call, degrade-and-log: a just-fired hotkey
@@ -2152,28 +2173,32 @@ private:
                     // cross-Workspace pin never flashes here. Null bridge → no-op.
                     if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
                 },
-                [&](const ResolveSpread& rs) {
-                    // Phase one of the Spread round-trip (ADR-0015), mirroring
-                    // ResolveFocus: probe Display occupancy and post SpreadResolve back
-                    // to ourselves, which the Reducer then reduces into the target
-                    // choice. The Worker decides nothing — it only enumerates.
+                [&](const ResolveDistribute& rd) {
+                    // Phase one of the Distribute round-trip (ADR-0020, was Spread's
+                    // ResolveSpread under ADR-0021), mirroring ResolveFocus: probe
+                    // Display occupancy and post DistributeResolve back to ourselves,
+                    // which the Reducer reduces (via pickDistributeTarget) into the
+                    // target choice. The Worker decides nothing — it only enumerates
+                    // and COUNTS.
                     //
-                    // Start from every Display, all unoccupied; then mark a Display
-                    // occupied when an Eligible window on the current Workspace maps to
-                    // it. isEligible already excludes DWM-cloaked windows, so windows
-                    // parked on other Virtual Desktops never count (Empty is
+                    // Start from every Display at count 0; then increment a Display's
+                    // count for each Eligible window on the current Workspace that maps
+                    // to it. isEligible already excludes DWM-cloaked windows, so windows
+                    // parked on other Virtual Desktops never count (Distribute is
                     // same-Workspace by construction). The subject is excluded so its
-                    // own opening Display never reads as occupied and defeats placement.
+                    // own opening Display never counts itself and defeats placement; its
+                    // current monitor is captured separately so the Reducer's tie-break
+                    // can prefer keeping it put.
                     const auto monitors = enumerateDisplays();
                     std::vector<DisplayOccupancy> displays(monitors.size());
                     std::ranges::transform(monitors, displays.begin(), [](MonitorId id) {
-                        return DisplayOccupancy{.id = id, .occupied = false};
+                        return DisplayOccupancy{.id = id, .count = 0};
                     });
 
                     const auto windows = probeTopLevelWindows();
                     auto occupiedMonitors =
                         windows | std::views::filter([&](const WindowAttrs& a) {
-                            return isEligible(a) && a.id != rs.subject;
+                            return isEligible(a) && a.id != rd.subject;
                         }) | std::views::transform([](const WindowAttrs& a) {
                             const RECT rc{a.rect.left, a.rect.top, a.rect.right, a.rect.bottom};
                             return toMonitorId(MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST));
@@ -2182,40 +2207,23 @@ private:
                         if (const auto d = std::ranges::find_if(
                                 displays, [&](const DisplayOccupancy& e) { return e.id == mon; });
                             d != displays.end())
-                            d->occupied = true;
+                            ++d->count;
 
-                    postEvent(m_hwnd, new Event{SpreadResolve{rs.subject, std::move(displays)}});
-                },
-                [&](const SpreadWindow& sw) {
-                    // Spread's geometry write (ADR-0015) — a bounded reversal of
-                    // ADR-0007's no-geometry ban, emitted only by Spread. One
-                    // SetWindowPos onto the target Display's WORK area (rcWork, so the
-                    // taskbar is respected), at the window's NATURAL size (its current
-                    // width/height preserved — never resized or snapped). It happens
-                    // once, at placement; winspace never touches the rect again.
-                    // Degrade-and-log throughout (ADR-0004): a bad monitor, HWND, or a
-                    // failed SetWindowPos logs and returns, never crashes the WM.
-                    const HWND h = toHwnd(sw.id);
-                    if (MONITORINFO mi{.cbSize = sizeof(MONITORINFO)};
-                        !GetMonitorInfoW(toHmonitor(sw.target), &mi)) {
-                        lg::warn("spread: GetMonitorInfo failed for target display");
-                    } else if (RECT r{}; !GetWindowRect(h, &r)) {
-                        lg::warn("spread: GetWindowRect failed; leaving window in place");
-                    } else if (const auto moved = ok(SetWindowPos(
-                                   h, nullptr, mi.rcWork.left, mi.rcWork.top, r.right - r.left,
-                                   r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE));
-                               !moved) {
-                        lg::warn("spread: SetWindowPos failed: {}", moved.error());
-                    }
+                    const MonitorId subjectMonitor =
+                        toMonitorId(MonitorFromWindow(toHwnd(rd.subject), MONITOR_DEFAULTTONEAREST));
+
+                    postEvent(m_hwnd, new Event{DistributeResolve{rd.subject, subjectMonitor,
+                                                                  std::move(displays)}});
                 },
                 [&](const PositionWindow& p) {
-                    // The Slot geometry-writing Effect (ADR-0016) — a bounded reopening
-                    // of ADR-0007's ban. The Reducer named only the symbolic Slot; the
+                    // The sole geometry-writing Effect (ADR-0016, generalized by
+                    // ADR-0020) — a bounded reopening of ADR-0007's ban. The Reducer
+                    // named only the symbolic Slot and an optional target Display; the
                     // adapter owns monitor resolution, the pure rectForSlot, the
-                    // visible-frame delta, and the maximize special case. Runs BEFORE
-                    // any MoveWindowToWorkspace the same Appeared emitted, positioning
-                    // the window while it is still visible.
-                    positionWindow(p.id, p.slot);
+                    // visible-frame delta, and the maximize special case. On the Slot-
+                    // rule path it runs BEFORE any MoveWindowToWorkspace the same
+                    // Appeared emitted, positioning the window while it is still visible.
+                    positionWindow(p.id, p.target, p.slot);
                 },
                 [&](const LaunchApp& l) {
                     // Launch-only (ADR-0011): start a detached child and

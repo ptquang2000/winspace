@@ -1,14 +1,16 @@
 # winspace
 
 A Windows 11 workspace + focus manager that leans on OS-native facilities and stays off
-the input critical path. It switches Workspaces and switches keyboard focus between
-windows; it owns geometry **only** through two bounded, place-once write Effects —
-`PositionWindow` (rule-targeted **Slot** placement, fired on a matched window's
-Appearance or an explicit `tile`;
-[ADR-0016](docs/adr/0016-bounded-window-geometry-rule-targeted-place-once.md)) and
-`SpreadWindow` (**Spread** onto an Empty Display on Appearance;
-[ADR-0015](docs/adr/0015-spread-bounded-geometry-write-to-empty-display.md)) — never
-continuously; both are narrow reopenings of
+the input critical path. It switches Workspaces, switches keyboard focus between windows,
+and **auto-places every eligible window** — on Appearance it **Distributes** an unmatched
+window onto the least-occupied Display and maximizes it, honoring explicit `windowrule`
+overrides ([ADR-0020](docs/adr/0020-distribute-auto-tile-every-eligible-window.md)). It
+owns geometry through **one** bounded, place-once write Effect — `PositionWindow` (a
+symbolic **Slot** on an optional target Display, fired on a window's Appearance or an
+explicit `tile`; unifies the former Slot writer of
+[ADR-0016](docs/adr/0016-bounded-window-geometry-rule-targeted-place-once.md) and the
+retired `SpreadWindow` of [ADR-0021](docs/adr/0021-spread-bounded-geometry-write-to-empty-display.md)) —
+never continuously, a bounded reopening of
 [ADR-0007](docs/adr/0007-drop-tiling-no-window-geometry.md)'s geometry ban. This
 glossary fixes the ubiquitous language shared by the ADRs (`docs/adr/`) and the code.
 
@@ -48,15 +50,18 @@ One physical monitor. All Displays switch Workspace together (global switch); ea
 stays on its own Display across a switch.
 _Avoid_: Monitor, Screen.
 
-**Empty Display**:
-A Display carrying **zero Eligible windows on the current Workspace**. "Empty" is about
-Eligible windows only — wallpaper, taskbar, and Ineligible windows never count, and a window
-parked on another Virtual Desktop does not occupy the Display while that Workspace is hidden.
-The target concept for the **Spread** WindowRule action: a matching window is relocated onto an
-Empty Display on `Appeared`, and when none remains the action is a no-op (**overflow → no
-placement** — the window is left Eligible and untouched wherever the OS opened it).
-_Avoid_: Free monitor, empty screen, Floating (there is no layout to float above — that term
-died with tiling, ADR-0007).
+**Least-occupied Display**:
+The Display carrying the **fewest Eligible windows on the current Workspace** — the target
+**Distribute** picks (ADR-0020, generalizing the former **Empty Display** of ADR-0021).
+Occupancy is a **count**, not a boolean: wallpaper, taskbar, and Ineligible windows never
+count, and a window parked on another Virtual Desktop does not occupy the Display while that
+Workspace is hidden. When Displays tie, the subject's **current** Display wins if it is among
+them (no pointless cross-monitor jump); otherwise the **first** in enumeration order. There is
+**no overflow no-op** — even when every Display carries windows, Distribute still picks the
+least-occupied and maximizes there (overlap accepted). The pure decision is
+`pickDistributeTarget(counts, current)`.
+_Avoid_: Empty Display (retired — occupancy is now a count, not empty/occupied), Free monitor,
+Floating (there is no layout to float above — that term died with tiling, ADR-0007).
 
 ### The core seam
 
@@ -71,9 +76,9 @@ window opened, the config reloaded). Named in the past/imperative, never carries
 **Effect**:
 A plain-data output from the Reducer describing something the I/O layer must do (switch
 Virtual Desktop, set the foreground window, exit). The Reducer emits Effects; it never
-performs them. Two Effects write window geometry — **PositionWindow** (Slot placement,
-ADR-0016) and **SpreadWindow** (Spread onto an Empty Display, ADR-0015), the narrow
-place-once reopenings of ADR-0007's ban; every other Effect leaves geometry alone.
+performs them. **One** Effect writes window geometry — **PositionWindow** (a Slot on an
+optional target Display, ADR-0016 + ADR-0020), the narrow place-once reopening of ADR-0007's
+ban; every other Effect leaves geometry alone.
 
 **State**:
 The authoritative in-memory model the Reducer transforms. Rebuilt on start — never persisted.
@@ -100,10 +105,12 @@ is a candidate to loosen for focus candidacy later; kept as-is for now.
 
 **Eligible window**:
 A window that passes the Eligibility gate — a real top-level application window winspace
-treats as a focus candidate (and a rule-match target). winspace moves or sizes it only
-when a Slot-bearing rule (or `tile`) targets it (ADR-0016); "Eligible" is about *whether
-winspace considers it*, not a promise of placement.
-_Avoid_: Tileable (dead — nothing is auto-tiled; placement is rule-targeted, not a layout), Managed.
+**manages by default** (ADR-0020): a focus candidate, a rule-match target, and — unless a
+rule opts it out — **auto-placed** by Distribute on its first Eligible `Appeared`. Since
+ADR-0020, "Eligible" *is* a promise of placement (Distribute onto the least-occupied Display),
+reversing ADR-0016's tile-allowlist where placement required a matching rule.
+_Avoid_: Tileable (dead — it is not a computed cross-window layout), Allowlisted (managed is now
+the default, not an opt-in).
 
 **Ineligible window**:
 A window that fails the Eligibility gate (dialog, tool window, context menu, cloaked UWP
@@ -164,21 +171,20 @@ inherits the *windows*, Adoption inherits the *desktops*.
 
 **WindowRule**:
 A parsed `windowrule` carrying one **action** — **Place** (`workspace N`, pin a matching app to
-a target Workspace on `Appeared`, optionally into a **Slot**), **Ignore** (exclude a matching
-window from Spatial focus), or **Spread** (`spread`, relocate a matching app onto an **Empty
-Display** on `Appeared`; see below). One rule names **one** match field and a pattern (`exe:…`,
-`class:…`, or `title:…`); `exe`/`class` match case-insensitively and exactly, `title` is a regex.
-Rules are evaluated in the fixed field precedence **exe → class → title** (config order breaks
-within-field ties), first match wins — and the winning rule's *action* is what applies (a window
-matching both an Ignore and a Place rule resolves by that same first-match order). A Place rule may
-carry an optional **Slot** geometry target (`workspace N slot <name>`, ADR-0016); with no `slot` it
-is exactly the pre-ADR-0016 Workspace pin. Place, Ignore and Spread are all keyed on
-`WindowIdentity`, fired on `Appeared`, and **place-once**. **Slot** and **Spread** are the two
-actions that write geometry — the bounded exceptions to ADR-0007
-([ADR-0015](docs/adr/0015-spread-bounded-geometry-write-to-empty-display.md),
-[ADR-0016](docs/adr/0016-bounded-window-geometry-rule-targeted-place-once.md)). **Place-once** /
-**Ignore-set** (see below).
-_Avoid_: windowrulev2, layer rule.
+a target Workspace on `Appeared`, optionally into a **Slot**) or **Ignore** (leave a matching
+window entirely alone). A rule match is **explicit user intent that opts the window out of
+Distribute** (ADR-0020): matched → Placed or Ignored; **unmatched → Distributed**. The
+`spread` action is **retired** (ADR-0020 — distribution is automatic now; a config still
+carrying it earns a targeted diagnostic). One rule names **one** match field and a pattern
+(`exe:…`, `class:…`, or `title:…`); `exe`/`class` match case-insensitively and exactly, `title`
+is a regex. Rules are evaluated in the fixed field precedence **exe → class → title** (config
+order breaks within-field ties), first match wins — and the winning rule's *action* is what
+applies (a window matching both an Ignore and a Place rule resolves by that same first-match
+order). A Place rule may carry an optional **Slot** geometry target (`workspace N slot <name>`,
+ADR-0016); with no `slot` it is exactly the pre-ADR-0016 Workspace pin at natural size. Place
+and Ignore are keyed on `WindowIdentity`, fired on `Appeared`, and **place-once**. **Place-once**
+/ **Ignore-set** / **Distribute** (see below).
+_Avoid_: windowrulev2, layer rule, spread (the action is retired).
 
 **WindowIdentity**:
 The string half of a window Probe — `exe` (process image basename), `windowClass`, `title` —
@@ -188,49 +194,50 @@ off that hot path). Plain UTF-8 `std::string`, narrowed at the adapter so the co
 _Avoid_: WindowInfo, metadata.
 
 **Place-once**:
-The rule that a `WindowRule` assigns a window its Workspace — and its **Slot**, if the rule
-carries one — **exactly once in its lifetime** and never re-asserts it: a window the user later
-moves is not yanked back. Enforced by a bounded `placed` set of `WindowId` in `State`: an id is
-inserted on its first `Appeared` **once Eligible** (matched or not; an Ineligible edge inserts
-nothing, so it is re-evaluated when it later becomes Eligible) and erased on `Vanished`. The same
-`placed` gate covers both the Workspace move and the geometry write, so no new State was added
-for Slots (ADR-0016). This is the deliberate, bounded reintroduction of window state that
-[ADR-0009](docs/adr/0009-window-rules-place-once-state.md) records against ADR-0007's otherwise
-stateless window side. `tile` deliberately does **not** consult `placed` — it is an explicit,
-re-placeable re-tile.
+The rule that a window is placed **exactly once in its lifetime** and never re-asserted: a window
+the user later moves is not yanked back. It covers **all** first-Appeared placement — a
+`WindowRule`'s Workspace move and Slot, **and Distribute's** auto-placement (ADR-0020) — behind
+one bounded `placed` set of `WindowId` in `State`: an id is inserted on its first `Appeared`
+**once Eligible** (matched or not; an Ineligible edge inserts nothing, so it is re-evaluated when
+it later becomes Eligible) and erased on `Vanished`. No new State was added for Slots (ADR-0016)
+or for Distribute (ADR-0020) — the same gate serves all three. This is the deliberate, bounded
+reintroduction of window state that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md)
+records against ADR-0007's otherwise stateless window side. `tile` deliberately does **not**
+consult `placed` — it is an explicit, re-placeable rebalance.
 _Avoid_: continuous enforcement, pinning-forever.
 
 **Ignore-set**:
 The bounded `ignored` set of `WindowId` in `State` that enforces the **Ignore** WindowRule
-action. An id enters on its first Eligible `Appeared` when the window matches an Ignore rule and
-is erased on `Vanished`, mirroring `placed`. Spatial focus consults it: `resolveFocus` drops any
-Candidate whose id is in the set, so an Ignored window is never a focus target. Kept as state —
-rather than re-matched live at keypress — so the WindowIdentity read (a `title` match needs
-`GetWindowText` → `WM_GETTEXT`, which can block on a hung window) stays on the hook thread and
-never freezes focus navigation. Like Place-once, it is **not re-asserted on reload**: an Ignore
-rule added at reload only takes effect for a matching window when it next `Appears`.
+action, which ADR-0020 widens to **"don't touch at all."** An id enters on its first Eligible
+`Appeared` when the window matches an Ignore rule and is erased on `Vanished`, mirroring `placed`.
+Two exclusions follow: Spatial focus's `resolveFocus` drops any Candidate whose id is in the set
+(never a focus target), **and** the `Appeared` handler emits no geometry for an Ignore match
+(never auto-placed) — so an Ignored window is left entirely alone (still Eligible, never moved or
+sized, still Alt-Tab reachable). Kept as state — rather than re-matched live at keypress — so the
+WindowIdentity read (a `title` match needs `GetWindowText` → `WM_GETTEXT`, which can block on a
+hung window) stays on the hook thread and never freezes focus navigation. Like Place-once, it is
+**not re-asserted on reload**: an Ignore rule added at reload only takes effect for a matching
+window when it next `Appears`.
 _Avoid_: unmanaged, blacklist, Ineligible (an Ignored window IS Eligible — it is excluded by
 rule, not by the Eligibility gate).
 
-**Spread** *(the action)*:
-The third **WindowRule** action (`windowrule = exe:…, spread`): on a matching window's first
-Eligible `Appeared`, relocate it **once** onto an **Empty Display**. Parallel to **Place** but
-targeting a Display, not a Workspace, and — uniquely — it **writes geometry**. Empty Display is
-resolved **statelessly**: a Probe round-trip (mirroring Spatial focus, ADR-0008) enumerates the
-Displays that already carry an Eligible window on the current Workspace, and the Reducer picks one
-that carries none (the subject window excluded from the count). It is **place-once** (recorded in
-`placed`, erased on `Vanished`, never re-asserted on uncloak or reload — a dragged window is not
-yanked back). Two boundaries: **overflow → no placement** (no Empty Display left → emit nothing;
-the window is left where the OS opened it, never forced onto the focused Display), and
-**best-effort under bursts** (no persisted occupancy, so a simultaneous burst of matching windows
-may collide on one Empty Display — accepted, since overflow is a benign no-op). The move is the
-`SpreadWindow` Effect — a single `SetWindowPos`, never a `layout()` — the bounded reversal
-of ADR-0007 that [ADR-0015](docs/adr/0015-spread-bounded-geometry-write-to-empty-display.md)
-records, the geometry twin of Place-once's bounded-state reversal (ADR-0009). Distinct from
-`PositionWindow`, the Slot writer (ADR-0016): Spread moves a window to a whole Display at its
-natural size; a Slot writes a computed fraction of the window's own monitor.
-_Avoid_: Tile, fill, distribute, balance (Spread relocates one window per Empty Display on
-`Appeared` — it is not a continuous layout that rebalances as windows come and go).
+**Distribute** *(the action / behavior, ADR-0020)*:
+The default auto-placement for every Eligible window that no rule governs: on the window's first
+Eligible `Appeared`, move it to the **Least-occupied Display** and **maximize** it. "Spread
+first, then position" — the Display choice is the real work; the position step always applies the
+fixed default **Slot** `maximized`. The Display is resolved **statelessly** via a Probe
+round-trip (mirroring Spatial focus, ADR-0008): the Reducer emits `ResolveDistribute`, the Worker
+enumerates Displays and **counts** the Eligible windows on each (subject excluded, subject's own
+Display captured), and posts `DistributeResolve` back; the pure `pickDistributeTarget` picks the
+target. It is **place-once** (recorded in `placed`, never re-asserted on uncloak or reload — a
+dragged window is not yanked back) and it never moves a window between **Workspaces** (Display +
+geometry only). Unlike the retired **Spread**, there is **no overflow no-op** — Distribute always
+places (overlap accepted when Displays are full). Evenness **drifts** as windows come and go;
+`tile` is the explicit, on-demand rebalance that re-evens it. The move is the unified
+`PositionWindow` Effect (target = the chosen Display, or nullopt to keep the window put).
+_Avoid_: Spread (retired term), continuous tiling / rebalancing (Distribute is place-once — only
+`tile` re-layouts, and only when pressed), pixel-even sharing (evenness is by window **count**,
+not screen area).
 
 ### Geometry (rule-targeted place-once)
 
@@ -246,28 +253,39 @@ direct answer to ADR-0007's stale-rect rejection. Deliberately a different word 
 `SetWindowPos` to the computed rect.
 _Avoid_: zone (that is FancyZones' user-drawn region), layout (there is no computed cross-window layout), stored rect.
 
-**PositionWindow** *(the Effect, ADR-0016)*:
-The **one** geometry-writing Effect — the sole reopening of ADR-0007's ban. It names a `WindowId`
-and a symbolic `Slot`; the Reducer never computes or sees a rect. The adapter (`positionWindow`
-in `win32.cpp`, the deep geometry module) resolves the window's monitor work area
-(`MONITOR_DEFAULTTONEAREST`), applies the pure `rectForSlot`, compensates the visible frame
+**PositionWindow** *(the Effect, ADR-0016 + ADR-0020)*:
+The **one** geometry-writing Effect — the sole reopening of ADR-0007's ban (ADR-0020 folded the
+retired `SpreadWindow` into it). It names a `WindowId`, an **optional target Display**, and a
+symbolic `Slot`; the Reducer never computes or sees a rect. `target == nullopt` means the
+window's **current** monitor (a Slot rule on its own Display, and Distribute's "keep it put"
+tie-break); a set target is Distribute's chosen Display. The adapter (`positionWindow` in
+`win32.cpp`, the deep geometry module) resolves the destination monitor's work area (the target,
+else `MONITOR_DEFAULTTONEAREST`), applies the pure `rectForSlot`, compensates the visible frame
 (`DWMWA_EXTENDED_FRAME_BOUNDS` vs `GetWindowRect`) so the **visible** edges land flush, restores a
-minimized/maximized window first, and writes with `SetWindowPos`. Emitted on two paths — a
-Slot-bearing Place rule matching on `Appeared` (before the `MoveWindowToWorkspace`), and the
-`tile` sweep — never continuously.
-_Avoid_: SetWindowPos Effect (the Reducer names a Slot, not pixels), resize/move Effect.
+minimized/maximized window first, and writes with `SetWindowPos` — or, for `maximized` with a
+target, **moves** the window onto the target Display first, then `SW_MAXIMIZE`, so the OS reports
+it maximized there. Emitted on three paths — a Slot-bearing Place rule on `Appeared` (target
+nullopt, before the `MoveWindowToWorkspace`), **Distribute** (`DistributeResolve` → target = the
+chosen Display, Slot `maximized`), and the `tile` sweep — never continuously.
+_Avoid_: SetWindowPos Effect (the Reducer names a Slot, not pixels), resize/move Effect,
+SpreadWindow (retired — folded into this Effect).
 
-**Tile** *(the Dispatcher / Event, ADR-0016)*:
-The `tile` Dispatcher — a Bind with no argument that re-applies the Slot rules to everything open
-on the **current** Workspace on demand. A two-phase Probe sweep mirroring Spatial focus:
-`Tile` Event (the bind fired) → `ResolveTile` Effect (ask the Worker to sweep) → `TileResolve`
-Event carrying the probed windows (each a `ProbedWindow` — `WindowAttrs` **and** `WindowIdentity`,
-the pair `Appeared` carries, since tile must match rules) → the Reducer emits one `PositionWindow`
-per Eligible, Slot-matched window. **Stateless and geometry-only**: it consults no `placed` set
-(deliberately re-placeable), never emits `MoveWindowToWorkspace`, and leaves State untouched.
+**Tile** *(the Dispatcher / Event, ADR-0016 + ADR-0020)*:
+The `tile` Dispatcher — a Bind with no argument that **re-runs the full placement pipeline** over
+everything open on the **current** Workspace on demand: the one explicit **rebalance** button
+(ADR-0020 widened it from ADR-0016's "re-apply Slot rules" to the whole pipeline). A two-phase
+Probe sweep mirroring Spatial focus: `Tile` Event (the bind fired) → `ResolveTile` Effect (ask the
+Worker to sweep) → `TileResolve` Event carrying the probed windows (each a `ProbedWindow` —
+`WindowAttrs` **and** `WindowIdentity`) **and the live Display list** → the Reducer, for each
+Eligible window: Slot rules emit `PositionWindow{nullopt, slot}`; Ignore / workspace-only Place
+windows are **counted as occupancy but not moved**; every free (unmatched) window is **balanced**
+across all Displays (including empty ones) via `pickDistributeTarget` over a mutating count
+vector, each maximized. **Re-placeable**: it consults no `placed` set (the only path that may
+move an already-placed window), never emits `MoveWindowToWorkspace`, and leaves State untouched.
 "Current Workspace only" falls out of the Eligibility gate — windows on other Virtual Desktops are
 DWM-cloaked → Ineligible → skipped. Stays on `RegisterHotKey` like every other Dispatcher (ADR-0014).
-_Avoid_: retile-all (it is current-Workspace only), auto-tile (nothing is automatic — it is an explicit press).
+_Avoid_: retile-all (it is current-Workspace only), auto-tile (nothing is automatic — it is an
+explicit press; only `tile` rebalances already-placed windows).
 
 ### Launcher
 

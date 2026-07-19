@@ -1,9 +1,12 @@
 <#
-    Slot-placement Smoke seams (VM harness, ADR-0005 / ADR-0016) — the live geometry
-    write the pure Reducer seam structurally cannot reach. A `windowrule = workspace N
-    slot <name>, <field>:<pattern>` drops a matching real app into its Slot the moment
-    it appears (place-once), and a bound `tile` re-applies the Slot rules to everything
-    open on demand.
+    Slot-placement + Distribute Smoke seams (VM harness, ADR-0005 / ADR-0016 / ADR-0020) —
+    the live geometry write the pure Reducer seam structurally cannot reach. A
+    `windowrule = workspace N slot <name>, <field>:<pattern>` drops a matching real app
+    into its Slot the moment it appears (place-once); an unmatched window is auto-placed
+    by **Distribute** (maximized on its Display, ADR-0020); an `ignore` rule leaves a
+    window entirely alone; and a bound `tile` re-runs the pipeline over everything open
+    on demand. (The single-display VM cannot exercise cross-monitor balancing; that is
+    covered by the pure `pickDistributeTarget` / `TileResolve` reducer tests.)
 
     The Slot vocabulary, rectForSlot arithmetic, the PositionWindow Effect, and the
     tile round-trip are all reducer-tested (winspace_test.cpp). These seams prove only
@@ -214,42 +217,88 @@ Describe 'slot-placement' {
         }
     }
 
-    # unmatched-untouched: a window matching NO Slot rule is never moved — proves the
-    # tile-allowlist (float/fullscreen stays the default for everything winspace was not
-    # asked to manage). The barrier is a matched window that IS placed: once it lands,
-    # the unmatched window must be byte-for-byte where it opened.
-    It 'unmatched-untouched: a non-matching window is never moved' -Tag 'slot-placement' {
+    # distribute-on-appear: a window matching NO rule is auto-placed by Distribute
+    # (ADR-0020) — moved to the least-occupied Display and MAXIMIZED. On a single
+    # desktop that is the window's own Display, so the Oracle is the maximized frame
+    # (≈ the monitor work area). This is the reversal of the retired ADR-0016
+    # tile-allowlist: managed is now the default, not an opt-in.
+    It 'distribute-on-appear: an unmatched window is maximized on its display' -Tag 'slot-placement' {
         $winspace = $null
         $unmatched = $null
-        $matched = $null
         try {
             Set-DesktopCount 1
             Set-WinspaceConfig -Content $script:SlotConfig | Out-Null
             $winspace = Start-Winspace
 
-            # A window whose title does NOT match the rule — the allowlist must skip it.
+            # A window whose title does NOT match the slot rule — Distribute manages it.
             $unmatched = Start-TestWindow -Title 'winspace-slot-unmatched' -X 120 -Y 120 -Width 400 -Height 300
-            $before = Get-FrameBounds -Hwnd $unmatched.Hwnd
 
-            # Barrier: a matched window opens and is placed, proving winspace processed
-            # the Appeared stream past the unmatched window's own Appeared.
-            $matched = Start-TestWindow -Title $script:SlotTitle -X 200 -Y 160 -Width 480 -Height 320
-            $work = Get-WorkArea -Hwnd $matched.Hwnd
-            $expected = Get-ExpectedSlotRect -WorkArea $work -Slot $script:Slot
-            Wait-Until -Because 'the matched window to be placed (stream drained past the unmatched one)' -Condition {
-                Test-RectNear -Actual (Get-FrameBounds -Hwnd $matched.Hwnd) -Expected $expected -Tolerance $script:SlotTolerance
+            # Distribute maximizes it on its own (only) Display; the Oracle is the
+            # maximized rect — the full work area, computed the same way the adapter does.
+            $work = Get-WorkArea -Hwnd $unmatched.Hwnd
+            $expected = Get-ExpectedSlotRect -WorkArea $work -Slot 'maximized'
+
+            Wait-Until -Because 'the unmatched window to be Distributed (maximized) on its display' -Condition {
+                Test-RectNear -Actual (Get-FrameBounds -Hwnd $unmatched.Hwnd) -Expected $expected -Tolerance $script:SlotTolerance
             }
 
-            # The unmatched window never moved — its frame is unchanged.
-            $after = Get-FrameBounds -Hwnd $unmatched.Hwnd
-            (Test-RectEqual -A $after -B $before) | Should -BeTrue `
-                -Because "an unmatched window $(Format-Rect $after) must be left exactly where it opened $(Format-Rect $before)"
+            $frame = Get-FrameBounds -Hwnd $unmatched.Hwnd
+            (Test-RectNear -Actual $frame -Expected $expected -Tolerance $script:SlotTolerance) | Should -BeTrue `
+                -Because "a Distributed window's visible frame $(Format-Rect $frame) must fill its display's work area $(Format-Rect $expected)"
         } catch {
-            Save-FailureScreenshot -Name 'slot-unmatched-untouched'
+            Save-FailureScreenshot -Name 'slot-distribute-on-appear'
             throw
         } finally {
             Stop-TestWindow $unmatched
-            Stop-TestWindow $matched
+            Stop-Winspace -Process $winspace
+        }
+    }
+
+    # ignore-untouched: an Ignore-matched window is left ENTIRELY alone — never placed by
+    # Distribute (ADR-0020 widened Ignore to "don't touch at all"), even though every
+    # unmatched window IS auto-maximized. The barrier is an unmatched sibling that gets
+    # Distributed (maximized): once it lands, the ignored window must still be exactly
+    # where it opened.
+    It 'ignore-untouched: an Ignore-matched window is neither placed nor resized' -Tag 'slot-placement' {
+        $winspace = $null
+        $ignored = $null
+        $unmatched = $null
+        try {
+            Set-DesktopCount 1
+            $ignoreTitle = 'winspace-slot-ignored'
+            # A double-quoted here-string: `$mod is escaped to survive to the file while
+            # $ignoreTitle expands here.
+            $cfg = @"
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
+windowrule = ignore, title:$ignoreTitle
+"@
+            Set-WinspaceConfig -Content $cfg | Out-Null
+            $winspace = Start-Winspace
+
+            # The ignored window opens at a distinct spot; winspace must not touch it.
+            $ignored = Start-TestWindow -Title $ignoreTitle -X 120 -Y 120 -Width 400 -Height 300
+            $before = Get-FrameBounds -Hwnd $ignored.Hwnd
+
+            # Barrier: an unmatched sibling opens and IS Distributed (maximized), proving
+            # winspace processed the Appeared stream past the ignored window's own Appeared.
+            $unmatched = Start-TestWindow -Title 'winspace-slot-unmatched' -X 200 -Y 160 -Width 480 -Height 320
+            $work = Get-WorkArea -Hwnd $unmatched.Hwnd
+            $expected = Get-ExpectedSlotRect -WorkArea $work -Slot 'maximized'
+            Wait-Until -Because 'the unmatched sibling to be Distributed (maximized)' -Condition {
+                Test-RectNear -Actual (Get-FrameBounds -Hwnd $unmatched.Hwnd) -Expected $expected -Tolerance $script:SlotTolerance
+            }
+
+            # The ignored window never moved — its frame is byte-for-byte unchanged.
+            $after = Get-FrameBounds -Hwnd $ignored.Hwnd
+            (Test-RectEqual -A $after -B $before) | Should -BeTrue `
+                -Because "an Ignore-matched window $(Format-Rect $after) must be left exactly where it opened $(Format-Rect $before)"
+        } catch {
+            Save-FailureScreenshot -Name 'slot-ignore-untouched'
+            throw
+        } finally {
+            Stop-TestWindow $ignored
+            Stop-TestWindow $unmatched
             Stop-Winspace -Process $winspace
         }
     }
