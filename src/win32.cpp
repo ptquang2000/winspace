@@ -1687,6 +1687,106 @@ inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
 }  // namespace winspace::io
 
 // ─────────────────────────────────────────────────────────────────────────────
+// [io section] control
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Control channel + single-instance discovery — I/O adapter (owns <windows.h>).
+//
+// The out-of-band surface ADR-0019 adds beside the Reducer's Event stream. It is
+// deliberately NOT part of window management: a Control message crosses a process
+// boundary into the Orchestrator's message-only window carrying a SCALAR request
+// (never the in-process Event* pointer), and mutates OS artifacts (the Logon
+// task) or lifecycle (quit) outside `reduce`. The install / uninstall commands
+// (the app section) are the only senders; the Worker's wndProc (below) is the
+// only receiver.
+//
+// Discovery is by the Worker window's class name under HWND_MESSAGE — the same
+// message-only window that receives in-process Event posts is what a second
+// process finds to prove an Orchestrator is live. The named mutex is the
+// race-free single-instance gate; the window is the addressable control target.
+
+namespace winspace::io {
+
+// The Worker's message-only window class. Shared so the Worker registers/creates
+// under it AND another process can FindWindowEx it to locate the Orchestrator.
+inline constexpr const wchar_t* k_workerClassName = L"winspace.worker";
+
+// The single-instance mutex. `Local\` scopes it to the interactive session, so
+// two logged-in accounts on one machine each get their own Orchestrator (matching
+// the per-user Logon task) and never collide.
+inline constexpr const wchar_t* k_orchestratorMutexName = L"Local\\winspace.orchestrator";
+
+// The three cross-process Control requests, carried as the SCALAR wParam of the
+// registered Control message. Values are explicit so the on-the-wire meaning is
+// stable regardless of enum layout.
+enum class Control : WPARAM {
+    SyncAutostart = 1,    // make the Logon task match the Orchestrator's live start_at_login
+    RemoveAutostart = 2,  // delete the Logon task (uninstall)
+    Quit = 3,             // graceful shutdown via the clean Shift+Q path
+};
+
+// The registered window message that carries a Control request. RegisterWindowMessage
+// returns the SAME id for the same string in every process, so sender and receiver
+// agree without sharing a header constant; the id is well above WM_APP, so it never
+// collides with k_wmEvent / k_wmSetHotkeyThread / k_wmReloadBinds. Cached in a
+// function-local static — registered once per process, reused thereafter.
+inline UINT controlMessage() {
+    static const UINT id = RegisterWindowMessageW(L"winspace.control");
+    return id;
+}
+
+// Discover a live Orchestrator: the Worker's message-only window, found by class
+// under HWND_MESSAGE. WINEVENT_SKIPOWNPROCESS is irrelevant here — a bare
+// `winspace` command runs in its OWN process, so the window it finds (if any) is
+// genuinely the separate Orchestrator's. Null when none is running.
+inline HWND findOrchestrator() {
+    return FindWindowExW(HWND_MESSAGE, nullptr, k_workerClassName, nullptr);
+}
+
+// How long a command waits on a graceful quit before force-killing a wedged
+// Orchestrator (ADR-0019). Long enough for the RAII teardown of the Hotkey/Hook
+// threads to run, short enough that a stuck instance never blocks scoop update.
+inline constexpr DWORD k_quitTimeoutMs = 5000;
+// The per-message SendMessageTimeout budget for the autostart mutations, so a hung
+// Orchestrator's UI thread cannot wedge the command indefinitely.
+inline constexpr DWORD k_controlSendTimeoutMs = 5000;
+
+// Send a Control request to a live Orchestrator and wait for it to be handled.
+// SendMessageTimeout blocks until the Worker's wndProc returns — i.e. the
+// autostart mutation completed — but abandons the wait if the target hangs
+// (SMTO_ABORTIFHUNG) so a wedged Orchestrator degrades rather than blocks. Returns
+// true iff the message was delivered and processed within the budget.
+inline bool sendControl(HWND orchestrator, Control request) {
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(orchestrator, controlMessage(), static_cast<WPARAM>(request), 0,
+                               SMTO_ABORTIFHUNG, k_controlSendTimeoutMs, &result) != 0;
+}
+
+// Stop a running Orchestrator so its exe unlocks (ADR-0019). Ask for a graceful
+// quit down the clean Shift+Q path, then wait on the process handle; if it does
+// not exit within the timeout it is wedged — force-kill as the last-resort
+// fallback (the one place this codebase resorts to OS-level force). Resolving the
+// PID BEFORE requesting quit avoids a race where the window is gone before we look.
+inline void stopOrchestrator(HWND orchestrator) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(orchestrator, &pid);
+    const HANDLE proc = pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr;
+
+    // Post (don't Send) quit: the window is about to be destroyed, so we do not
+    // want to block inside its wndProc — we wait on the process handle instead.
+    PostMessageW(orchestrator, controlMessage(), static_cast<WPARAM>(Control::Quit), 0);
+
+    if (!proc) return;  // no handle to wait on — best effort, the quit was posted
+    if (WaitForSingleObject(proc, k_quitTimeoutMs) != WAIT_OBJECT_0) {
+        lg::warn("uninstall: orchestrator did not exit within {}ms; force-killing", k_quitTimeoutMs);
+        TerminateProcess(proc, 1);
+    }
+    CloseHandle(proc);
+}
+
+}  // namespace winspace::io
+
+// ─────────────────────────────────────────────────────────────────────────────
 // [io section] worker
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1824,7 +1924,9 @@ public:
     }
 
 private:
-    static constexpr const wchar_t* k_className = L"winspace.worker";
+    // The message-only window class, shared with the control section so another
+    // process can FindWindowEx this exact window to reach the Orchestrator.
+    static constexpr const wchar_t* k_className = k_workerClassName;
 
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (msg == WM_NCCREATE) {
@@ -1843,7 +1945,46 @@ private:
             self->m_hotkeyThreadId = static_cast<DWORD>(wparam);
             return 0;
         }
+        // Cross-process Control message (ADR-0019). The registered id is resolved
+        // at runtime, so it cannot sit in a `case`; compared last, after the
+        // fixed WM_APP ids. Handled OUTSIDE the Reducer — it mutates OS artifacts
+        // or lifecycle, not window-management State.
+        if (self && msg == controlMessage()) {
+            self->onControl(static_cast<Control>(wparam));
+            return 0;
+        }
         return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    // Execute a cross-process Control request on the Worker's STA thread (the COM
+    // apartment the autostart executor needs). This is the receiving half of the
+    // control channel — the install / uninstall commands are the senders.
+    void onControl(Control request) {
+        switch (request) {
+            case Control::SyncAutostart:
+                // Make the Logon task match the Orchestrator's LIVE flag — the
+                // authoritative single source of truth (possibly just reloaded),
+                // so a running WM never needs its config re-read from disk. Same
+                // declarative executor as the SyncAutostart Effect; degrade-and-log.
+                if (const auto synced = syncAutostart(m_state.startAtLogin); !synced)
+                    lg::warn("control: sync-autostart (enabled={}) failed: {}",
+                             m_state.startAtLogin, synced.error());
+                break;
+            case Control::RemoveAutostart:
+                // Unconditionally delete the Logon task (uninstall). ERROR_FILE_NOT_FOUND
+                // is counted as success inside, so an absent task is a clean no-op.
+                if (const auto removed = syncAutostart(false); !removed)
+                    lg::warn("control: remove-autostart failed: {}", removed.error());
+                break;
+            case Control::Quit:
+                // Route into the EXISTING clean-shutdown path (the one a Shift+Q
+                // `quit` bind uses): post the Quit Event to ourselves so it flows
+                // through reduce -> Exit -> PostQuitMessage, ending run() and
+                // letting the spine's RAII tear the Hotkey/Hook threads down. Not
+                // TerminateProcess — that is only the command's timeout fallback.
+                postEvent(m_hwnd, new Event{Quit{}});
+                break;
+        }
     }
 
     // Take ownership of the posted Event, reduce it against current State, adopt
@@ -2270,9 +2411,96 @@ inline void hotkeyThreadMain(HWND workerHwnd, const std::vector<Bind>& binds,
     }
 }
 
+// Narrow wWinMain's wide command tail (the arguments AFTER the program name —
+// wWinMain's lpCmdLine excludes it) to UTF-8 tokens and hand them to the pure
+// parseCommand. Whitespace-split is sufficient: the two verbs are single bare
+// words with no paths or quoting, and any quoted/multi-token line is Other anyway
+// (handled by parseCommand's size check). Keeping the argv extraction here leaves
+// the core wchar_t-free and shell32-free — no CommandLineToArgvW needed.
+inline Command commandFromCmdLine(const wchar_t* cmdLine) {
+    const auto isSep = [](wchar_t c) { return c == L' ' || c == L'\t'; };
+    std::vector<std::string> args;
+    const std::wstring line = cmdLine ? cmdLine : L"";
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && isSep(line[i])) ++i;      // skip separators
+        const size_t start = i;
+        while (i < line.size() && !isSep(line[i])) ++i;     // take one token
+        if (i > start) args.push_back(toUtf8(std::wstring_view(line).substr(start, i - start)));
+    }
+    return parseCommand(args);
+}
+
+// The headless `winspace install` command (ADR-0019). Make OS autostart match the
+// config's start_at_login — NEVER enabling it unbidden: the flag stays the single
+// source of truth. Hybrid: a live Orchestrator holds the authoritative (possibly
+// reloaded) flag, so ask IT to sync via a Control message; with none running,
+// load/self-seed the config exactly as the WM does and perform the one-shot sync
+// directly. The Scoop post_install hook invokes this to re-stamp the Logon task to
+// the new versioned location on every update (the moved-binary self-heal) without
+// launching the WM. Returns 0 on success, non-zero so Scoop can read a failure.
+inline int runInstall() {
+    if (const HWND orchestrator = findOrchestrator()) {
+        return sendControl(orchestrator, Control::SyncAutostart) ? 0 : 1;
+    }
+    // No Orchestrator: read start_at_login from config (self-seeding a first-run
+    // default) and sync the task directly. A false flag deletes/leaves-absent the
+    // task, so a fresh install never starts seizing logon hooks.
+    const LoadedConfig cfg = loadConfig();
+    if (const auto synced = syncAutostart(cfg.startAtLogin); !synced) {
+        lg::warn("install: direct autostart sync (enabled={}) failed: {}", cfg.startAtLogin,
+                 synced.error());
+        return 1;
+    }
+    return 0;
+}
+
+// The headless `winspace uninstall` command (ADR-0019). Remove the
+// `\winspace\<user>` Logon task UNCONDITIONALLY and stop any running Orchestrator
+// so the exe unlocks for deletion. Hybrid: a live Orchestrator removes the task
+// (remove-autostart) and then is asked to quit gracefully (with a force-kill
+// timeout fallback); with none running, remove the task directly. The Scoop
+// pre_uninstall hook invokes this so uninstall never orphans the task nor fails on
+// the running-process file lock. An absent task counts as success (clean no-op).
+inline int runUninstall() {
+    if (const HWND orchestrator = findOrchestrator()) {
+        // Remove the task FIRST (while the STA COM thread is still alive to run it),
+        // then stop the process so its image unlocks.
+        const bool removed = sendControl(orchestrator, Control::RemoveAutostart);
+        stopOrchestrator(orchestrator);
+        return removed ? 0 : 1;
+    }
+    if (const auto removed = syncAutostart(false); !removed) {
+        lg::warn("uninstall: direct autostart removal failed: {}", removed.error());
+        return 1;
+    }
+    return 0;
+}
+
 // Bring up all three threads, run until Exit, then tear down cleanly. Returns the
 // process exit code. Called by wWinMain.
 inline int runApp() {
+    // Single-instance guard (ADR-0019). The WM owns EXCLUSIVE OS resources — the
+    // global hotkeys and the COM Virtual Desktop bridge — so a second `winspace`
+    // must not raise a competing Orchestrator. The named mutex is the race-free
+    // gate: if it already exists another instance owns the session, so exit 0
+    // (starting winspace twice is a successful no-op, not an error — user story 4).
+    // The Orchestrator's message-only window is the addressable control target the
+    // install/uninstall commands find; the mutex closes the two-launches-at-once
+    // race the window discovery alone cannot.
+    const HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, k_orchestratorMutexName);
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        lg::info("app: an orchestrator is already running; exiting (single-instance)");
+        CloseHandle(instanceMutex);  // release our reference; the live owner keeps the mutex
+        return 0;
+    }
+    // Owner (or CreateMutex failed — degrade to unguarded rather than refuse to
+    // start). Held for the process lifetime; the OS destroys the mutex when this
+    // last handle closes at exit, so a later relaunch is unguarded again as intended.
+    const auto releaseMutex = [&] {
+        if (instanceMutex) CloseHandle(instanceMutex);
+    };
+
     // Per-Monitor-V2 DPI awareness, set before any window exists (the Worker's
     // message-only HWND included), so it leads runApp. This puts the process and
     // every window rect in ONE physical-pixel coordinate space — the precondition
@@ -2304,6 +2532,7 @@ inline int runApp() {
     const HWND workerHwnd = hwndFuture.get();
     if (!workerHwnd) {
         workerThread.join();
+        releaseMutex();
         return 1;  // Worker could not create its window — nothing can proceed
     }
 
@@ -2349,6 +2578,7 @@ inline int runApp() {
 
     // Block until an Exit Effect posts WM_QUIT to the Worker and its loop returns.
     workerThread.join();
+    releaseMutex();
     return 0;
 }
 
@@ -2359,8 +2589,16 @@ inline int runApp() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Defining wWinMain makes the linker select the Unicode windows CRT startup
 // (wWinMainCRTStartup) automatically; /SUBSYSTEM:WINDOWS gives us no console.
-// Parameter names are omitted so /W4 /WX doesn't flag them as unreferenced. All
-// wiring lives in the I/O spine (the [io app section] above).
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    return winspace::io::runApp();
+// The command line is parsed BEFORE any window/thread exists (ADR-0019): no args
+// runs the WM (unchanged), `install`/`uninstall` run the headless commands, and
+// an unknown verb or stray arguments exit 2 (a usage error) rather than silently
+// starting the WM. All wiring lives in the I/O spine (the [io app section] above).
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR lpCmdLine, int) {
+    switch (winspace::io::commandFromCmdLine(lpCmdLine)) {
+        case winspace::Command::Run:       return winspace::io::runApp();
+        case winspace::Command::Install:   return winspace::io::runInstall();
+        case winspace::Command::Uninstall: return winspace::io::runUninstall();
+        case winspace::Command::Other:     return 2;
+    }
+    return 2;  // unreachable — the switch is exhaustive
 }
