@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -68,6 +69,39 @@ namespace winspace {
 enum class WindowId : uint64_t {};
 enum class MonitorId : uint64_t {};
 
+// A Virtual Desktop's identity as the core sees it: a plain, fixed-size,
+// <windows.h>-free POD narrowed from the OS GUID at the BRIDGE boundary (ADR-0003
+// keeps GUIDs out of the core; ADR-0023 needs an identity the core can reason
+// over). Opaque exactly as WindowId and MonitorId are — stored, compared, and
+// handed back, never interpreted. It is what lets the reconcile policy and the
+// Quit-cleanup selection be pure functions with real unit tests.
+struct DesktopKey {
+    std::array<uint8_t, 16> bytes{};
+};
+
+constexpr bool operator==(const DesktopKey& a, const DesktopKey& b) {
+    return a.bytes == b.bytes;
+}
+
+// One `logical → desktop` binding, plus its **Provenance**. The bool records
+// whether WINSPACE created that desktop, separating two questions that look like
+// one: a desktop being *addressable* (bound to a Logical workspace number, so
+// `workspace N` lands on it) is independent of it being *ours* (destroyable by
+// Quit cleanup). Set true only on the create-and-bind path; Adoption and
+// Reconciliation both record false — winspace inherits the session rather than
+// annexing it. Lives in the bridge; the core only owns the shape and the two pure
+// policies over it (reconcile, desktopsToCleanup).
+struct DesktopBinding {
+    int logical = 0;
+    DesktopKey key{};
+    bool createdByWinspace = false;
+};
+
+constexpr bool operator==(const DesktopBinding& a, const DesktopBinding& b) {
+    return a.logical == b.logical && a.key == b.key &&
+           a.createdByWinspace == b.createdByWinspace;
+}
+
 // A logical rectangle in virtual-screen coordinates. Plain data; the Reducer
 // reasons in these (directional focus resolves over them). The
 // drop-shadow delta and DPI never enter the core.
@@ -83,17 +117,24 @@ struct Rect {
 // `rect` in virtual-screen coordinates (the directional resolution reasons over
 // these), and the eligibility booleans — the Eligibility gate is the pure AND of
 // those facts. The rect is probed together with the eligibility facts in one read.
+//
+// Every field here is a FACT the adapter read, never a verdict it formed
+// (ADR-0006). `monitorBounds` (the Display's full bounds — rcMonitor, taskbar
+// included) and `zoomed` (IsZoomed, i.e. OS-maximized) exist so the Reducer can
+// derive **Fullscreen** itself; the adapter used to decide that one and no unit
+// test could reach the decision.
 struct WindowAttrs {
     WindowId id{};
     MonitorId monitor{};
     Rect rect{};
+    Rect monitorBounds{};
     bool topLevel = false;
     bool visible = false;
     bool thickFrame = false;
     bool caption = false;
     bool toolWindow = false;
     bool cloaked = false;
-    bool fullscreen = false;
+    bool zoomed = false;
 };
 
 // The string half of a window Probe — the identity a WindowRule matches against
@@ -119,6 +160,16 @@ struct WindowIdentity {
 struct DisplayOccupancy {
     MonitorId id{};
     int count = 0;
+};
+
+// One Display and WHERE it is — its full bounds in virtual-screen coordinates. The
+// fact `movetodisplay` needs and Distribute does not: choosing the neighbouring
+// Display in a Direction is geometry, whereas choosing the least-occupied one is
+// arithmetic over counts. Built by the Worker (EnumDisplayMonitors + rcMonitor),
+// consumed by the pure resolveDisplayInDirection.
+struct DisplayInfo {
+    MonitorId id{};
+    Rect bounds{};
 };
 
 // One probed window: the (attrs, identity) pair — the same pair an Appeared
@@ -214,6 +265,21 @@ struct WorkspaceSwitch {
 };
 struct Quit {};
 
+// The OS says the active Virtual Desktop changed (ADR-0023). Translated to a
+// Logical workspace number by the bridge and posted by the Worker after one
+// idempotent reconcile — never straight from the Notification sink's callback.
+//
+// This is the SOLE writer of State.currentWorkspace. The OS notifies for
+// winspace's OWN switches as well as the user's Win+Ctrl+→, so one path serves
+// both: the Reducer emits SwitchToWorkspace expressing INTENT and reality
+// re-enters as this Event — the third instance of the shape ResolveFocus →
+// FocusResolve and ResolveDistribute → DistributeResolve already use. Consequence:
+// currentWorkspace is EVENTUALLY CONSISTENT — between a bind firing and the
+// notification landing, State still names the old Workspace.
+struct WorkspaceChanged {
+    int logical = 0;
+};
+
 // Spatial focus is a two-phase probe round-trip (ADR-0008): an Effect cannot hand
 // data back to the pure Reducer, so the Probed rects re-enter as a second Event.
 // FocusMove is what the Hotkey thread posts (it knows only which key fired);
@@ -232,6 +298,28 @@ struct FocusResolve {
 // posts (the bind fired); the Worker runs the sweep and posts TileResolve back to
 // itself with the probed windows. Unlike the focus sweep, tile gathers identity
 // too (it must match rules), so its payload is ProbedWindows, not bare WindowAttrs.
+// `movetodisplay left|right|up|down` — send the foreground window to the
+// neighbouring Display in that Direction and maximize it there. A two-phase Probe
+// round-trip mirroring Spatial focus and Distribute, because the Reducer cannot
+// enumerate Displays: MoveToDisplay is what the Hotkey thread posts (it knows only
+// which key fired); MoveToDisplayResolve is what the Worker posts back after
+// probing the live Display list WITH THEIR RECTS plus the foreground window and the
+// Display it currently sits on.
+//
+// The destination is named DIRECTIONALLY, never by index: EnumDisplayMonitors order
+// is not user-visible, does not match the numbers in Windows Display Settings, and
+// is not stable across a replug or a dock — a bind to `2` would silently mean a
+// different monitor tomorrow.
+struct MoveToDisplay {
+    reducer::Direction dir{};
+};
+struct MoveToDisplayResolve {
+    reducer::Direction dir{};
+    std::optional<WindowId> subject;   // the foreground window; nullopt => no-op
+    MonitorId subjectDisplay{};        // the Display it currently occupies
+    std::vector<DisplayInfo> displays; // every live Display with its bounds
+};
+
 struct Tile {};
 struct TileResolve {
     std::vector<ProbedWindow> windows;    // the full probed set, unfiltered
@@ -292,8 +380,9 @@ struct Reloaded {};
 // Event the Worker posts to itself once the new file has parsed cleanly.
 struct Reload {};
 
-using Event = std::variant<WorkspaceSwitch, Quit, FocusMove, FocusResolve, MoveToWorkspace,
-                           Appeared, Vanished, DistributeResolve, Started, Reloaded, Reload, Tile,
+using Event = std::variant<WorkspaceSwitch, Quit, WorkspaceChanged, FocusMove, FocusResolve,
+                           MoveToWorkspace, MoveToDisplay, MoveToDisplayResolve, Appeared,
+                           Vanished, DistributeResolve, Started, Reloaded, Reload, Tile,
                            TileResolve>;
 
 // Effects — what the Reducer asks the outside world to do. Executed by the
@@ -309,6 +398,25 @@ struct SwitchToWorkspace {
 };
 struct Exit {};
 
+// Leave the session as winspace found it (ADR-0024): switch to the **Home
+// desktop** — the one active at Adoption — and destroy every Virtual Desktop whose
+// **Provenance** says winspace created it, passing home as the RemoveDesktop
+// fallback so windows MIGRATE rather than being lost. Foreign desktops survive
+// untouched: "clean up all workspaces" must never mean "delete your stuff".
+//
+// Unconditional, NOT empty-only. Once winspace exits the user no longer has
+// `workspace N` binds, so a window parked on desktop 7 does not become neutral, it
+// becomes *harder to reach* — recoverable only by walking Win+Ctrl+→. Consolidating
+// onto home is the kind option; stranding is the destructive one. Asking about
+// occupancy would also make shutdown unpredictable.
+//
+// Emitted by `Quit` immediately BEFORE Exit, so all three quit paths (the `quit`
+// bind, the Control message from `winspace uninstall` or a second instance, and the
+// selftest hook) inherit cleanup for free. Two constraints live inside the adapter,
+// not here: the switch to home must COMPLETE before any removal, and the arm must
+// NOT consult State.currentWorkspace, which is eventually consistent (ADR-0023).
+struct CleanupWorkspaces {};
+
 // ResolveFocus asks the Worker to run the Probe sweep and post FocusResolve back;
 // SetForegroundWindow asks it to bring the resolved target to the foreground.
 struct ResolveFocus {
@@ -322,6 +430,13 @@ struct SetForegroundWindow {
 // attrs AND identity per window) and post TileResolve back — the tile counterpart
 // of ResolveFocus (ADR-0016). Carries nothing: the sweep needs no argument.
 struct ResolveTile {};
+
+// Phase one of the movetodisplay round-trip, mirroring ResolveFocus: ask the Worker
+// to probe the live Display list (with rects) and the foreground window, and post
+// MoveToDisplayResolve back. The Reducer cannot enumerate Displays, so it only asks.
+struct ResolveMoveToDisplay {
+    reducer::Direction dir{};
+};
 
 // Move the foreground window to a Logical workspace (resolved to a GUID in the
 // bridge, ADR-0010; the target is materialized on demand WITHOUT switching). The
@@ -397,23 +512,31 @@ struct SyncAutostart {
     bool enabled = false;
 };
 
-using Effect = std::variant<SwitchToWorkspace, Exit, ResolveFocus, SetForegroundWindow,
+using Effect = std::variant<SwitchToWorkspace, Exit, CleanupWorkspaces, ResolveFocus,
+                            SetForegroundWindow,
                             MoveForegroundWindowToWorkspace, MoveWindowToWorkspace, ResolveDistribute,
-                            PositionWindow, ResolveTile, LaunchApp, ReloadConfig,
-                            SyncAutostart>;
+                            PositionWindow, ResolveTile, ResolveMoveToDisplay, LaunchApp,
+                            ReloadConfig, SyncAutostart>;
 
 constexpr bool operator==(const WorkspaceSwitch& a, const WorkspaceSwitch& b) {
     return a.n == b.n;
 }
 constexpr bool operator==(const Quit&, const Quit&) { return true; }
+constexpr bool operator==(const WorkspaceChanged& a, const WorkspaceChanged& b) {
+    return a.logical == b.logical;
+}
 constexpr bool operator==(const SwitchToWorkspace& a, const SwitchToWorkspace& b) {
     return a.logical == b.logical;
 }
 constexpr bool operator==(const Exit&, const Exit&) { return true; }
+constexpr bool operator==(const CleanupWorkspaces&, const CleanupWorkspaces&) { return true; }
 constexpr bool operator==(const ResolveFocus& a, const ResolveFocus& b) {
     return a.dir == b.dir;
 }
 constexpr bool operator==(const ResolveTile&, const ResolveTile&) { return true; }
+constexpr bool operator==(const ResolveMoveToDisplay& a, const ResolveMoveToDisplay& b) {
+    return a.dir == b.dir;
+}
 constexpr bool operator==(const SetForegroundWindow& a, const SetForegroundWindow& b) {
     return a.id == b.id;
 }
@@ -449,11 +572,15 @@ constexpr bool operator==(const SyncAutostart& a, const SyncAutostart& b) {
 constexpr bool operator==(const Rect& a, const Rect& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
+constexpr bool operator==(const DisplayInfo& a, const DisplayInfo& b) {
+    return a.id == b.id && a.bounds == b.bounds;
+}
 constexpr bool operator==(const WindowAttrs& a, const WindowAttrs& b) {
     return a.id == b.id && a.monitor == b.monitor && a.rect == b.rect &&
-           a.topLevel == b.topLevel && a.visible == b.visible && a.thickFrame == b.thickFrame &&
+           a.monitorBounds == b.monitorBounds && a.topLevel == b.topLevel &&
+           a.visible == b.visible && a.thickFrame == b.thickFrame &&
            a.caption == b.caption && a.toolWindow == b.toolWindow && a.cloaked == b.cloaked &&
-           a.fullscreen == b.fullscreen;
+           a.zoomed == b.zoomed;
 }
 
 // All the Reducer owns. Tiny by design: pass-by-value and return-by-value keep
@@ -461,6 +588,11 @@ constexpr bool operator==(const WindowAttrs& a, const WindowAttrs& b) {
 // Spatial focus is stateless, resolving from rects probed live at
 // keypress, so nothing about windows is persisted between events.
 struct State {
+    // Which Workspace the OS says is current. Written by exactly ONE Event,
+    // WorkspaceChanged (ADR-0023) — never by the Effects that ask for a switch. That
+    // makes it EVENTUALLY CONSISTENT: between a bind firing and the OS notification
+    // landing it still names the old Workspace, so any future logic that switches
+    // and then reads "where am I" inside the same reduce would read stale.
     int currentWorkspace = 1;
     bool running = true;
 
@@ -521,15 +653,96 @@ overload(Fs...) -> overload<Fs...>;
 
 // ── eligibility: the pure window gate (substrate for focus + rules) ──────────
 
+// Does the window cover its Display's FULL bounds (rcMonitor, taskbar included)?
+// A zero/degenerate `monitorBounds` — the adapter could not read the monitor —
+// answers false rather than trivially true, so an unreadable Display degrades to
+// "not fullscreen" instead of quietly making every window on it Ineligible.
+constexpr bool coversDisplay(const WindowAttrs& a) {
+    const Rect& m = a.monitorBounds;
+    if (m.right <= m.left || m.bottom <= m.top) return false;
+    return a.rect.left <= m.left && a.rect.top <= m.top && a.rect.right >= m.right &&
+           a.rect.bottom >= m.bottom;
+}
+
+// Fullscreen: covers the Display's full bounds AND is not OS-maximized.
+//
+// The `!zoomed` half is LOAD-BEARING — do not "simplify" it away. Geometry alone
+// cannot separate fullscreen from **maximized**: on a Display with no taskbar the
+// work area IS the monitor bounds, so ADR-0020's auto-maximize makes every window
+// there cover rcMonitor exactly. Defining Fullscreen by geometry alone therefore
+// made every window on a taskbar-less second Display Ineligible, and Spatial focus
+// could neither enter nor move within it. The distinction was never geometry; it is
+// window *state* (CONTEXT.md → Fullscreen).
+constexpr bool isFullscreen(const WindowAttrs& a) { return coversDisplay(a) && !a.zoomed; }
+
 // The Eligibility gate: a window is Eligible iff every probed fact agrees. A
 // real top-level, visible, resizable, captioned application window that is
 // neither a tool window, cloaked, nor fullscreen. The Spatial-focus sweep
 // filters candidates through this; the window rules match against the
 // same set. (`thickFrame` is a tiling-era hold-over and may be loosened for
-// focus candidacy later — see ADR-0007.)
+// focus candidacy later — see ADR-0007.) Fullscreen is the one term that is
+// DERIVED from probed facts rather than probed directly (ADR-0006: the Probe
+// gathers facts, the Reducer decides) — the gate is still the AND of those facts.
 constexpr bool isEligible(const WindowAttrs& a) {
     return a.topLevel && a.visible && a.thickFrame && a.caption && !a.toolWindow && !a.cloaked &&
-           !a.fullscreen;
+           !isFullscreen(a);
+}
+
+// ── reconciliation: the pure desktop-binding policy (ADR-0023) ───────────────
+
+// Rebuild the bindings from the live Virtual Desktop set — the whole
+// Reconciliation policy, pure and unit-tested with no live desktop (which is the
+// point of DesktopKey being opaque). Given the previous bindings and the keys the
+// OS currently reports:
+//
+//   * a key present in BOTH keeps its Logical workspace number AND its Provenance
+//     — a Task View drag reorders desktops but disturbs no numbers (ADR-0003:
+//     identity, never array position), and a winspace-created desktop stays ours;
+//   * a key that has DISAPPEARED is dropped, freeing its number;
+//   * a key that is NEW is bound at the LOWEST FREE number and recorded foreign.
+//     Lowest-free, not max+1 — otherwise numbering ratchets upward all session and
+//     you end up binding `workspace 17` on a four-desktop machine.
+//
+// A function of its inputs alone: no I/O, no COM, idempotent, and independent of
+// the order the live keys arrive in. That last property is why several new keys
+// are assigned in a deterministic order derived from their identity rather than
+// from enumeration order, and why the result is returned sorted by logical number.
+inline std::vector<DesktopBinding> reconcile(const std::vector<DesktopBinding>& previous,
+                                             const std::vector<DesktopKey>& live) {
+    std::vector<DesktopBinding> next;
+    std::vector<DesktopKey> fresh;
+    for (const DesktopKey& key : live) {
+        const auto prior = std::ranges::find(previous, key, &DesktopBinding::key);
+        if (prior != previous.end())
+            next.push_back(*prior);   // number and Provenance both survive
+        else
+            fresh.push_back(key);
+    }
+
+    std::ranges::sort(fresh, {}, &DesktopKey::bytes);
+    const auto taken = [&](int n) {
+        return std::ranges::any_of(next, [&](const DesktopBinding& b) { return b.logical == n; });
+    };
+    int candidate = 1;
+    for (const DesktopKey& key : fresh) {
+        while (taken(candidate)) ++candidate;
+        next.push_back({candidate, key, false});  // foreign: winspace did not make it
+        ++candidate;
+    }
+
+    std::ranges::sort(next, {}, &DesktopBinding::logical);
+    return next;
+}
+
+// ── quit cleanup: the pure selection (ADR-0024) ──────────────────────────────
+
+// Which desktops Quit cleanup may destroy: exactly those whose **Provenance** says
+// winspace created them. Pure over the opaque DesktopKey, so the safety guarantee
+// — a foreign desktop is NEVER returned — is a unit-testable assertion rather than
+// a claim about COM code. A session that created nothing selects nothing.
+inline std::vector<DesktopKey> desktopsToCleanup(const std::vector<DesktopBinding>& bindings) {
+    return bindings | std::views::filter(&DesktopBinding::createdByWinspace) |
+           std::views::transform(&DesktopBinding::key) | std::ranges::to<std::vector>();
 }
 
 // ── directional focus resolution: the pure rule (ADR-0008) ───────────────────
@@ -615,6 +828,47 @@ inline std::optional<WindowId> resolveFocus(reducer::Direction dir,
                          std::tie(best->band, best->dist, best->id)) {
             best = s;
             chosen = c.id;
+        }
+    }
+    return chosen;
+}
+
+// ── movetodisplay: the pure destination rule ─────────────────────────────────
+
+// The neighbouring Display in a Direction, shaped exactly like resolveFocus and
+// sharing its arithmetic: from the SUBJECT'S CURRENT Display centre, the nearest
+// Display whose centre lies STRICTLY ahead in the Direction, ties broken
+// deterministically by the opaque MonitorId so the result never depends on
+// enumeration order. There is no cross-axis band term — Displays are few and large,
+// so nearest-ahead is the whole rule.
+//
+// Nothing ahead yields nullopt and the caller emits no Effect, so the edge-of-desk
+// press and the single-Display machine both fall out with no special case. A
+// `current` that names no listed Display (an unreadable monitor) is likewise a
+// no-op rather than a guess.
+inline std::optional<MonitorId> resolveDisplayInDirection(reducer::Direction dir,
+                                                          const std::vector<DisplayInfo>& displays,
+                                                          MonitorId current) {
+    using namespace focus_detail;
+    const auto here = std::ranges::find(displays, current, &DisplayInfo::id);
+    if (here == displays.end()) return std::nullopt;
+    const Center oc = center(here->bounds);
+
+    struct Score {
+        long long dist;  // squared centre distance
+        MonitorId id;    // deterministic final tie-break
+    };
+    std::optional<Score> best;
+    std::optional<MonitorId> chosen;
+
+    for (const DisplayInfo& d : displays) {
+        if (d.id == current) continue;   // never its own destination
+        const Center dc = center(d.bounds);
+        if (!ahead(dir, dc, oc)) continue;
+        const Score s{distSq(dc, oc), d.id};
+        if (!best || std::tie(s.dist, s.id) < std::tie(best->dist, best->id)) {
+            best = s;
+            chosen = d.id;
         }
     }
     return chosen;
@@ -735,15 +989,30 @@ inline std::optional<MonitorId> pickDistributeTarget(const std::vector<DisplayOc
 inline ReduceResult reduce(const State& s, const Event& e) {
     return std::visit(
         detail::overload{
+            // Emit the INTENT and nothing else. currentWorkspace is deliberately
+            // NOT written here (ADR-0023): the OS notifies for winspace's own
+            // switches too, so the fact re-enters as WorkspaceChanged — its sole
+            // writer. Recording the hoped-for number here would make State say
+            // "where we asked to go" rather than "where the OS says we are".
             [&](const WorkspaceSwitch& ws) -> ReduceResult {
-                State next = s;
-                next.currentWorkspace = ws.n;
-                return {next, {Effect{SwitchToWorkspace{ws.n}}}};
+                return {s, {Effect{SwitchToWorkspace{ws.n}}}};
             },
+            // The OS's confirmation, arriving for winspace's own switches and the
+            // user's Win+Ctrl+→ alike: record it and emit NOTHING. Emitting a switch
+            // here would loop.
+            [&](const WorkspaceChanged& wc) -> ReduceResult {
+                State next = s;
+                next.currentWorkspace = wc.logical;
+                return {next, {}};
+            },
+            // Quit emits an ORDERED PAIR (ADR-0024): tidy up the desktops winspace
+            // created, THEN exit. Order matters and the Worker executes Effects in
+            // emission order, exactly as the follow-move already relies on to emit
+            // its move before its switch.
             [&](const Quit&) -> ReduceResult {
                 State next = s;
                 next.running = false;
-                return {next, {Effect{Exit{}}}};
+                return {next, {Effect{CleanupWorkspaces{}}, Effect{Exit{}}}};
             },
             // Phase one: ask the Worker to run the Probe sweep. State is untouched —
             // spatial focus persists nothing (ADR-0007).
@@ -763,11 +1032,38 @@ inline ReduceResult reduce(const State& s, const Event& e) {
             // desktop for its cloak decision before any follow-on switch lands.
             [&](const MoveToWorkspace& m) -> ReduceResult {
                 std::vector<Effect> effects{Effect{MoveForegroundWindowToWorkspace{m.logical}}};
-                if (!m.follow) return {s, std::move(effects)};
-                State next = s;
-                next.currentWorkspace = m.logical;
-                effects.push_back(Effect{SwitchToWorkspace{m.logical}});
-                return {next, std::move(effects)};
+                if (m.follow) effects.push_back(Effect{SwitchToWorkspace{m.logical}});
+                // State is untouched even on the follow form: the switch is intent,
+                // and WorkspaceChanged is what records where the OS actually landed
+                // (ADR-0023's single-writer rule).
+                return {s, std::move(effects)};
+            },
+            // Phase one of the movetodisplay round-trip, mirroring FocusMove: ask
+            // the Worker to probe the Displays and the foreground window. State is
+            // untouched — like `tile`, movetodisplay is explicit and repeatable, so
+            // it neither consults nor writes the place-once set and never spends a
+            // window's one placement.
+            [&](const MoveToDisplay& m) -> ReduceResult {
+                return {s, {Effect{ResolveMoveToDisplay{m.dir}}}};
+            },
+            // Phase two: the Display rects and the subject have re-entered as an
+            // Event. Resolve the neighbouring Display purely and emit at most ONE
+            // PositionWindow, maximized there — the existing bounded geometry write
+            // (ADR-0016 + ADR-0020), no new Effect and no widening of ADR-0007's ban.
+            //
+            // Three no-ops, each falling out rather than special-cased: no foreground
+            // window (nothing to move, matching focus's missing Origin), a foreground
+            // window in the Ignore-set (Ignore means "don't touch at all", ADR-0020),
+            // and nothing ahead in the Direction (the desk edge, and the whole
+            // single-Display case). A cross-Workspace move is NEVER emitted — Display
+            // and geometry only, the same boundary Distribute holds.
+            [&](const MoveToDisplayResolve& r) -> ReduceResult {
+                if (!r.subject) return {s, {}};
+                if (s.ignored.contains(*r.subject)) return {s, {}};
+                const std::optional<MonitorId> target =
+                    resolveDisplayInDirection(r.dir, r.displays, r.subjectDisplay);
+                if (!target) return {s, {}};
+                return {s, {Effect{PositionWindow{*r.subject, target, Slot::Maximized}}}};
             },
             // A window appeared (SHOW / UNCLOAKED). Place-once (ADR-0009): if the id
             // is already `placed`, do nothing. If the window is not Eligible, emit
@@ -1036,6 +1332,7 @@ enum class Dispatcher : uint8_t {
     MoveToWorkspaceSilent,  // movetoworkspacesilent N — move, stay on current
     Reload,                 // reload — re-read + re-apply the config file
     Tile,                   // tile — re-place every open window into its Slot (ADR-0016)
+    MoveToDisplay,          // movetodisplay DIR — send the foreground window one Display over
 };
 
 // A parsed bind line. `arg` carries the workspace number for Workspace and the two
@@ -1194,7 +1491,22 @@ inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
     if (t == "movetoworkspacesilent") return Dispatcher::MoveToWorkspaceSilent;
     if (t == "reload") return Dispatcher::Reload;
     if (t == "tile") return Dispatcher::Tile;
+    if (t == "movetodisplay") return Dispatcher::MoveToDisplay;
     return std::nullopt;
+}
+
+// A name that did not die — it moved. `movetomonitor` is the Hyprland spelling of a
+// capability winspace HAS, one keybind away, so it earns a rename pointer rather
+// than the "removed with tiling" message it used to get (which was a lie the moment
+// movetodisplay shipped). This is CONTEXT.md's glossary asserting itself on the
+// config surface: Display is the term, Monitor is listed under _Avoid_.
+inline std::optional<std::string_view> renamed_dispatcher(std::string_view name) {
+    if (name == "movetomonitor") return "movetodisplay";
+    return std::nullopt;
+}
+
+inline std::string renamed_message(std::string_view name, std::string_view to) {
+    return "'" + std::string(name) + "' was renamed to '" + std::string(to) + "'";
 }
 
 // Names removed when tiling was dropped (ADR-0007) — dispatchers a `bind` might
@@ -1205,8 +1517,9 @@ inline std::optional<Dispatcher> parse_dispatcher(std::string_view t) {
 // removed dispatcher name collides with a removed setting name.
 inline bool is_removed_tiling_name(std::string_view name) {
     static constexpr std::string_view removed[] = {
-        // dispatchers
-        "movewindow", "maximize", "resizeactive", "togglefloat", "movetomonitor",
+        // dispatchers. NOTE `movetomonitor` is deliberately absent — it was renamed,
+        // not removed, and gets its own targeted message (see renamed_dispatcher).
+        "movewindow", "maximize", "resizeactive", "togglefloat",
         // settings
         "min_tile_width", "min_tile_height"};
     return std::ranges::contains(removed, name);
@@ -1389,10 +1702,13 @@ inline ParseResult parse(std::string_view text) {
 
             const auto disp = parse_dispatcher(fields[2]);
             if (!disp) {
+                const auto renamed = renamed_dispatcher(fields[2]);
                 result.diagnostics.push_back(
-                    {line_no, is_removed_tiling_name(fields[2])
-                                  ? removed_tiling_message(fields[2])
-                                  : "unknown dispatcher '" + std::string(fields[2]) + "'"});
+                    {line_no,
+                     renamed  ? renamed_message(fields[2], *renamed)
+                     : is_removed_tiling_name(fields[2])
+                              ? removed_tiling_message(fields[2])
+                              : "unknown dispatcher '" + std::string(fields[2]) + "'"});
                 continue;
             }
 
@@ -1422,10 +1738,13 @@ inline ParseResult parse(std::string_view text) {
                     continue;
                 }
                 bind.arg = n;
-            } else if (*disp == Dispatcher::Focus) {
+            } else if (*disp == Dispatcher::Focus || *disp == Dispatcher::MoveToDisplay) {
+                // focus and movetodisplay share the Direction vocabulary and this
+                // parsing path: one steers the keyboard, the other the window.
                 if (fields.size() < 4 || fields[3].empty()) {
                     result.diagnostics.push_back(
-                        {line_no, "focus dispatcher needs a direction (left|right|up|down)"});
+                        {line_no, std::string(fields[2]) +
+                                      " dispatcher needs a direction (left|right|up|down)"});
                     continue;
                 }
                 const auto dir = parse_direction(fields[3]);
@@ -1632,10 +1951,12 @@ inline ParseResult parse(std::string_view text) {
         // tiling (a dropped setting like min_tile_width, or a dispatcher used as a
         // bare directive), give the targeted message so a ported config reads as
         // scoped, not mistyped.
+        const auto renamedDirective = renamed_dispatcher(lhs);
         result.diagnostics.push_back(
-            {line_no, is_removed_tiling_name(lhs)
-                          ? removed_tiling_message(lhs)
-                          : "unknown directive '" + std::string(lhs) + "'"});
+            {line_no, renamedDirective  ? renamed_message(lhs, *renamedDirective)
+                      : is_removed_tiling_name(lhs)
+                                        ? removed_tiling_message(lhs)
+                                        : "unknown directive '" + std::string(lhs) + "'"});
     }
 
     return result;

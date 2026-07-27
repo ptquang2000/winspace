@@ -52,17 +52,52 @@ TEST_CASE("a WorkspaceSwitch Event emits exactly SwitchToWorkspace with that num
 
     // The Effect carries the requested logical number...
     REQUIRE(single_effect<SwitchToWorkspace>(r) == SwitchToWorkspace{5});
-    // ...and the same number is what currentWorkspace becomes.
-    REQUIRE(r.state.currentWorkspace == 5);
+    // ...and State is NOT written: the switch is INTENT, and WorkspaceChanged is the
+    // sole writer of currentWorkspace (ADR-0023). Until the OS confirms, State still
+    // honestly names the Workspace we are on.
+    REQUIRE(r.state.currentWorkspace == 1);
     REQUIRE(r.state.running);
 }
 
 TEST_CASE("the switch target is the Event's number, not a delta from the current workspace", "[reducer]") {
-    // Already on 4; switching to 2 lands on 2, not 4-2 or 4+2.
+    // Already on 4; the Effect names 2, not 4-2 or 4+2. State stays 4 until the OS
+    // confirms the landing via WorkspaceChanged (the single-writer rule).
     const auto r = reduce(State{.currentWorkspace = 4, .running = true}, WorkspaceSwitch{2});
 
     REQUIRE(single_effect<SwitchToWorkspace>(r) == SwitchToWorkspace{2});
-    REQUIRE(r.state.currentWorkspace == 2);
+    REQUIRE(r.state.currentWorkspace == 4);
+}
+
+// ── WorkspaceChanged: the sole writer of currentWorkspace (ADR-0023) ─────────
+
+TEST_CASE("WorkspaceChanged records the current workspace and emits no Effect", "[reducer]") {
+    // The OS's confirmation, arriving for winspace's own switches and the user's
+    // Win+Ctrl+→ alike. Emitting a switch here would loop.
+    const auto r = reduce(State{.currentWorkspace = 1, .running = true}, WorkspaceChanged{4});
+
+    REQUIRE(r.effects.empty());
+    REQUIRE(r.state.currentWorkspace == 4);
+    REQUIRE(r.state.running);
+}
+
+TEST_CASE("WorkspaceChanged is the only writer — a switch then its confirmation", "[reducer]") {
+    // The full round trip: intent, then reality. Only the second step moves State.
+    const auto switched = reduce(State{.currentWorkspace = 1, .running = true},
+                                 WorkspaceSwitch{3});
+    REQUIRE(switched.state.currentWorkspace == 1);
+
+    const auto confirmed = reduce(switched.state, WorkspaceChanged{3});
+    REQUIRE(confirmed.state.currentWorkspace == 3);
+    REQUIRE(confirmed.effects.empty());
+}
+
+TEST_CASE("an external switch is recorded by the same path as winspace's own", "[reducer]") {
+    // Nothing preceded this WorkspaceChanged — the user pressed Win+Ctrl+→. One
+    // path serves both cases, which is why no "was it ours?" flag exists.
+    const auto r = reduce(State{.currentWorkspace = 2, .running = true}, WorkspaceChanged{5});
+
+    REQUIRE(r.state.currentWorkspace == 5);
+    REQUIRE(r.effects.empty());
 }
 
 TEST_CASE("switching to the workspace already current still emits the Effect", "[reducer]") {
@@ -74,11 +109,15 @@ TEST_CASE("switching to the workspace already current still emits the Effect", "
     REQUIRE(r.state.currentWorkspace == 3);
 }
 
-TEST_CASE("a Quit Event emits Exit and clears running", "[reducer]") {
+TEST_CASE("a Quit Event emits cleanup then Exit, in that order, and clears running", "[reducer]") {
     const auto r = reduce(State{.currentWorkspace = 2, .running = true}, Quit{});
 
-    // Exit is the observable Effect; running=false is exactly what it reveals.
-    REQUIRE(single_effect<Exit>(r) == Exit{});
+    // The ordered pair (ADR-0024): tidy up the desktops winspace created, THEN exit.
+    // Order is the assertion — the Worker executes Effects in emission order, and
+    // cleanup must run while the COM bridge is still alive.
+    REQUIRE(r.effects.size() == 2);
+    REQUIRE(std::holds_alternative<CleanupWorkspaces>(r.effects[0]));
+    REQUIRE(std::holds_alternative<Exit>(r.effects[1]));
     REQUIRE_FALSE(r.state.running);
     // Quit doesn't move the workspace.
     REQUIRE(r.state.currentWorkspace == 2);
@@ -112,8 +151,10 @@ TEST_CASE("movetoworkspace (follow) emits the move then the switch", "[reducer]"
             MoveForegroundWindowToWorkspace{3});
     REQUIRE(std::holds_alternative<SwitchToWorkspace>(r.effects[1]));
     REQUIRE(std::get<SwitchToWorkspace>(r.effects[1]) == SwitchToWorkspace{3});
-    // Following advances the active workspace, exactly as a bare WorkspaceSwitch would.
-    REQUIRE(r.state.currentWorkspace == 3);
+    // Following emits the switch but writes NO State — exactly as a bare
+    // WorkspaceSwitch does. WorkspaceChanged is the sole writer (ADR-0023), so the
+    // follow-move's speculative assignment is gone.
+    REQUIRE(r.state.currentWorkspace == 1);
 }
 
 TEST_CASE("movetoworkspacesilent emits only the move and stays on the current workspace", "[reducer]") {
@@ -153,10 +194,14 @@ WindowAttrs eligible(WindowId id, MonitorId monitor) {
                        .caption = true,
                        .toolWindow = false,
                        .cloaked = false,
-                       .fullscreen = false};
+                       .zoomed = false};
 }
 
 constexpr MonitorId kMon{1};
+
+// A whole Display's bounds (rcMonitor) — used by the Fullscreen cases, which are
+// the only ones that care where the monitor edges are.
+constexpr Rect kDisplay{0, 0, 1920, 1080};
 
 }  // namespace
 
@@ -173,7 +218,49 @@ TEST_CASE("isEligible is the AND of the probed facts — each condition alone fl
     // Each must-be-false fact, set, drops it out.
     auto tool = ok; tool.toolWindow = true; REQUIRE_FALSE(isEligible(tool));
     auto cloaked = ok; cloaked.cloaked = true; REQUIRE_FALSE(isEligible(cloaked));
-    auto fs = ok; fs.fullscreen = true; REQUIRE_FALSE(isEligible(fs));
+
+    // Fullscreen is the one fact DERIVED from probed facts rather than probed:
+    // covers the Display's full bounds AND not OS-maximized. Both halves flip it.
+    auto fs = ok;
+    fs.monitorBounds = kDisplay;
+    fs.rect = kDisplay;   // covers rcMonitor exactly, not maximized ⇒ Fullscreen
+    REQUIRE_FALSE(isEligible(fs));
+}
+
+// ── Fullscreen is not maximized (PRD 0025) ───────────────────────────────────
+//
+// The bug this pins: a maximized window on a Display with NO taskbar covers
+// rcMonitor exactly (the work area IS the monitor bounds), so a geometry-only
+// Fullscreen rule made every window there Ineligible and Spatial focus could
+// neither enter nor move within that Display.
+
+TEST_CASE("a window covering its Display's full bounds AND OS-maximized is Eligible", "[reducer]") {
+    auto maxed = eligible(WindowId{1}, kMon);
+    maxed.monitorBounds = kDisplay;
+    maxed.rect = kDisplay;  // taskbar-less Display: maximized == covers rcMonitor
+    maxed.zoomed = true;
+
+    REQUIRE(isEligible(maxed));
+}
+
+TEST_CASE("a window covering its Display's full bounds and NOT OS-maximized is Ineligible", "[reducer]") {
+    auto full = eligible(WindowId{1}, kMon);
+    full.monitorBounds = kDisplay;
+    full.rect = kDisplay;
+    full.zoomed = false;  // genuinely fullscreen (a video player, a game)
+
+    REQUIRE_FALSE(isEligible(full));
+}
+
+TEST_CASE("an OS-maximized window that does not cover the full bounds is Eligible", "[reducer]") {
+    // The ordinary maximized-with-taskbar case: the work area stops short of
+    // rcMonitor, so the window never covers the Display.
+    auto maxed = eligible(WindowId{1}, kMon);
+    maxed.monitorBounds = kDisplay;
+    maxed.rect = Rect{0, 0, 1920, 1040};
+    maxed.zoomed = true;
+
+    REQUIRE(isEligible(maxed));
 }
 
 // ── spatial directional focus: the pure resolution rule (ADR-0008) ───────────
@@ -307,6 +394,52 @@ TEST_CASE("traversal crosses monitors via virtual-screen coordinates, no boundar
         reduce(State{}, FocusResolve{Direction::Right, {origin, onSecondDisplay}, origin});
 
     REQUIRE(single_effect<winspace::SetForegroundWindow>(r) == winspace::SetForegroundWindow{WindowId{2}});
+}
+
+// The reported bug of PRD 0025, expressed as rects: a second Display whose work
+// area equals its monitor bounds (the taskbar is shown only on the primary), so
+// ADR-0020's auto-maximize leaves every window there covering rcMonitor.
+namespace {
+
+constexpr Rect kSecondDisplay{1920, 0, 3840, 1080};
+
+// A maximized window filling a taskbar-less Display — covers rcMonitor, zoomed.
+WindowAttrs maximizedOn(WindowId id, MonitorId monitor, Rect display, Rect rect) {
+    WindowAttrs a = eligible(id, monitor);
+    a.monitorBounds = display;
+    a.rect = rect;
+    a.zoomed = true;
+    return a;
+}
+
+}  // namespace
+
+TEST_CASE("focus resolves onto a maximized window on a taskbar-less second Display", "[reducer][focus]") {
+    // Origin: an ordinary maximized window on the primary, where the taskbar keeps
+    // the work area short of rcMonitor.
+    auto origin = maximizedOn(WindowId{1}, kMon, kDisplay, Rect{0, 0, 1920, 1040});
+    const auto onSecond = maximizedOn(WindowId{2}, MonitorId{2}, kSecondDisplay, kSecondDisplay);
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, onSecond}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) ==
+            winspace::SetForegroundWindow{WindowId{2}});
+}
+
+TEST_CASE("focus resolves between windows within that same second Display", "[reducer][focus]") {
+    // Origin: a restored window parked on the left of the taskbar-less Display.
+    // Candidate: a maximized one filling it — covers rcMonitor, so a geometry-only
+    // Fullscreen rule dropped it and focus could not move WITHIN the Display either.
+    auto origin = eligible(WindowId{1}, MonitorId{2});
+    origin.monitorBounds = kSecondDisplay;
+    origin.rect = Rect{1920, 0, 2400, 1080};
+    const auto maxed =
+        maximizedOn(WindowId{2}, MonitorId{2}, kSecondDisplay, kSecondDisplay);
+
+    const auto r = reduce(State{}, FocusResolve{Direction::Right, {origin, maxed}, origin});
+
+    REQUIRE(single_effect<winspace::SetForegroundWindow>(r) ==
+            winspace::SetForegroundWindow{WindowId{2}});
 }
 
 TEST_CASE("two Candidates identical in band and distance break the tie by lowest WindowId", "[reducer][focus]") {
@@ -744,6 +877,27 @@ TEST_CASE("an unmatched Eligible Appeared emits exactly ResolveDistribute{thatId
     REQUIRE(single_effect<ResolveDistribute>(r) == ResolveDistribute{WindowId{7}});
 }
 
+TEST_CASE("an app that opens fullscreen is not auto-placed by Distribute", "[reducer][distribute]") {
+    // The other half of the Fullscreen exclusion (PRD 0025): a window that opens
+    // genuinely fullscreen — covering rcMonitor and NOT maximized — must not be
+    // grabbed and maximized out of it. It is Ineligible, so nothing is emitted and
+    // nothing is placed; a later Eligible edge re-evaluates it.
+    Appeared a = appeared(WindowId{7}, "player.exe", "cls", "Player");
+    a.attrs.monitorBounds = kDisplay;
+    a.attrs.rect = kDisplay;
+    a.attrs.zoomed = false;
+
+    const auto r = reduce(State{}, a);
+
+    REQUIRE(r.effects.empty());
+
+    // Not recorded as placed: when the app later leaves fullscreen it is Distributed.
+    Appeared windowed = a;
+    windowed.attrs.rect = Rect{100, 100, 900, 700};
+    const auto later = reduce(r.state, windowed);
+    REQUIRE(single_effect<ResolveDistribute>(later) == ResolveDistribute{WindowId{7}});
+}
+
 TEST_CASE("a Distributed window is place-once — a repeat Appeared for the placed id emits nothing", "[reducer][distribute]") {
     const auto first = reduce(State{}, appeared(WindowId{7}, "term.exe", "cls", "Terminal"));
     REQUIRE(single_effect<ResolveDistribute>(first) == ResolveDistribute{WindowId{7}});
@@ -854,6 +1008,278 @@ TEST_CASE("pickDistributeTarget on a single Display keeps the window put", "[red
 
 TEST_CASE("pickDistributeTarget with no Displays yields nullopt", "[reducer][distribute]") {
     REQUIRE(pickDistributeTarget({}, MonitorId{10}) == std::nullopt);
+}
+
+// ── movetodisplay: the pure destination decision (PRD 0026) ──────────────────
+//
+// A two-phase Probe round-trip mirroring Spatial focus and Distribute: the Display
+// list arrives as plain data, so the whole feature is decidable here over synthetic
+// rects — which is the point, since the machine running these tests has one Display.
+
+namespace {
+
+// A 1920x1080 Display whose top-left corner is (x, y).
+DisplayInfo display(uint64_t id, int x, int y) {
+    return DisplayInfo{MonitorId{id}, Rect{x, y, x + 1920, y + 1080}};
+}
+
+// The probe result for a foreground window sitting on `on`.
+MoveToDisplayResolve resolved(Direction dir, uint64_t on, std::vector<DisplayInfo> displays) {
+    return MoveToDisplayResolve{dir, WindowId{7}, MonitorId{on}, std::move(displays)};
+}
+
+}  // namespace
+
+TEST_CASE("MoveToDisplay emits exactly ResolveMoveToDisplay and leaves State untouched", "[reducer][movetodisplay]") {
+    const State s{.currentWorkspace = 2, .running = true};
+
+    const auto r = reduce(s, MoveToDisplay{Direction::Right});
+
+    REQUIRE(single_effect<ResolveMoveToDisplay>(r) == ResolveMoveToDisplay{Direction::Right});
+    REQUIRE(r.state.placed.empty());   // never spends a window's one placement
+    REQUIRE(r.state.currentWorkspace == 2);
+}
+
+TEST_CASE("a two-Display row resolves right to the right Display, maximized there", "[reducer][movetodisplay]") {
+    const auto r = reduce(State{}, resolved(Direction::Right, 1,
+                                            {display(1, 0, 0), display(2, 1920, 0)}));
+
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, MonitorId{2}, Slot::Maximized});
+}
+
+TEST_CASE("left from the leftmost Display is a no-op", "[reducer][movetodisplay]") {
+    const auto r = reduce(State{}, resolved(Direction::Left, 1,
+                                            {display(1, 0, 0), display(2, 1920, 0)}));
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("a vertically stacked layout resolves up and down", "[reducer][movetodisplay]") {
+    const std::vector<DisplayInfo> stacked{display(1, 0, 0), display(2, 0, 1080)};
+
+    // Win32 y grows DOWN, so the lower Display is +y.
+    const auto down = reduce(State{}, resolved(Direction::Down, 1, stacked));
+    REQUIRE(single_effect<PositionWindow>(down) ==
+            PositionWindow{WindowId{7}, MonitorId{2}, Slot::Maximized});
+
+    const auto up = reduce(State{}, resolved(Direction::Up, 2, stacked));
+    REQUIRE(single_effect<PositionWindow>(up) ==
+            PositionWindow{WindowId{7}, MonitorId{1}, Slot::Maximized});
+}
+
+TEST_CASE("a three-Display row resolves to the adjacent Display, not the farthest", "[reducer][movetodisplay]") {
+    const std::vector<DisplayInfo> row{display(1, 0, 0), display(2, 1920, 0),
+                                       display(3, 3840, 0)};
+
+    const auto r = reduce(State{}, resolved(Direction::Right, 1, row));
+
+    REQUIRE(single_effect<PositionWindow>(r) ==
+            PositionWindow{WindowId{7}, MonitorId{2}, Slot::Maximized});
+}
+
+TEST_CASE("shuffling the input Display order does not change the result", "[reducer][movetodisplay]") {
+    // EnumDisplayMonitors order is not stable across a replug or a dock, so the
+    // decision must not depend on it.
+    const auto ordered = reduce(
+        State{}, resolved(Direction::Right, 1,
+                          {display(1, 0, 0), display(2, 1920, 0), display(3, 3840, 0)}));
+    const auto shuffled = reduce(
+        State{}, resolved(Direction::Right, 1,
+                          {display(3, 3840, 0), display(1, 0, 0), display(2, 1920, 0)}));
+
+    REQUIRE(shuffled.effects == ordered.effects);
+}
+
+TEST_CASE("a single Display is a silent no-op", "[reducer][movetodisplay]") {
+    for (const Direction dir :
+         {Direction::Left, Direction::Right, Direction::Up, Direction::Down}) {
+        const auto r = reduce(State{}, resolved(dir, 1, {display(1, 0, 0)}));
+        REQUIRE(r.effects.empty());
+    }
+}
+
+TEST_CASE("no foreground window is a no-op", "[reducer][movetodisplay]") {
+    const auto r = reduce(State{}, MoveToDisplayResolve{Direction::Right, std::nullopt,
+                                                        MonitorId{1},
+                                                        {display(1, 0, 0), display(2, 1920, 0)}});
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("a foreground window in the Ignore-set is a no-op", "[reducer][movetodisplay]") {
+    // Ignore means "don't touch at all" (ADR-0020), geometry included.
+    State s;
+    s.ignored.insert(WindowId{7});
+
+    const auto r = reduce(s, resolved(Direction::Right, 1,
+                                      {display(1, 0, 0), display(2, 1920, 0)}));
+
+    REQUIRE(r.effects.empty());
+}
+
+TEST_CASE("movetodisplay never emits a cross-Workspace move and never touches State", "[reducer][movetodisplay]") {
+    // Display and geometry only — the same boundary Distribute holds. And like
+    // `tile`, it is re-placeable: `placed` is neither read nor written, so the same
+    // window can be moved across Displays repeatedly.
+    State s;
+    s.placed.insert(WindowId{99});   // an unrelated already-placed window
+
+    const auto first = reduce(s, resolved(Direction::Right, 1,
+                                          {display(1, 0, 0), display(2, 1920, 0)}));
+    REQUIRE(single_effect<PositionWindow>(first) ==
+            PositionWindow{WindowId{7}, MonitorId{2}, Slot::Maximized});
+    REQUIRE_FALSE(first.state.placed.contains(WindowId{7}));
+    REQUIRE(first.state.placed == s.placed);
+
+    // Back again, then forward again — the action is not spent after one use.
+    const auto back = reduce(first.state, resolved(Direction::Left, 2,
+                                                   {display(1, 0, 0), display(2, 1920, 0)}));
+    REQUIRE(single_effect<PositionWindow>(back) ==
+            PositionWindow{WindowId{7}, MonitorId{1}, Slot::Maximized});
+
+    const auto again = reduce(back.state, resolved(Direction::Right, 1,
+                                                   {display(1, 0, 0), display(2, 1920, 0)}));
+    REQUIRE(single_effect<PositionWindow>(again) ==
+            PositionWindow{WindowId{7}, MonitorId{2}, Slot::Maximized});
+}
+
+// ── reconcile: the pure desktop-binding policy (ADR-0023) ────────────────────
+//
+// The whole Reconciliation policy is decidable here because DesktopKey is opaque:
+// no live desktop, no COM, just previous bindings + the keys the OS reports.
+
+namespace {
+
+// A DesktopKey distinguishable by one byte — the tests only ever compare them.
+constexpr DesktopKey key(uint8_t tag) {
+    DesktopKey k{};
+    k.bytes[0] = tag;
+    return k;
+}
+
+}  // namespace
+
+TEST_CASE("a stable live set reconciles to itself — numbers and Provenance unchanged", "[reducer][reconcile]") {
+    const std::vector<DesktopBinding> previous{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    const auto next = reconcile(previous, {key(0xA), key(0xB), key(0xC)});
+
+    REQUIRE(next == previous);
+}
+
+TEST_CASE("a new key takes the lowest free logical number, not max+1", "[reducer][reconcile]") {
+    // 2 was freed by an earlier external destroy; the newcomer must reuse it rather
+    // than ratcheting the numbering upward to 4.
+    const std::vector<DesktopBinding> previous{{1, key(0xA), false}, {3, key(0xC), false}};
+
+    const auto next = reconcile(previous, {key(0xA), key(0xC), key(0x9)});
+
+    REQUIRE(next == std::vector<DesktopBinding>{
+                        {1, key(0xA), false}, {2, key(0x9), false}, {3, key(0xC), false}});
+}
+
+TEST_CASE("a destroyed key frees its number and the next new key reuses it", "[reducer][reconcile]") {
+    const std::vector<DesktopBinding> previous{
+        {1, key(0xA), false}, {2, key(0xB), false}, {3, key(0xC), false}};
+
+    // Win+Ctrl+F4 on the middle desktop: its binding is dropped, freeing 2.
+    const auto destroyed = reconcile(previous, {key(0xA), key(0xC)});
+    REQUIRE(destroyed ==
+            std::vector<DesktopBinding>{{1, key(0xA), false}, {3, key(0xC), false}});
+
+    // The next externally-created desktop lands on the freed number.
+    const auto created = reconcile(destroyed, {key(0xA), key(0xC), key(0xD)});
+    REQUIRE(created == std::vector<DesktopBinding>{
+                           {1, key(0xA), false}, {2, key(0xD), false}, {3, key(0xC), false}});
+}
+
+TEST_CASE("a winspace-created binding keeps its Provenance across reconciles", "[reducer][reconcile]") {
+    // The property Quit cleanup depends on: reconciling must never launder a
+    // winspace-created desktop into a foreign one (nor the reverse).
+    const std::vector<DesktopBinding> previous{{1, key(0xA), false}, {2, key(0xB), true}};
+
+    const auto once = reconcile(previous, {key(0xA), key(0xB), key(0x9)});
+    const auto twice = reconcile(once, {key(0xA), key(0xB), key(0x9)});
+
+    REQUIRE(twice[1] == DesktopBinding{2, key(0xB), true});
+    REQUIRE_FALSE(twice[2].createdByWinspace);  // the newcomer is foreign
+}
+
+TEST_CASE("reconcile is idempotent — running it twice on the same live set changes nothing", "[reducer][reconcile]") {
+    const std::vector<DesktopBinding> previous{{1, key(0xA), true}};
+    const std::vector<DesktopKey> live{key(0xA), key(0xB), key(0xC)};
+
+    const auto once = reconcile(previous, live);
+    const auto twice = reconcile(once, live);
+
+    REQUIRE(twice == once);
+}
+
+TEST_CASE("reordering the live key list does not change the result", "[reducer][reconcile]") {
+    // A Task View drag reorders the OS's dense array; the GUID-anchored bindings
+    // (ADR-0003) must not notice, and neither must the numbering of newcomers.
+    const std::vector<DesktopBinding> previous{{1, key(0xA), false}, {2, key(0xB), true}};
+
+    const auto ordered = reconcile(previous, {key(0xA), key(0xB), key(0xC), key(0xD)});
+    const auto shuffled = reconcile(previous, {key(0xD), key(0xB), key(0xC), key(0xA)});
+
+    REQUIRE(shuffled == ordered);
+}
+
+TEST_CASE("reconciling an empty previous binds every live key from 1 upward", "[reducer][reconcile]") {
+    const auto next = reconcile({}, {key(0xA), key(0xB)});
+
+    REQUIRE(next.size() == 2);
+    REQUIRE(next[0].logical == 1);
+    REQUIRE(next[1].logical == 2);
+    REQUIRE_FALSE(next[0].createdByWinspace);
+    REQUIRE_FALSE(next[1].createdByWinspace);
+}
+
+// ── quit cleanup: the pure selection (ADR-0024) ──────────────────────────────
+//
+// The safety guarantee stated as assertions: only winspace-created desktops are
+// ever selected, so "clean up all workspaces" can never mean "delete your stuff".
+
+TEST_CASE("desktopsToCleanup returns only the winspace-created bindings", "[reducer][cleanup]") {
+    const std::vector<DesktopBinding> bindings{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), true}};
+
+    REQUIRE(desktopsToCleanup(bindings) == std::vector<DesktopKey>{key(0xB), key(0xC)});
+}
+
+TEST_CASE("a mixed set never returns a foreign key", "[reducer][cleanup]") {
+    // The data-loss guarantee. A desktop the user made by hand in Task View, or one
+    // adopted at startup, must survive the quit.
+    const std::vector<DesktopBinding> bindings{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    const auto doomed = desktopsToCleanup(bindings);
+
+    REQUIRE(doomed == std::vector<DesktopKey>{key(0xB)});
+    REQUIRE_FALSE(std::ranges::contains(doomed, key(0xA)));
+    REQUIRE_FALSE(std::ranges::contains(doomed, key(0xC)));
+}
+
+TEST_CASE("a session that created nothing removes nothing", "[reducer][cleanup]") {
+    // Every desktop adopted at startup is foreign, so quitting after a session that
+    // only switched around leaves the desktop set exactly as it found it.
+    const std::vector<DesktopBinding> adopted{
+        {1, key(0xA), false}, {2, key(0xB), false}, {3, key(0xC), false}};
+
+    REQUIRE(desktopsToCleanup(adopted).empty());
+    REQUIRE(desktopsToCleanup({}).empty());
+}
+
+TEST_CASE("a created binding stays selectable after reconciles", "[reducer][cleanup]") {
+    // The join between the two policies: reconcile preserves Provenance, so a
+    // desktop winspace made early in the session is still cleaned up at quit.
+    const std::vector<DesktopBinding> previous{{1, key(0xA), false}, {2, key(0xB), true}};
+    const auto reconciled = reconcile(previous, {key(0xA), key(0xB), key(0xC)});
+
+    REQUIRE(desktopsToCleanup(reconciled) == std::vector<DesktopKey>{key(0xB)});
 }
 
 // ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────
@@ -1630,8 +2056,10 @@ TEST_CASE("the tile dispatcher parses as a zero-argument bind", "[config]") {
 // ── removed-with-tiling diagnostics ──────────────────────────────────────────
 
 TEST_CASE("a bind to each removed tiling dispatcher yields a targeted removed-with-tiling diagnostic", "[config]") {
+    // movetomonitor is deliberately NOT in this list any more — it was renamed, not
+    // removed. See the rename case below.
     for (const std::string disp :
-         {"movewindow", "maximize", "resizeactive", "togglefloat", "movetomonitor"}) {
+         {"movewindow", "maximize", "resizeactive", "togglefloat"}) {
         const auto result = parse("bind = SUPER, X, " + disp + "\n");
         REQUIRE(result.config.binds.empty());
         REQUIRE(result.diagnostics.size() == 1);
@@ -1661,6 +2089,59 @@ TEST_CASE("an unknown name that is NOT a removed tiling one keeps the generic di
     REQUIRE(dir.diagnostics.size() == 1);
     REQUIRE(dir.diagnostics[0].message.find("unknown directive") != std::string::npos);
     REQUIRE(dir.diagnostics[0].message.find("removed with tiling") == std::string::npos);
+}
+
+// ── movetodisplay: the config surface (PRD 0026) ─────────────────────────────
+
+TEST_CASE("movetodisplay parses with each of the four directions", "[config]") {
+    const auto result = parse(
+        "bind = SUPER, H, movetodisplay, left\n"
+        "bind = SUPER, L, movetodisplay, right\n"
+        "bind = SUPER, K, movetodisplay, up\n"
+        "bind = SUPER, J, movetodisplay, down\n");
+
+    REQUIRE(result.diagnostics.empty());
+    REQUIRE(result.config.binds.size() == 4);
+    REQUIRE(result.config.binds[0] ==
+            Bind{Mod::Super, Key::H, Dispatcher::MoveToDisplay, 0, config::Direction::Left});
+    REQUIRE(result.config.binds[1] ==
+            Bind{Mod::Super, Key::L, Dispatcher::MoveToDisplay, 0, config::Direction::Right});
+    REQUIRE(result.config.binds[2] ==
+            Bind{Mod::Super, Key::K, Dispatcher::MoveToDisplay, 0, config::Direction::Up});
+    REQUIRE(result.config.binds[3] ==
+            Bind{Mod::Super, Key::J, Dispatcher::MoveToDisplay, 0, config::Direction::Down});
+}
+
+TEST_CASE("a movetodisplay with an invalid direction is diagnosed, naming the valid four", "[config]") {
+    const auto unknown = parse("bind = SUPER, L, movetodisplay, sideways\n");
+    REQUIRE(unknown.config.binds.empty());
+    REQUIRE(unknown.diagnostics.size() == 1);
+    REQUIRE(unknown.diagnostics[0].message.find("unknown direction") != std::string::npos);
+    REQUIRE(unknown.diagnostics[0].message.find("sideways") != std::string::npos);
+
+    const auto missing = parse("bind = SUPER, L, movetodisplay\n");
+    REQUIRE(missing.config.binds.empty());
+    REQUIRE(missing.diagnostics.size() == 1);
+    REQUIRE(missing.diagnostics[0].message.find("left|right|up|down") != std::string::npos);
+    REQUIRE(missing.diagnostics[0].message.find("movetodisplay") != std::string::npos);
+}
+
+TEST_CASE("movetomonitor reports the rename, NOT 'removed with tiling'", "[config]") {
+    // The capability exists and is one keybind away, so the old message was a lie
+    // the moment movetodisplay shipped — asserting the NEW text is what tests the
+    // rename (CONTEXT.md fixes Display as the term; Monitor is under _Avoid_).
+    const auto bound = parse("bind = SUPER, L, movetomonitor, right\n");
+    REQUIRE(bound.config.binds.empty());
+    REQUIRE(bound.diagnostics.size() == 1);
+    REQUIRE(bound.diagnostics[0].message.find("renamed to 'movetodisplay'") != std::string::npos);
+    REQUIRE(bound.diagnostics[0].message.find("removed with tiling") == std::string::npos);
+
+    // Same for a bare directive, the other place the diagnostic is produced.
+    const auto directive = parse("movetomonitor = right\n");
+    REQUIRE(directive.diagnostics.size() == 1);
+    REQUIRE(directive.diagnostics[0].message.find("renamed to 'movetodisplay'") !=
+            std::string::npos);
+    REQUIRE(directive.diagnostics[0].message.find("removed with tiling") == std::string::npos);
 }
 
 // ── exec / exec-once directive ───────────────────────────────────────────────
