@@ -124,6 +124,61 @@ Describe 'window-rules' {
         }
     }
 
+    # The Pending move retry (ADR-0022): the reliability counterpart of `live pin`
+    # above. The shell's View registration is asynchronous, so GetViewForHwnd
+    # intermittently returns 0x8002802B for a brand-new HWND and the rule's move
+    # silently does nothing — place-once has already inserted the id, so nothing ever
+    # tries again. winspace now re-asks every 25ms for 250ms.
+    #
+    # The natural race lands ~1 launch in 4 and was never caught in an instrumented
+    # build, so this seam FORCES it: WINSPACE_DIAG_DROP_FIRST_MOVE (permanent,
+    # env-gated, inert unless set) fails the first move per window with the exact
+    # HRESULT. Without the retry the forced failure is final and this is red; with it,
+    # the second attempt lands. That is the whole point — a seam that could pass with
+    # the feature deleted asserts nothing (ADR-0005).
+    #
+    # Oracle is `live pin`'s: the window's desktop GUID from the PUBLIC
+    # IVirtualDesktopManager, never winspace's log — the retry's success is
+    # deliberately silent there. Target is workspace 1 (the INACTIVE desktop) for the
+    # same reason as `live pin`: a move to the desktop the window already opened on
+    # would be indistinguishable from no move at all.
+    It 'retry-after-view-miss: a dropped first move is retried until the shell registers the view' -Tag 'window-rules' {
+        $winspace = $null
+        $window = $null
+        try {
+            Set-DesktopCount 2
+            $before = Get-VdState
+            $before.Count | Should -Be 2 -Because 'the seam needs an inactive desktop to pin to'
+            $desktop1Guid = $before.Guids[0]   # workspace 1 — the inactive pin target
+            $desktop2Guid = $before.Guids[1]   # workspace 2 — the active desktop we stay on
+            $before.CurrentGuid | Should -Be $desktop2Guid
+
+            Set-WinspaceConfig -Content $script:RuleConfig | Out-Null
+
+            # Fault injection is on for THIS winspace only; Start-Winspace restores the
+            # host process env the moment the child has snapshotted it.
+            $winspace = Start-Winspace -Env @{ WINSPACE_DIAG_DROP_FIRST_MOVE = '1' }
+
+            $window = Start-TestWindow -Title $script:RuleTitle -X 200 -Y 160 -Width 480 -Height 320
+
+            Wait-Until -Because 'the retry to pin the window after its first move was dropped' -Condition {
+                (Get-WindowDesktopId -Hwnd $window.Hwnd) -eq $desktop1Guid
+            }
+
+            $after = Get-VdState
+            (Get-WindowDesktopId -Hwnd $window.Hwnd) | Should -Be $desktop1Guid `
+                -Because 'the Pending move retry must land the pin the forced first failure dropped'
+            $after.CurrentGuid | Should -Be $desktop2Guid `
+                -Because 'a retried cross-desktop pin must still NOT switch the active desktop'
+        } catch {
+            Save-FailureScreenshot -Name 'window-rule-retry-after-view-miss'
+            throw
+        } finally {
+            Stop-TestWindow $window
+            Stop-Winspace -Process $winspace
+        }
+    }
+
     # Startup ADOPTION: the matching window is already open when winspace launches. The
     # hook thread's EnumWindows posts a synthetic Appeared per top-level window through
     # the same path a live SHOW takes, so the rule pins the pre-existing window too.

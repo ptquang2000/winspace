@@ -172,6 +172,15 @@ struct Error {
     std::source_location loc;
 };
 
+// The HRESULT an Error carries, or E_FAIL for the two non-COM conventions. For the
+// rare caller that must ACT on a specific code rather than merely log it — today
+// exactly one: the Pending move retry, which reacts to k_viewNotRegistered and to
+// nothing else (ADR-0022). Anything else deserves the boundary logger, not this.
+inline HRESULT hresultOf(const Error& e) {
+    const auto* hr = std::get_if<HrError>(&e.code);
+    return hr ? hr->hr : E_FAIL;
+}
+
 // ── the ok() wrapper set: free inline functions, no macros, no ?-operator ────
 //
 // One name, three overloads dispatched by EXACT-TYPE constraints. Plain overloads
@@ -1263,8 +1272,14 @@ public:
     // IApplicationViewCollection::GetViewForHwnd + MoveViewToDesktop — the public
     // IVirtualDesktopManager::MoveWindowToDesktop returns E_ACCESSDENIED for windows
     // the caller does not own, which is precisely winspace's case (a foreground app
-    // window from another process). Returns true iff the move landed.
-    virtual bool moveWindowToWorkspace(WindowId window, int logical) = 0;
+    // window from another process).
+    //
+    // Returns a MoveOutcome rather than a bool because ONE failure is actionable to
+    // the caller: ViewNotRegistered means the shell has not finished View
+    // registration for a brand-new HWND yet, and the attempt is worth repeating
+    // (ADR-0022). Every other failure is logged here and is final. The HRESULT stays
+    // sealed inside the adapter — the seam speaks winspace vocabulary (ADR-0004).
+    virtual MoveOutcome moveWindowToWorkspace(WindowId window, int logical) = 0;
 };
 
 // ── hand-declared undocumented COM ABI (RE lineage; see file header) ─────────
@@ -1434,6 +1449,30 @@ inline std::wstring forcedVariantOverride() {
     return buf;
 }
 
+// TYPE_E_ELEMENTNOTFOUND ("Element not found") — what GetViewForHwnd returns while
+// the shell has not finished View registration for a brand-new HWND (ADR-0022). The
+// one transient the move path translates into MoveOutcome::ViewNotRegistered; every
+// other HRESULT is a real error. Sealed in the adapter — the seam never sees it.
+inline constexpr HRESULT k_viewNotRegisteredHr = static_cast<HRESULT>(0x8002802BL);
+
+// WINSPACE_DIAG_DROP_FIRST_MOVE — permanent, env-gated fault injection (ADR-0022).
+// Force-fails the FIRST move attempt per window exactly as the real
+// View-registration race does, then lets every later attempt through. It ships
+// in Release deliberately: the natural race is invisible ~5 launches out of 6, so
+// without it the live seam would pass whether or not the retry exists — and
+// ADR-0005 makes a live behavior's definition of done a seam that actually asserts.
+//
+// Inert unless the variable is set, and it can only make winspace do LESS. The
+// seen-set is per-process and never pruned; it grows by one pointer-sized id per
+// moved window, and only ever under the diagnostic.
+inline bool dropFirstMove(WindowId window) {
+    static const bool enabled =
+        GetEnvironmentVariableW(L"WINSPACE_DIAG_DROP_FIRST_MOVE", nullptr, 0) != 0;
+    if (!enabled) return false;
+    static std::unordered_set<uint64_t> dropped;
+    return dropped.insert(static_cast<uint64_t>(window)).second;
+}
+
 }  // namespace bridge_detail
 
 // ── the 24H2 implementation ──────────────────────────────────────────────────
@@ -1508,28 +1547,40 @@ public:
     // (create + bind, NO switch) on a miss — then MoveViewToDesktop. The internal
     // path is what moves a FOREIGN window; the public HWND API cannot. Null view
     // collection (acquisition failed) → no-op.
-    bool moveWindowToWorkspace(WindowId window, int logical) override {
-        if (!m_manager || !m_viewCollection) return false;
+    //
+    // Every failure is logged HERE — degrade-and-log, ADR-0004 — with one exception:
+    // a GetViewForHwnd k_viewNotRegisteredHr returns QUIETLY as ViewNotRegistered,
+    // because it is the one transient the caller retries and a recovered failure must
+    // not spam the log (ADR-0022). If the retry budget runs out, the Worker logs the
+    // give-up warn instead.
+    MoveOutcome moveWindowToWorkspace(WindowId window, int logical) override {
+        // A degraded bridge (an unsupported variant, or a view collection that never
+        // acquired) — both already logged loudly at construction.
+        if (!m_manager || !m_viewCollection) return MoveOutcome::Failed;
+        if (bridge_detail::dropFirstMove(window)) return MoveOutcome::ViewNotRegistered;
 
         auto view = ok([&](vd::IApplicationView** pp) {
             return m_viewCollection->GetViewForHwnd(toHwnd(window), pp);
         });
         if (!view) {
+            // The one retryable failure — silent here; the caller logs if it gives up.
+            if (hresultOf(view.error()) == bridge_detail::k_viewNotRegisteredHr)
+                return MoveOutcome::ViewNotRegistered;
             lg::error("move window to workspace {}: GetViewForHwnd: {}", logical, view.error());
-            return false;
+            return MoveOutcome::Failed;
         }
         const std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> desktop =
             resolveMoveTarget(logical);
         if (!desktop) {
             lg::error("{}", desktop.error());
-            return false;
+            return MoveOutcome::Failed;
         }
         if (const auto moved = ok(m_manager->MoveViewToDesktop((*view).Get(), (*desktop).Get()));
             !moved) {
             lg::error("move window to workspace {}: {}", logical, moved.error());
-            return false;
+            return MoveOutcome::Failed;
         }
-        return true;
+        return MoveOutcome::Moved;
     }
 
 private:
@@ -1939,6 +1990,16 @@ inline constexpr UINT k_wmSetHotkeyThread = WM_APP + 1;
 // postEvent's delete-on-failure ownership). ADR-0012.
 inline constexpr UINT k_wmReloadBinds = WM_APP + 2;
 
+// The Pending move retry timer (ADR-0022) — winspace's only SetTimer id. Distinct
+// from the k_wm* message ids above: a timer id is scoped to its window, not to the
+// message space.
+inline constexpr UINT_PTR k_pendingMoveTimerId = 1;
+
+// The injected clock for the pure PendingMoves policy. GetTickCount64 is monotonic,
+// never jumps with the wall clock, and has ~10-16ms resolution — coarse, but the
+// budget is 250ms and a coarse read only ever spends FEWER attempts.
+inline Tick nowMs() { return GetTickCount64(); }
+
 // Hand an Event to the Worker across threads. Ownership transfers to the Worker
 // on a successful post (it deletes after reducing); on failure — a full queue
 // or a dead HWND — we delete here so a dropped Event never leaks.
@@ -2050,6 +2111,16 @@ private:
         if (self && msg == k_wmEvent) {
             return self->onEvent(reinterpret_cast<Event*>(lparam));
         }
+        // winspace's ONE timer (ADR-0022): the Pending move retry, armed on demand
+        // and killed the moment the set drains. It waits on a THIRD PARTY's
+        // asynchronous bookkeeping — the shell's View registration, for which no
+        // notification exists — and never reads a window's own attributes, which is
+        // exactly where ADR-0007's no-polling ban begins. Do not read this as licence
+        // for a second timer without meeting that same bar.
+        if (self && msg == WM_TIMER && wparam == k_pendingMoveTimerId) {
+            self->onPendingTick();
+            return 0;
+        }
         if (self && msg == k_wmSetHotkeyThread) {
             self->m_hotkeyThreadId = static_cast<DWORD>(wparam);
             return 0;
@@ -2100,10 +2171,62 @@ private:
     // the new State, and execute each emitted Effect — all on the Worker thread.
     LRESULT onEvent(Event* raw) {
         const std::unique_ptr<Event> ev(raw);  // delete after reducing
+
+        // The one place the Effect executor observes an Event rather than only
+        // handing it to the Reducer (ADR-0022, a deliberate documented leak).
+        // Cancellation is MANDATORY, not a nicety: Windows recycles HWND values, so
+        // a pending entry that outlives its window could resolve a RECYCLED handle
+        // and move an unrelated window — an intermittent wrong action, strictly
+        // worse than the intermittent no-op this whole mechanism exists to fix.
+        if (const auto* vanished = std::get_if<Vanished>(ev.get())) {
+            m_pending.erase(vanished->id);
+            syncPendingTimer();
+        }
+
         ReduceResult result = reduce(m_state, *ev);
         m_state = std::move(result.state);
         for (const Effect& effect : result.effects) execute(effect);
         return 0;
+    }
+
+    // One Pending move poll (ADR-0022). Give up on anything past its 250ms budget
+    // with exactly ONE warn naming the app, then re-attempt everything due. A
+    // re-attempt that lands — or fails for any reason OTHER than the transient — is
+    // erased; the bridge has already logged the latter.
+    void onPendingTick() {
+        const PendingMoveTick t = m_pending.tick(nowMs());
+        for (const PendingMove& e : t.expired)
+            lg::warn("move window to workspace {}: the shell never registered a view for "
+                     "'{}' within {}ms — giving up",
+                     e.logical, e.exe.empty() ? "window" : e.exe, k_pendingMoveBudgetMs);
+        for (const PendingMove& e : t.due) {
+            // An entry can only exist because the bridge accepted an attempt, so it is
+            // still here; the guard is defensive.
+            const MoveOutcome outcome = m_bridge
+                                            ? m_bridge->moveWindowToWorkspace(e.id, e.logical)
+                                            : MoveOutcome::Failed;
+            // Moved, or Failed for a reason the bridge already logged and that re-asking
+            // cannot fix — either way this entry is finished. Only the transient stays.
+            if (outcome != MoveOutcome::ViewNotRegistered) m_pending.erase(e.id);
+        }
+        syncPendingTimer();
+    }
+
+    // Make the OS timer match the set: non-empty ⇒ armed, empty ⇒ gone. Arming is a
+    // DERIVED property (ADR-0022), so this is the only place SetTimer/KillTimer are
+    // called and the two cannot drift apart. When nothing is pending — which is
+    // ~always — no timer exists, so idle wakeups stay at exactly zero and ADR-0007's
+    // no-polling promise is untouched. SetTimer with an existing id merely resets it,
+    // but the flag keeps the common case a single branch.
+    void syncPendingTimer() {
+        const bool want = m_pending.armed();
+        if (want == m_timerArmed) return;
+        if (want)
+            SetTimer(m_hwnd, k_pendingMoveTimerId, static_cast<UINT>(k_pendingMovePollMs),
+                     nullptr);
+        else
+            KillTimer(m_hwnd, k_pendingMoveTimerId);
+        m_timerArmed = want;
     }
 
     void execute(const Effect& effect) {
@@ -2163,7 +2286,16 @@ private:
                         lg::warn("move to workspace {}: no foreground window", m.logical);
                         return;
                     }
-                    m_bridge->moveWindowToWorkspace(toWindowId(fg), m.logical);
+                    // No Pending move retry here: this path names a window the user
+                    // is looking at, whose View registration completed long ago
+                    // (ADR-0022 scopes the retry to the freshly-Appeared rule move).
+                    // The bridge returns that one HRESULT quietly, so log it here
+                    // rather than let a genuine failure vanish.
+                    if (m_bridge->moveWindowToWorkspace(toWindowId(fg), m.logical) ==
+                        MoveOutcome::ViewNotRegistered)
+                        lg::warn("move to workspace {}: the shell has no view for the "
+                                 "foreground window",
+                                 m.logical);
                 },
                 [&](const MoveWindowToWorkspace& m) {
                     // The WindowRule move: a SPECIFIC window that just
@@ -2171,7 +2303,17 @@ private:
                     // internal MoveViewToDesktop reassigns the desktop without ever
                     // painting on the current one (ADR-0010 revised), so a
                     // cross-Workspace pin never flashes here. Null bridge → no-op.
-                    if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
+                    if (!m_bridge) return;
+                    const MoveOutcome outcome = m_bridge->moveWindowToWorkspace(m.id, m.logical);
+                    if (outcome == MoveOutcome::Moved) return;
+                    // The window is brand new, so the shell may not have finished
+                    // View registration (ADR-0022). noteFailure takes only that one
+                    // transient — a Failed was already logged and is final. The exe is
+                    // probed HERE, while the window certainly still exists, so the
+                    // give-up warn can name the app even if it has since died.
+                    if (m_pending.noteFailure(m.id, m.logical, probeIdentity(toHwnd(m.id)).exe,
+                                              outcome, nowMs()))
+                        syncPendingTimer();
                 },
                 [&](const ResolveDistribute& rd) {
                     // Phase one of the Distribute round-trip (ADR-0020, was Spread's
@@ -2321,6 +2463,11 @@ private:
     bool m_comInitialized = false;
     DWORD m_hotkeyThreadId = 0;  // set by k_wmSetHotkeyThread; target of reload's new Binds
     std::unique_ptr<IVirtualDesktopBridge> m_bridge;  // COM VD bridge; null if unsupported
+
+    // Pending move (ADR-0022) — Worker-local, deliberately NOT in State. m_timerArmed
+    // mirrors the OS timer so syncPendingTimer can keep it equal to m_pending.armed().
+    PendingMoves m_pending;
+    bool m_timerArmed = false;
 };
 
 // Worker thread entry. Constructs the Worker (COM + message-only HWND), publishes

@@ -856,6 +856,156 @@ TEST_CASE("pickDistributeTarget with no Displays yields nullopt", "[reducer][dis
     REQUIRE(pickDistributeTarget({}, MonitorId{10}) == std::nullopt);
 }
 
+// ── PendingMoves: the pure retry policy (ADR-0022) ───────────────────────────
+//
+// The Pending move set is the I/O layer's, but its arithmetic is pure and lives
+// here for the same reason pickDistributeTarget does: it is policy, not mechanism.
+// Time is injected as a plain Tick, so every edge — due, expired, cancelled — is
+// pinned by a fast test instead of by a 250ms live run. The adapter's half (SetTimer
+// / GetViewForHwnd / the clock) is the live `retry-after-view-miss` Smoke seam's.
+//
+// `armed()` is asserted directly rather than inferred: "empty ⇒ not armed" IS the
+// zero-idle-wakeups guarantee, and it is the one property the adapter reads to
+// decide whether a timer exists at all.
+
+namespace {
+
+// A view-not-registered failure at t=0 for one window, the state every case below
+// starts from. Deliberately built through the public entry point (noteFailure), so
+// the tests never reach past the interface into the entry list.
+PendingMoves onePending(WindowId id = WindowId{1}, int logical = 2, Tick now = 0) {
+    PendingMoves p;
+    p.noteFailure(id, logical, "pwsh.exe", MoveOutcome::ViewNotRegistered, now);
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("a view-not-registered failure inserts an entry and arms the set", "[pending]") {
+    PendingMoves p;
+    REQUIRE(p.noteFailure(WindowId{1}, 2, "pwsh.exe", MoveOutcome::ViewNotRegistered, 0));
+    REQUIRE(p.armed());
+}
+
+TEST_CASE("an empty set is never armed", "[pending]") {
+    const PendingMoves p;
+    // The zero-idle-wakeups guarantee (ADR-0022): nothing pending → no timer exists.
+    REQUIRE_FALSE(p.armed());
+}
+
+TEST_CASE("a successful re-attempt erases the entry and the last erase disarms",
+          "[pending]") {
+    PendingMoves p = onePending();
+    p.erase(WindowId{1});
+    REQUIRE_FALSE(p.armed());
+    // Nothing is ever due again — the entry is gone, not merely quiesced.
+    REQUIRE(p.tick(k_pendingMoveBudgetMs * 2).due.empty());
+}
+
+TEST_CASE("Vanished for a pending id cancels it and never yields a due attempt",
+          "[pending]") {
+    PendingMoves p = onePending();
+    p.erase(WindowId{1});  // the Worker's Vanished observation (mandatory, ADR-0022)
+    REQUIRE_FALSE(p.armed());
+    const PendingMoveTick t = p.tick(k_pendingMovePollMs);
+    // Cancellation is what stops a recycled HWND being moved by a stale entry.
+    REQUIRE(t.due.empty());
+    REQUIRE(t.expired.empty());
+}
+
+TEST_CASE("Vanished for an id that is not pending is a no-op", "[pending]") {
+    PendingMoves p = onePending(WindowId{1});
+    p.erase(WindowId{99});
+    REQUIRE(p.armed());
+    REQUIRE(p.tick(k_pendingMovePollMs).due.size() == 1);
+}
+
+TEST_CASE("an entry past its deadline reports as expired exactly once, then is gone",
+          "[pending]") {
+    PendingMoves p = onePending();
+    const PendingMoveTick first = p.tick(k_pendingMoveBudgetMs);
+    REQUIRE(first.expired.size() == 1);
+    REQUIRE(first.expired[0].exe == "pwsh.exe");  // the warn names the app
+    REQUIRE(first.due.empty());                   // expiry wins over a concurrent due
+    REQUIRE_FALSE(p.armed());
+    const PendingMoveTick second = p.tick(k_pendingMoveBudgetMs);
+    REQUIRE(second.expired.empty());
+}
+
+TEST_CASE("an entry is not due before the poll interval and is due after", "[pending]") {
+    PendingMoves p = onePending();
+    REQUIRE(p.tick(k_pendingMovePollMs - 1).due.empty());
+    REQUIRE(p.tick(k_pendingMovePollMs).due.size() == 1);
+    // A due attempt reschedules rather than repeating: the next poll is a full
+    // interval later, so a slow WM_TIMER spends fewer attempts, never more.
+    REQUIRE(p.tick(k_pendingMovePollMs).due.empty());
+    REQUIRE(p.tick(k_pendingMovePollMs * 2).due.size() == 1);
+}
+
+TEST_CASE("two pending moves resolve independently", "[pending]") {
+    PendingMoves p = onePending(WindowId{1}, 2, 0);
+    // A second app fails later, so its deadline is its own — one slow app must not
+    // delay or cancel another's placement (story 12).
+    p.noteFailure(WindowId{2}, 3, "edge.exe", MoveOutcome::ViewNotRegistered, 100);
+
+    const PendingMoveTick t = p.tick(125);
+    REQUIRE(t.due.size() == 2);
+
+    p.erase(WindowId{1});  // one succeeds
+    REQUIRE(p.armed());    // the other keeps the set armed
+
+    // Window 1's budget has run out, but that never expires window 2.
+    const PendingMoveTick later = p.tick(k_pendingMoveBudgetMs);
+    REQUIRE(later.expired.empty());
+    REQUIRE(later.due.size() == 1);
+    REQUIRE(later.due[0].id == WindowId{2});
+
+    // Window 2 expires on its OWN deadline, 100ms after window 1's.
+    REQUIRE(p.tick(100 + k_pendingMoveBudgetMs).expired.size() == 1);
+    REQUIRE_FALSE(p.armed());
+}
+
+TEST_CASE("the target workspace captured at issue time is the one re-attempted",
+          "[pending]") {
+    // A config reload between the failure and the retry must not redirect the
+    // window: the target travels with the entry (story 14).
+    PendingMoves p = onePending(WindowId{1}, 7);
+    const PendingMoveTick t = p.tick(k_pendingMovePollMs);
+    REQUIRE(t.due.size() == 1);
+    REQUIRE(t.due[0].logical == 7);
+    REQUIRE(t.due[0].id == WindowId{1});
+}
+
+TEST_CASE("a failure other than view-not-registered inserts nothing", "[pending]") {
+    PendingMoves p;
+    // A real error — already logged where it happened and kept on today's
+    // degrade-and-log path. The retry is for one known transient, not a blanket
+    // wrapper. A landed move obviously inserts nothing either.
+    REQUIRE_FALSE(p.noteFailure(WindowId{1}, 2, "pwsh.exe", MoveOutcome::Failed, 0));
+    REQUIRE_FALSE(p.noteFailure(WindowId{1}, 2, "pwsh.exe", MoveOutcome::Moved, 0));
+    REQUIRE_FALSE(p.armed());
+}
+
+TEST_CASE("expiry reports the entry that actually expired, not a survivor", "[pending]") {
+    // One entry expires while another is still well inside its budget — the shape
+    // that decides whether the give-up warn names the right app (story 4). Asserted
+    // separately because a single-entry expiry passes even when the removal is
+    // reading moved-from values.
+    PendingMoves p = onePending(WindowId{1}, 2, 0);
+    p.noteFailure(WindowId{2}, 3, "edge.exe", MoveOutcome::ViewNotRegistered, 200);
+
+    const PendingMoveTick t = p.tick(k_pendingMoveBudgetMs);
+    REQUIRE(t.expired.size() == 1);
+    REQUIRE(t.expired[0].id == WindowId{1});
+    REQUIRE(t.expired[0].exe == "pwsh.exe");
+    REQUIRE(t.expired[0].logical == 2);
+    // The survivor is untouched and still due for its own re-attempt.
+    REQUIRE(t.due.size() == 1);
+    REQUIRE(t.due[0].id == WindowId{2});
+    REQUIRE(t.due[0].exe == "edge.exe");
+    REQUIRE(p.armed());
+}
+
 // ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────
 //
 // A State seeded with a synthetic exec list; assert the LaunchApp Effects. Started
