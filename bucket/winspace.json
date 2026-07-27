@@ -1,11 +1,11 @@
 {
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "A Windows 11 workspace + focus manager that leans on OS-native facilities and stays off the input critical path.",
     "homepage": "https://github.com/ptquang2000/winspace",
     "license": "Unlicense",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/ptquang2000/winspace/releases/download/v0.0.1/winspace-0.0.1-x64.zip"
+            "url": "https://github.com/ptquang2000/winspace/releases/download/v0.0.2/winspace-0.0.2-x64.zip"
         }
     },
     "bin": "winspace.exe",
