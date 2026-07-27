@@ -68,6 +68,10 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# local working state (agent scratch notes, per-machine MCP server config)
+.scratch/
+.mcp.json
+
 # VM seam-test run artifacts (regenerated each run)
 scripts/results*.xml
 scripts/failure-*.png
