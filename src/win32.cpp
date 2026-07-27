@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>        // std::FILE, stderr
+#include <cstring>       // std::memcpy — GUID ⇄ DesktopKey narrowing (vd_bridge)
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -624,6 +625,13 @@ inline constexpr std::string_view k_defaultConfig =
     "bind = $mod, J, focus, down\n"
     "bind = $mod, K, focus, up\n"
     "bind = $mod, L, focus, right\n"
+    "# Send the focused window to the next display and maximize it there. Named by\n"
+    "# DIRECTION, never by index: monitor enumeration order is not what Windows\n"
+    "# Display Settings shows and is not stable across a replug or a dock. On a\n"
+    "# single-display machine this is a silent no-op, so the same config works on a\n"
+    "# laptop and at a desk. (This is what `movetomonitor` was renamed to.)\n"
+    "# bind = $mod SHIFT, H, movetodisplay, left\n"
+    "# bind = $mod SHIFT, L, movetodisplay, right\n"
     "# Move the focused window to a workspace ($mod SHIFT + <n>, the hyprland idiom).\n"
     "# On multi-keyboard-layout machines Alt+Shift may clash with the OS layout toggle.\n"
     "# `movetoworkspacesilent` moves it but leaves you where you are; the plain\n"
@@ -848,6 +856,7 @@ inline Event toEvent(const Bind& bind) {
         case Dispatcher::MoveToWorkspaceSilent: return MoveToWorkspace{bind.arg, false};
         case Dispatcher::Reload: return Reload{};
         case Dispatcher::Tile: return Tile{};
+        case Dispatcher::MoveToDisplay: return MoveToDisplay{toReducerDir(bind.dir)};
     }
     return Quit{};  // unreachable
 }
@@ -1021,16 +1030,22 @@ inline WindowAttrs probeWindow(HWND h) {
     GetWindowRect(h, &r);
     a.rect = Rect{r.left, r.top, r.right, r.bottom};
 
+    // OS-maximized state: a FACT, not a verdict. Together with monitorBounds below
+    // it is what lets the pure isEligible derive Fullscreen (covers the Display AND
+    // not maximized) — the adapter used to decide that here, where no unit test
+    // could reach it (ADR-0006, PRD 0025).
+    a.zoomed = IsZoomed(h) != FALSE;
+
     const HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
     a.monitor = toMonitorId(mon);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     if (GetMonitorInfoW(mon, &mi)) {
-        // Fullscreen ⇔ the window covers its monitor's full bounds (rcMonitor, not
-        // the work area) — a maximized app that leaves the taskbar visible is not
-        // fullscreen. Skipped as a focus target by isEligible.
-        a.fullscreen = r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top &&
-                       r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+        // The Display's FULL bounds (rcMonitor, taskbar included) — not the work
+        // area. Left zeroed on a failed read, which the core reads as "unknown", so
+        // the window simply never classifies Fullscreen.
+        a.monitorBounds =
+            Rect{mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom};
     }
     return a;
 }
@@ -1061,6 +1076,28 @@ inline std::vector<MonitorId> enumerateDisplays() {
         nullptr, nullptr,
         [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
             reinterpret_cast<std::vector<MonitorId>*>(lp)->push_back(toMonitorId(m));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&out));
+    return out;
+}
+
+// Every Display WITH ITS BOUNDS — the substrate for `movetodisplay`'s directional
+// resolution, which needs to know where the monitors ARE (Distribute needs only how
+// many windows they carry, hence the separate, cheaper enumerateDisplays above).
+// rcMonitor, not the work area: a Display's position and extent, taskbar included.
+inline std::vector<DisplayInfo> enumerateDisplayInfos() {
+    std::vector<DisplayInfo> out;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(m, &mi))
+                reinterpret_cast<std::vector<DisplayInfo>*>(lp)->push_back(DisplayInfo{
+                    toMonitorId(m),
+                    Rect{mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right,
+                         mi.rcMonitor.bottom}});
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&out));
@@ -1240,6 +1277,25 @@ inline void positionWindow(WindowId id, std::optional<MonitorId> target, Slot sl
 
 namespace winspace::io {
 
+// ── GUID ⇄ DesktopKey narrowing (the boundary, ADR-0003 / ADR-0023) ──────────
+// The one place a Virtual Desktop's OS identity becomes the core's opaque
+// DesktopKey and back — the same translation-adapter shape as Mod→MOD_* and
+// WindowId⇄HWND. A GUID is 16 bytes of identity with no meaning to the core, so
+// the narrowing is a byte copy, not a reinterpretation.
+static_assert(sizeof(GUID) == 16, "DesktopKey mirrors a GUID's 16 identity bytes");
+
+inline DesktopKey toDesktopKey(const GUID& g) {
+    DesktopKey key{};
+    std::memcpy(key.bytes.data(), &g, sizeof(GUID));
+    return key;
+}
+
+inline GUID toGuid(const DesktopKey& key) {
+    GUID g{};
+    std::memcpy(&g, key.bytes.data(), sizeof(GUID));
+    return g;
+}
+
 // ── the seam: pure winspace vocabulary, no COM type in sight ─────────────────
 
 // The abstraction the rest of winspace sees. Logical workspace numbers in,
@@ -1257,6 +1313,26 @@ public:
     // The Logical workspace active at startup, seeded from the OS active desktop
     // during adoption. Lets the Worker align its State with reality on boot.
     virtual int currentWorkspace() const = 0;
+
+    // Re-derive the bindings from the LIVE Virtual Desktop set (ADR-0023): the pure
+    // `reconcile` policy applied to what the OS currently reports. Idempotent, so
+    // running it more often than strictly needed is always safe. Also recomputes
+    // which Logical workspace is current.
+    virtual void reconcileDesktops() = 0;
+
+    // Register the Notification sink on the caller's STA so external desktop
+    // changes are noticed AS THEY HAPPEN (ADR-0023). `worker` is the message-only
+    // window the sink posts its reconcile trigger to. False means the interface
+    // could not be acquired — a future Windows build moved the vtable — and the
+    // caller stays on the on-demand degrade path: slower to notice, never wrong.
+    virtual bool startNotifications(HWND worker) = 0;
+
+    // Leave the session as winspace found it (ADR-0024): switch to the Home desktop
+    // and destroy every desktop whose Provenance says winspace created it, with home
+    // as the RemoveDesktop fallback so windows migrate onto it rather than being
+    // lost. Foreign desktops survive. Degrade-and-log throughout — quitting must
+    // never be blockable.
+    virtual void cleanupCreatedDesktops() = 0;
 
     // Move a window to the Logical workspace, materializing the target on demand
     // WITHOUT switching to it (ADR-0010, revised). Implemented with the INTERNAL
@@ -1288,6 +1364,18 @@ inline constexpr GUID k_clsidVirtualDesktopManagerInternal = {
 // E_ACCESSDENIED for windows the caller does not own — see ADR-0010 revision).
 inline constexpr GUID k_iidApplicationViewCollection = {
     0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
+
+// The Virtual Desktop NOTIFICATION service (ADR-0023) — the second undocumented
+// vtable winspace pins, taken knowingly. QueryService on the ImmersiveShell with
+// this service id yields IVirtualDesktopNotificationService, whose Register hands
+// the shell our sink. The IIDs come from the same community RE lineage as the
+// manager above (MScholtes/VirtualDesktop, VirtualDesktop11-24H2.cs).
+inline constexpr GUID k_clsidVirtualDesktopNotificationService = {
+    0xA501FDEC, 0x4A09, 0x464C, {0xAE, 0x4E, 0x1B, 0x9C, 0x21, 0xB8, 0x49, 0x18}};
+inline constexpr GUID k_iidVirtualDesktopNotificationService = {
+    0x0CD45E71, 0xD927, 0x4F15, {0x8B, 0x0A, 0x8F, 0xEF, 0x52, 0x53, 0x37, 0xBF}};
+inline constexpr GUID k_iidVirtualDesktopNotification = {
+    0xB9E5E94D, 0x233E, 0x49AB, {0xAF, 0x5C, 0x2B, 0x45, 0x41, 0xC3, 0xAA, 0xDE}};
 
 // IID_IVirtualDesktop — 24H2 / build 26100 (VirtualDesktop11-24H2.cs). Passed to
 // IObjectArray::GetAt to fetch each desktop as this element type.
@@ -1375,7 +1463,141 @@ IApplicationViewCollection : public IUnknown {
     STDMETHOD(GetViewForHwnd)(void* hwnd, IApplicationView** ppView) = 0;        // 6
 };
 
+// IVirtualDesktopNotification — the sink interface the shell CALLS INTO, so
+// winspace implements this one rather than calling through it. That inverts the
+// usual undocumented-vtable risk: every method below does the same near-zero work
+// (post and return S_OK) and reads none of its arguments, so a slot that has
+// shifted in some future build costs us a mislabelled trigger, never a bad call
+// through a wrong pointer. Argument types are declared for shape only; HSTRING and
+// IApplicationView params are pointer-width void* (ABI-identical).
+MIDL_INTERFACE("B9E5E94D-233E-49AB-AF5C-2B4541C3AADE")
+IVirtualDesktopNotification : public IUnknown {
+    STDMETHOD(VirtualDesktopCreated)(IVirtualDesktop* pDesktop) = 0;                    // 3
+    STDMETHOD(VirtualDesktopDestroyBegin)(IVirtualDesktop* pD, IVirtualDesktop* pF) = 0;   // 4
+    STDMETHOD(VirtualDesktopDestroyFailed)(IVirtualDesktop* pD, IVirtualDesktop* pF) = 0;  // 5
+    STDMETHOD(VirtualDesktopDestroyed)(IVirtualDesktop* pD, IVirtualDesktop* pF) = 0;      // 6
+    STDMETHOD(VirtualDesktopIsPerMonitorChanged)(int state) = 0;                        // 7
+    STDMETHOD(VirtualDesktopMoved)(IVirtualDesktop* pD, int from, int to) = 0;          // 8
+    STDMETHOD(VirtualDesktopNameChanged)(IVirtualDesktop* pD, void* name) = 0;          // 9
+    STDMETHOD(ViewVirtualDesktopChanged)(void* pView) = 0;                              // 10
+    STDMETHOD(CurrentVirtualDesktopChanged)(IVirtualDesktop* pOld,
+                                            IVirtualDesktop* pNew) = 0;                 // 11
+    STDMETHOD(VirtualDesktopWallpaperChanged)(IVirtualDesktop* pD, void* path) = 0;     // 12
+    STDMETHOD(VirtualDesktopSwitched)(IVirtualDesktop* pDesktop) = 0;                   // 13
+    STDMETHOD(RemoteVirtualDesktopConnected)(IVirtualDesktop* pDesktop) = 0;            // 14
+};
+
+// IVirtualDesktopNotificationService — Register hands the shell a sink and returns
+// a cookie; Unregister takes it back. Stable across the Windows 11 builds in the
+// RE lineage.
+MIDL_INTERFACE("0CD45E71-D927-4F15-8B0A-8FEF525337BF")
+IVirtualDesktopNotificationService : public IUnknown {
+    STDMETHOD(Register)(IVirtualDesktopNotification* pSink, DWORD* pdwCookie) = 0;  // 3
+    STDMETHOD(Unregister)(DWORD dwCookie) = 0;                                      // 4
+};
+
 }  // namespace vd
+
+// ── the Notification sink: posts, and does nothing else ──────────────────────
+
+// The message the sink posts to the Worker's message-only window to ask for one
+// reconcile on a clean pump turn. Shares the WM_APP private block with the Worker's
+// own ids (k_wmEvent = WM_APP+0, k_wmSetHotkeyThread = +1, k_wmReloadBinds = +2),
+// which are declared in the worker section further down; this one lives here
+// because the sink — declared above the Worker — is what posts it.
+inline constexpr UINT k_wmReconcile = WM_APP + 3;
+
+// winspace's IVirtualDesktopNotification implementation (ADR-0023), registered on
+// the WORKER's existing STA — no second apartment, no cross-apartment marshalling.
+//
+// It does NEAR-ZERO WORK: it touches neither the bindings nor State, it only posts
+// to the Worker's message-only window — the third instance of the shape the Hotkey
+// thread and the Hook thread already follow. That is not tidiness, it is the whole
+// safety argument. An STA sink's callbacks are dispatched by the message pump
+// INCLUDING the pump that runs inside an outbound blocking COM call, so a
+// CurrentVirtualDesktopChanged can arrive *inside* doSwitch's own SwitchDesktop
+// while resolveLiveDesktop is mid-iteration over the desktop snapshot. A callback
+// that only posts cannot corrupt anything; the reconcile always runs on a clean
+// pump turn.
+//
+// A notification is a TRIGGER, NEVER THE DATA — which is why every callback is the
+// same one-liner and no argument is read. The Worker re-enumerates instead, and
+// because a full re-enumeration is idempotent, coalescing many notifications into
+// one reconcile is correct by construction: no Created-before-CurrentChanged
+// ordering has to be modelled.
+class VirtualDesktopNotificationSink final : public vd::IVirtualDesktopNotification {
+public:
+    explicit VirtualDesktopNotificationSink(HWND worker) : m_worker(worker) {}
+
+    // IUnknown. The sink is created on, called on, and released on the Worker STA,
+    // but the counter is interlocked anyway — a COM object's lifetime is not ours
+    // to reason about once the shell holds a reference.
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) ||
+            IsEqualIID(riid, vd::k_iidVirtualDesktopNotification)) {
+            *ppv = static_cast<vd::IVirtualDesktopNotification*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_refs));
+    }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        const LONG remaining = InterlockedDecrement(&m_refs);
+        if (remaining == 0) delete this;
+        return static_cast<ULONG>(remaining);
+    }
+
+    // Every notification, without exception, is the same trigger.
+    STDMETHODIMP VirtualDesktopCreated(vd::IVirtualDesktop*) override { return trigger(); }
+    STDMETHODIMP VirtualDesktopDestroyBegin(vd::IVirtualDesktop*, vd::IVirtualDesktop*) override {
+        return trigger();
+    }
+    STDMETHODIMP VirtualDesktopDestroyFailed(vd::IVirtualDesktop*, vd::IVirtualDesktop*) override {
+        return trigger();
+    }
+    STDMETHODIMP VirtualDesktopDestroyed(vd::IVirtualDesktop*, vd::IVirtualDesktop*) override {
+        return trigger();
+    }
+    STDMETHODIMP VirtualDesktopIsPerMonitorChanged(int) override { return trigger(); }
+    STDMETHODIMP VirtualDesktopMoved(vd::IVirtualDesktop*, int, int) override { return trigger(); }
+    STDMETHODIMP VirtualDesktopNameChanged(vd::IVirtualDesktop*, void*) override {
+        return trigger();
+    }
+    STDMETHODIMP ViewVirtualDesktopChanged(void*) override { return trigger(); }
+    STDMETHODIMP CurrentVirtualDesktopChanged(vd::IVirtualDesktop*,
+                                              vd::IVirtualDesktop*) override {
+        return trigger();
+    }
+    STDMETHODIMP VirtualDesktopWallpaperChanged(vd::IVirtualDesktop*, void*) override {
+        return trigger();
+    }
+    STDMETHODIMP VirtualDesktopSwitched(vd::IVirtualDesktop*) override { return trigger(); }
+    STDMETHODIMP RemoteVirtualDesktopConnected(vd::IVirtualDesktop*) override {
+        return trigger();
+    }
+
+private:
+    ~VirtualDesktopNotificationSink() = default;  // COM lifetime: Release deletes
+
+    // The entire body of every callback. PostMessage (never Send) so the shell's
+    // notifying thread is released immediately and the reconcile runs later, on a
+    // clean pump turn. A failed post drops one trigger, which the on-demand
+    // reconcile at the top of the next workspace operation would recover anyway.
+    HRESULT trigger() {
+        if (m_worker) PostMessageW(m_worker, k_wmReconcile, 0, 0);
+        return S_OK;
+    }
+
+    HWND m_worker = nullptr;
+    LONG m_refs = 1;  // born owned by its creator, which hands it to a ComPtr
+};
 
 // ── variant identity + diagnostics ──────────────────────────────────────────
 
@@ -1452,7 +1674,7 @@ public:
     VirtualDesktop24H2Bridge(
         Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager,
         Microsoft::WRL::ComPtr<IServiceProvider> shell)
-        : m_manager(std::move(manager)) {
+        : m_manager(std::move(manager)), m_shell(shell) {
         adopt();
 
         // Acquire the internal IApplicationViewCollection (ADR-0010, revised): the
@@ -1474,8 +1696,17 @@ public:
         }
     }
 
+    // Unregister the sink before the COM pointers drop, so the shell never holds a
+    // reference to a sink whose Worker window is about to be destroyed.
+    ~VirtualDesktop24H2Bridge() override {
+        if (m_notificationService && m_notificationCookie != 0)
+            if (const auto r = ok(m_notificationService->Unregister(m_notificationCookie)); !r)
+                lg::warn("virtual desktop bridge: notification Unregister failed: {}", r.error());
+    }
+
     bool switchTo(int logical) override {
         if (!m_manager) return false;
+        reconcileBeforeOperation();
 
         // Hit path as an and_then chain: resolve the binding to its live desktop
         // (matched by identity, so it survives a Task View reorder), then switch.
@@ -1486,7 +1717,7 @@ public:
         const std::expected<Success, Error> result =
             resolveBinding(logical)
                 .and_then([&](const Microsoft::WRL::ComPtr<vd::IVirtualDesktop>& desktop) {
-                    return doSwitch(logical, desktop.Get());
+                    return doSwitch(desktop.Get());
                 })
                 .or_else([&](const Error& e) -> std::expected<Success, Error> {
                     if (!std::holds_alternative<NotFound>(e.code))
@@ -1503,6 +1734,121 @@ public:
 
     int currentWorkspace() const override { return m_current; }
 
+    // Re-derive the bindings from the live desktop set via the PURE reconcile policy
+    // (ADR-0023). All the deciding — keep, drop, lowest-free — happens in core; this
+    // arm only enumerates, installs the answer, and recomputes `m_current`.
+    void reconcileDesktops() override {
+        if (!m_manager) return;
+        const std::vector<DesktopKey> live = liveDesktopKeys();
+        // A machine always has at least one desktop, so an empty read means the
+        // enumeration FAILED (already logged). Keeping the old bindings is strictly
+        // better than wiping every workspace number on a transient COM error.
+        if (live.empty()) return;
+
+        m_bindings = reconcile(m_bindings, live);
+        if (const std::optional<DesktopKey> active = activeDesktopKey())
+            if (const auto* bound = bindingForKey(*active)) m_current = bound->logical;
+    }
+
+    // Acquire IVirtualDesktopNotificationService off the same ImmersiveShell service
+    // provider the manager came from, and Register a sink that only posts. Failure
+    // is DEGRADE-AND-LOG (ADR-0004), not fatal: the cookie stays 0, which is exactly
+    // what makes reconcileBeforeOperation resume reconciling on every keypress.
+    bool startNotifications(HWND worker) override {
+        if (!m_shell || !worker) return false;
+
+        auto service = ok([&](vd::IVirtualDesktopNotificationService** pp) {
+            return m_shell->QueryService(vd::k_clsidVirtualDesktopNotificationService,
+                                         vd::k_iidVirtualDesktopNotificationService,
+                                         reinterpret_cast<void**>(pp));
+        });
+        if (!service) {
+            lg::warn("virtual desktop bridge: QueryService(IVirtualDesktopNotificationService) "
+                     "failed — reconciling on demand instead: {}",
+                     service.error());
+            return false;
+        }
+
+        // Attach (not assign): the sink is born with one reference, which the ComPtr
+        // takes over rather than adding a second.
+        Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotification> sink;
+        sink.Attach(new VirtualDesktopNotificationSink(worker));
+
+        DWORD cookie = 0;
+        if (const auto registered = ok((*service)->Register(sink.Get(), &cookie)); !registered) {
+            lg::warn("virtual desktop bridge: notification Register failed — reconciling on "
+                     "demand instead: {}",
+                     registered.error());
+            return false;
+        }
+
+        m_notificationService = std::move(*service);
+        m_notificationSink = std::move(sink);
+        m_notificationCookie = cookie;
+        lg::info("virtual desktop bridge: notification sink registered (live reconcile)");
+        return true;
+    }
+
+    // Quit cleanup (ADR-0024). Two constraints shape this arm:
+    //
+    //   * the switch to home must COMPLETE before any removal, or cleanup removes
+    //     the desktop it is standing on — hence the explicit
+    //     WaitForAnimationToComplete between the two phases; and
+    //   * it must NOT consult the Reducer's current workspace, which ADR-0023 makes
+    //     eventually consistent — it may still name the old Workspace right now. The
+    //     home identity captured at Adoption is the only thing it trusts.
+    //
+    // Every step degrades and logs (ADR-0004): a failed switch or a failed removal
+    // is skipped, and Exit — emitted right after this Effect — always runs.
+    void cleanupCreatedDesktops() override {
+        if (!m_manager) return;
+        if (!m_home) {
+            lg::warn("quit cleanup: no home desktop was captured at adoption — skipping");
+            return;
+        }
+
+        const std::vector<DesktopKey> doomed = desktopsToCleanup(m_bindings);
+        if (doomed.empty()) return;   // created nothing, so remove nothing
+
+        const auto home = resolveLiveDesktop(toGuid(*m_home));
+        if (!home) {
+            lg::warn("quit cleanup: home desktop is gone — leaving {} desktop(s) standing: {}",
+                     doomed.size(), home.error());
+            return;
+        }
+
+        // Phase one: land on home, and let the switch settle. Removing the desktop
+        // we are standing on is the failure this ordering exists to prevent.
+        if (const auto switched = ok(m_manager->SwitchDesktop((*home).Get())); !switched) {
+            lg::warn("quit cleanup: could not switch to the home desktop — leaving {} "
+                     "desktop(s) standing: {}",
+                     doomed.size(), switched.error());
+            return;
+        }
+        if (const auto settled = ok(m_manager->WaitForAnimationToComplete()); !settled)
+            lg::warn("quit cleanup: WaitForAnimationToComplete failed; continuing: {}",
+                     settled.error());
+
+        // Phase two: destroy ours, with home as the fallback so any windows parked
+        // on a removed desktop MIGRATE there rather than being destroyed.
+        int removed = 0;
+        for (const DesktopKey& key : doomed) {
+            if (key == *m_home) continue;   // never remove the ground we stand on
+            const auto desktop = resolveLiveDesktop(toGuid(key));
+            if (!desktop) continue;         // already gone — nothing to do
+            if (const auto r =
+                    ok(m_manager->RemoveDesktop((*desktop).Get(), (*home).Get()));
+                !r)
+                lg::warn("quit cleanup: RemoveDesktop failed; skipping: {}", r.error());
+            else
+                ++removed;
+        }
+        std::erase_if(m_bindings, [](const DesktopBinding& b) { return b.createdByWinspace; });
+        lg::info("quit cleanup: removed {} of {} winspace-created desktop(s); foreign desktops "
+                 "left standing",
+                 removed, doomed.size());
+    }
+
     // Move `window` to Logical workspace `logical` (ADR-0010, revised): resolve the
     // HWND to its IApplicationView, resolve the target desktop — materializing
     // (create + bind, NO switch) on a miss — then MoveViewToDesktop. The internal
@@ -1510,6 +1856,7 @@ public:
     // collection (acquisition failed) → no-op.
     bool moveWindowToWorkspace(WindowId window, int logical) override {
         if (!m_manager || !m_viewCollection) return false;
+        reconcileBeforeOperation();
 
         auto view = ok([&](vd::IApplicationView** pp) {
             return m_viewCollection->GetViewForHwnd(toHwnd(window), pp);
@@ -1538,20 +1885,43 @@ private:
     // an enumeration failure logs once and leaves the bridge with no bindings; a
     // single unreadable desktop is skipped, as the pre-refactor filtered pipeline did.
     void adopt() {
-        auto desktops = ok(
-            [&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
+        const std::vector<DesktopKey> live = liveDesktopKeys();
+
+        // Bind each readable desktop to its 1-based logical slot, every one recorded
+        // as FOREIGN (Provenance false): winspace inherits the session, it does not
+        // annex it, so Quit cleanup leaves these standing.
+        m_bindings.clear();
+        for (const auto [i, key] : std::views::enumerate(live))
+            m_bindings.push_back({static_cast<int>(i) + 1, key, false});
+
+        // The HOME desktop: the one active at Adoption — where winspace found the
+        // user. This is the only moment it can be observed, and Quit cleanup needs it
+        // as both a switch-back target and the RemoveDesktop fallback.
+        if (const std::optional<DesktopKey> active = activeDesktopKey()) {
+            m_home = *active;
+            if (const auto* bound = bindingForKey(*active)) m_current = bound->logical;
+        }
+
+        lg::info(
+            "virtual desktop bridge: adopted {} desktop(s); current workspace = {}",
+            m_bindings.size(), m_current);
+    }
+
+    // Every live desktop's identity, in enumeration order. The single COM
+    // enumeration both Adoption and Reconciliation read the world through; an
+    // unreadable desktop is skipped, as the pre-refactor filtered pipeline did.
+    std::vector<DesktopKey> liveDesktopKeys() {
+        auto desktops = ok([&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
         if (!desktops) {
             lg::error("{}", desktops.error());
-            return;
+            return {};
         }
         UINT count = 0;
         if (const auto r = ok((*desktops)->GetCount(&count)); !r) {
             lg::error("{}", r.error());
-            return;
+            return {};
         }
-
-        // Bind each readable desktop's GUID to its 1-based logical slot.
-        const auto readBinding = [&](UINT i) -> std::optional<std::pair<int, GUID>> {
+        const auto readKey = [&](UINT i) -> std::optional<DesktopKey> {
             auto desktop = ok([&](vd::IVirtualDesktop** pp) {
                 return (*desktops)->GetAt(i, vd::k_iidVirtualDesktop24H2,
                                           reinterpret_cast<void**>(pp));
@@ -1559,36 +1929,54 @@ private:
             if (!desktop) return std::nullopt;
             GUID id{};
             if (!ok((*desktop)->GetID(&id))) return std::nullopt;
-            return std::pair{static_cast<int>(i) + 1, id};
+            return toDesktopKey(id);
         };
-        std::ranges::for_each(
-            std::views::iota(0u, count) | std::views::transform(readBinding) |
-                std::views::filter([](const auto& b) { return b.has_value(); }),
-            [&](const auto& b) { m_logicalToGuid[b->first] = b->second; });
+        return std::views::iota(0u, count) | std::views::transform(readKey) |
+               std::views::filter([](const auto& k) { return k.has_value(); }) |
+               std::views::transform([](const auto& k) { return *k; }) |
+               std::ranges::to<std::vector>();
+    }
 
-        auto active = ok(
-            [&](vd::IVirtualDesktop** pp) { return m_manager->GetCurrentDesktop(pp); });
-        GUID activeId{};
-        if (active.has_value() && ok((*active)->GetID(&activeId)).has_value()) {
-            const auto match = std::ranges::find_if(
-                m_logicalToGuid,
-                [&](const auto& entry) { return IsEqualGUID(entry.second, activeId); });
-            if (match != m_logicalToGuid.end()) m_current = match->first;
-        }
+    // The identity of the desktop the OS says is active right now, or nullopt if it
+    // cannot be read.
+    std::optional<DesktopKey> activeDesktopKey() {
+        auto active =
+            ok([&](vd::IVirtualDesktop** pp) { return m_manager->GetCurrentDesktop(pp); });
+        if (!active) return std::nullopt;
+        GUID id{};
+        if (!ok((*active)->GetID(&id))) return std::nullopt;
+        return toDesktopKey(id);
+    }
 
-        lg::info(
-            "virtual desktop bridge: adopted {} desktop(s); current workspace = {}", count,
-            m_current);
+    // The DEGRADE path of ADR-0023, run at the top of every workspace-affecting
+    // operation: with no live notification sink, the next keypress is the only
+    // moment winspace can notice a desktop the user created or destroyed behind its
+    // back. With the sink registered this is redundant — reconcile already ran on
+    // the notification's pump turn — so it is skipped to keep the switch path free
+    // of an extra COM enumeration. Degraded means slower to notice, never wrong.
+    void reconcileBeforeOperation() {
+        if (m_notificationCookie == 0) reconcileDesktops();
+    }
+
+    // Bindings are resolved by IDENTITY, never by array position (ADR-0003).
+    const DesktopBinding* bindingForKey(const DesktopKey& key) const {
+        const auto it = std::ranges::find(m_bindings, key, &DesktopBinding::key);
+        return it == m_bindings.end() ? nullptr : &*it;
+    }
+
+    const DesktopBinding* bindingForLogical(int logical) const {
+        const auto it = std::ranges::find(m_bindings, logical, &DesktopBinding::logical);
+        return it == m_bindings.end() ? nullptr : &*it;
     }
 
     // Map a logical workspace to its live desktop. A logical with no binding yet,
     // or one whose bound desktop has vanished, surfaces as NotFound so switchTo's
     // .or_else re-materializes both cases uniformly.
     std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> resolveBinding(int logical) {
-        const auto it = m_logicalToGuid.find(logical);
-        if (it == m_logicalToGuid.end())
+        const DesktopBinding* bound = bindingForLogical(logical);
+        if (!bound)
             return std::unexpected(Error{NotFound{}, std::source_location::current()});
-        return resolveLiveDesktop(it->second);
+        return resolveLiveDesktop(toGuid(bound->key));
     }
 
     // Resolve a stored GUID to the live IVirtualDesktop that currently holds it, by
@@ -1626,10 +2014,13 @@ private:
         return std::unexpected(Error{NotFound{}, std::source_location::current()});
     }
 
-    // Create exactly ONE desktop (appended at the tail) and bind logical→GUID,
+    // Create exactly ONE desktop (appended at the tail) and bind logical→key,
     // WITHOUT switching. No intermediate filling, no clamp (ADR-0003). The shared
     // root of materialize (which then switches) and the move path (which needs the
     // target to exist but must not steal focus unless following) — ADR-0010.
+    //
+    // The ONE place Provenance is recorded true: this desktop is ours, so Quit
+    // cleanup may destroy it. Every other binding path records false.
     std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> createAndBind(int logical) {
         auto created = ok(
             [&](vd::IVirtualDesktop** pp) { return m_manager->CreateDesktop(pp); });
@@ -1637,7 +2028,9 @@ private:
         GUID id{};
         if (const auto r = ok((*created)->GetID(&id)); !r)
             return std::unexpected(r.error());
-        m_logicalToGuid[logical] = id;
+        std::erase_if(m_bindings,
+                      [&](const DesktopBinding& b) { return b.logical == logical; });
+        m_bindings.push_back({logical, toDesktopKey(id), true});
         return *created;
     }
 
@@ -1646,7 +2039,7 @@ private:
     std::expected<Success, Error> materialize(int logical) {
         return createAndBind(logical).and_then(
             [&](const Microsoft::WRL::ComPtr<vd::IVirtualDesktop>& desktop) {
-                return doSwitch(logical, desktop.Get());
+                return doSwitch(desktop.Get());
             });
     }
 
@@ -1664,19 +2057,23 @@ private:
             });
     }
 
-    // Call SwitchDesktop and, on success, record the new current workspace. The
-    // .transform maps the Success through untouched while letting any Error skip
-    // straight past it to the caller's boundary consumer.
-    std::expected<Success, Error> doSwitch(int logical, vd::IVirtualDesktop* desktop) {
-        return ok(m_manager->SwitchDesktop(desktop)).transform([&](Success s) {
-            m_current = logical;
-            return s;
-        });
+    // Call SwitchDesktop, and record NOTHING (ADR-0023). It used to stamp
+    // m_current = logical here — a write of INTENT. m_current is now derived from
+    // the OS only, by Adoption and by reconcileDesktops, so it means "where the OS
+    // says we are" rather than "where we hoped to go". It no longer takes the
+    // logical number, because there is nothing left to do with it.
+    std::expected<Success, Error> doSwitch(vd::IVirtualDesktop* desktop) {
+        return ok(m_manager->SwitchDesktop(desktop));
     }
 
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> m_manager;
+    Microsoft::WRL::ComPtr<IServiceProvider> m_shell;  // kept: the notification service comes off it
     Microsoft::WRL::ComPtr<vd::IApplicationViewCollection> m_viewCollection;  // HWND→view (move)
-    std::unordered_map<int, GUID> m_logicalToGuid;  // logical workspace → desktop identity
+    Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotificationService> m_notificationService;
+    Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotification> m_notificationSink;
+    std::vector<DesktopBinding> m_bindings;  // logical workspace → identity + Provenance
+    std::optional<DesktopKey> m_home;        // the desktop active at Adoption
+    DWORD m_notificationCookie = 0;          // non-zero ⇔ the sink is live (ADR-0023)
     int m_current = 1;
 };
 
@@ -2003,7 +2400,17 @@ public:
         // switch Effects then no-op rather than calling through a wrong vtable.
         // Adoption ran in the factory, so seed State from the active desktop.
         m_bridge = makeVirtualDesktopBridge();
-        if (m_bridge) m_state.currentWorkspace = m_bridge->currentWorkspace();
+        if (m_bridge) {
+            m_state.currentWorkspace = m_bridge->currentWorkspace();
+            // Subscribe to the OS's Virtual Desktop notifications on THIS STA
+            // (ADR-0023). The sink only posts k_wmReconcile back to the window
+            // created above; the reconcile itself runs on a clean pump turn, in
+            // onReconcile. A failure is not fatal — the bridge falls back to
+            // reconciling at the top of each workspace operation.
+            if (!m_bridge->startNotifications(m_hwnd))
+                lg::warn("worker: virtual desktop notifications unavailable — external desktop "
+                         "changes will be noticed on the next workspace keypress instead");
+        }
     }
 
     ~Worker() {
@@ -2049,6 +2456,10 @@ private:
         auto* self = reinterpret_cast<Worker*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (self && msg == k_wmEvent) {
             return self->onEvent(reinterpret_cast<Event*>(lparam));
+        }
+        if (self && msg == k_wmReconcile) {
+            self->onReconcile();
+            return 0;
         }
         if (self && msg == k_wmSetHotkeyThread) {
             self->m_hotkeyThreadId = static_cast<DWORD>(wparam);
@@ -2096,6 +2507,21 @@ private:
         }
     }
 
+    // The Notification sink asked for a reconcile (ADR-0023). This is the clean pump
+    // turn the sink's callback deliberately deferred to, so ALL the work happens
+    // here: re-enumerate the live Virtual Desktop set, rebuild the bindings through
+    // the pure policy, and — only if the current Workspace actually differs — post
+    // the one fact the Reducer models back to ourselves as WorkspaceChanged. Many
+    // coalesced notifications collapse into one reconcile with no ordering
+    // assumptions, because a full re-enumeration is idempotent.
+    void onReconcile() {
+        if (!m_bridge) return;
+        m_bridge->reconcileDesktops();
+        if (const int current = m_bridge->currentWorkspace();
+            current != m_state.currentWorkspace)
+            postEvent(m_hwnd, new Event{WorkspaceChanged{current}});
+    }
+
     // Take ownership of the posted Event, reduce it against current State, adopt
     // the new State, and execute each emitted Effect — all on the Worker thread.
     LRESULT onEvent(Event* raw) {
@@ -2115,6 +2541,16 @@ private:
                     // materializing the workspace on demand. Null bridge (an
                     // unsupported OS variant) → the switch is a no-op.
                     if (m_bridge) m_bridge->switchTo(s.logical);
+                },
+                [&](const CleanupWorkspaces&) {
+                    // Emitted immediately BEFORE Exit, so it runs while the COM
+                    // bridge is still alive (ADR-0024). The bridge owns both ordering
+                    // constraints — switch to home first and let it complete, and
+                    // never read the eventually-consistent currentWorkspace — because
+                    // both are I/O sequencing, not a `reduce` concern. Null bridge (an
+                    // unsupported OS variant) → nothing was ever created, so nothing
+                    // to clean.
+                    if (m_bridge) m_bridge->cleanupCreatedDesktops();
                 },
                 [&](const Exit&) {
                     // End run()'s loop; the process then unwinds cleanly.
@@ -2138,6 +2574,22 @@ private:
                     // mechanical executor.
                     postEvent(m_hwnd, new Event{TileResolve{probeTopLevelWindowsWithIdentity(),
                                                             enumerateDisplays()}});
+                },
+                [&](const ResolveMoveToDisplay& rm) {
+                    // Phase one of the movetodisplay round-trip, mirroring
+                    // ResolveFocus: enumerate the live Displays WITH their rects and
+                    // resolve the foreground window plus the Display it sits on, then
+                    // post it all back as a MoveToDisplayResolve. No foreground window
+                    // becomes a nullopt subject, which the Reducer treats as a no-op —
+                    // the Worker decides nothing.
+                    const HWND fg = ::GetForegroundWindow();
+                    const std::optional<WindowId> subject =
+                        fg ? std::optional{toWindowId(fg)} : std::nullopt;
+                    const MonitorId display =
+                        fg ? toMonitorId(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST))
+                           : MonitorId{};
+                    postEvent(m_hwnd, new Event{MoveToDisplayResolve{
+                                          rm.dir, subject, display, enumerateDisplayInfos()}});
                 },
                 [&](const SetForegroundWindow& sf) {
                     // Bare call, degrade-and-log: a just-fired hotkey

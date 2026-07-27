@@ -31,19 +31,125 @@ position. Use this term only for the Windows mechanism; use Workspace for the us
 **Logical workspace number**:
 The stable 1, 2, 3… label the user types and binds keys to. Mapped to a Virtual Desktop
 **by GUID, never by array position**, so the label survives reordering and (later) reaping.
-The reducer reasons only in logical numbers; the `logical→GUID` map lives in the bridge.
+The reducer reasons only in logical numbers; the bindings (`logical` → **DesktopKey** +
+**Provenance**) live in the bridge, which narrows the GUID at its boundary.
+
+**DesktopKey**:
+A Virtual Desktop's identity as the **Reducer**'s world sees it — a plain, fixed-size,
+`windows.h`-free POD narrowed from the OS `GUID` at the **bridge** boundary, exactly as
+`Mod→MOD_*` and `Key→VK_*` are narrowed there (ADR-0003). Opaque in the same way `WindowId`
+and `MonitorId` are: stored, compared, and handed back, never interpreted. It exists so the
+two policies over the bindings — **Reconciliation** and **Quit cleanup**'s selection — can be
+pure functions in core with real unit tests, while every GUID stays in the bridge. A binding
+is `{logical, DesktopKey, createdByWinspace}`.
+_Avoid_: desktop GUID (that is the Windows type it is narrowed from), desktop id, index.
 
 **Adoption**:
 At startup, binding the Virtual Desktops that already exist to logical numbers `1..N` (by
 GUID), and seeding the current workspace from the active desktop — so winspace inherits the
-session rather than resetting it. This is a **Workspace**-level concept — the desktops, not
-the windows on them. _Distinct from_ **Rule adoption** (the window-level startup sweep).
+session rather than resetting it. Every adopted desktop is recorded with **Provenance**
+`foreign`: winspace inherits the session, it does not annex it. This is a **Workspace**-level
+concept — the desktops, not the windows on them. _Distinct from_ **Rule adoption** (the
+window-level startup sweep).
+
+**Provenance**:
+The one bool carried beside each binding's **DesktopKey**, recording whether **winspace
+created that Virtual Desktop** (`createdByWinspace`). It separates two questions that look like one:
+a desktop being **addressable** (bound to a Logical workspace number, so `workspace N` lands
+on it) is independent of it being **ours** (destroyable by **Quit cleanup**). Set true only by
+`createAndBind`; false for every desktop seen by **Adoption** or **Reconciliation**. Without
+it, cleaning up on exit would delete desktops the user made by hand in Task View — tidying
+that is actually data loss. The bindings live in the bridge, never in State (a GUID is a
+Windows type, ADR-0003); core owns only their *shape* and the two pure policies over them.
+_Avoid_: ownership flag (too broad — winspace *manages* foreign desktops, it just may not
+destroy them), managed, internal.
+
+**Foreign desktop**:
+A Virtual Desktop winspace did not create — one that already existed at **Adoption**, or one
+the user made mid-run with Win+Ctrl+D / Task View. It **is** bound to a Logical workspace
+number (lowest free, so labels stay compact and reuse numbers freed by an external destroy —
+the sparse model's whole point, where `max+1` would ratchet upward all session) and is
+switchable like any other, but its **Provenance** is `foreign`, so **Quit cleanup** leaves it
+standing.
+_Avoid_: external desktop (reads as off-machine), unmanaged, orphan.
+
+**Reconciliation**:
+Keeping the bindings true to the live Virtual Desktop set as it changes for reasons
+**other than winspace** — the policy ADR-0003 explicitly deferred ("Reconciliation of desktops
+created outside winspace mid-run is a separate deferred policy"). Distinct from **Adoption**,
+which is the one-shot startup form of the same reconciliation. Driven by
+`IVirtualDesktopNotification`, and **split by layer**: the map maintenance (`Created`,
+`Destroyed`, `Moved`, `NameChanged`) stays bridge-internal per ADR-0003, while the single fact
+the Reducer models — which Workspace is current — re-enters as the **WorkspaceChanged** Event.
+A notification is a **trigger, never the data**: the **Notification sink** posts, and the
+Worker then runs **one idempotent reconcile** — re-enumerate, rebuild bindings preserving
+**Provenance** and assigning lowest-free to anything new, recompute current, post
+`WorkspaceChanged` only on a real change. The deciding half is the pure core function
+`reconcile(previous, liveKeys)` over **DesktopKey**s; the bridge only enumerates and installs
+the answer. Because a full re-enumeration is idempotent,
+coalescing many notifications into one reconcile is correct by construction and no
+`Created`-before-`CurrentChanged` ordering has to be modeled — the failure mode undocumented
+COM most often springs. The same routine is the **degrade path**: if a future Windows build
+breaks the notification vtable, winspace logs it (ADR-0004) and reconciles at the top of each
+workspace operation instead — noticing on the next keypress rather than dying.
+
+**Notification sink**:
+winspace's `IVirtualDesktopNotification` implementation, registered on the **Worker**'s
+existing STA (no second apartment, no cross-apartment marshalling). It does **near-zero work**:
+it touches neither the map nor State, it only posts to the Worker's message-only window — the
+third instance of the shape the Hotkey thread and Hook thread already follow. This is what
+kills the reentrancy hazard: an STA sink's callbacks are dispatched by the message pump
+*including the pump that runs inside an outbound blocking COM call*, so a
+`CurrentVirtualDesktopChanged` can arrive **inside** `doSwitch`'s own `SwitchDesktop` while
+`resolveLiveDesktop` is mid-iteration. A callback that only posts cannot corrupt anything; the
+reconcile always runs on a clean pump turn.
+_Avoid_: notification thread (there isn't one — it lives on the Worker STA), listener,
+observer.
+
+**WorkspaceChanged** *(the Event)*:
+The `CurrentVirtualDesktopChanged` notification, translated to a Logical workspace number and
+posted to the Worker — and the **sole writer** of `State.currentWorkspace`. The notification
+fires for winspace's **own** switches as well as external ones, so one path serves both: the
+Reducer emits `SwitchToWorkspace` expressing *intent*, and reality re-enters as an Event,
+exactly as `ResolveFocus`→`FocusResolve` and `ResolveDistribute`→`DistributeResolve` already
+do. This retires three writers that recorded intent rather than fact (the speculative
+`next.currentWorkspace` in `WorkspaceSwitch` and `MoveToWorkspace`, and `doSwitch`'s
+`m_current`). **Consequence:** `currentWorkspace` is **eventually consistent** — between the
+bind firing and the notification landing, State still names the *old* Workspace. Nothing reads
+the field today, but any future logic that switches and then reads "where am I" inside the
+same `reduce` will read stale.
+_Avoid_: DesktopSwitched (the OS spelling; the Reducer speaks Workspaces), SwitchToWorkspace
+(that is the Effect — the intent, not the confirmation).
 
 **Reaping**:
-Destroying an empty, unfocused Workspace so junk desktops don't accumulate. A wanted
-feature, still deferred: it needs per-Workspace occupancy tracking the hook does not yet
-maintain (the lifecycle stream is in master, an occupancy model is not); the GUID-anchored
-mapping is what makes it safe.
+Destroying an empty, unfocused Workspace **during a session** so junk desktops don't
+accumulate. A wanted feature, still deferred: it needs per-Workspace occupancy tracking the
+hook does not yet maintain (the lifecycle stream is in master, an occupancy model is not); the
+GUID-anchored mapping is what makes it safe. _Distinct from_ **Quit cleanup**, which is not
+blocked by that gap — a one-shot question needs no continuous tracking.
+
+**Home desktop**:
+The Virtual Desktop that was active at **Adoption** — where winspace found the user. The
+switch-back target and the `RemoveDesktop` fallback for **Quit cleanup**.
+_Avoid_: desktop 1 (home is wherever the user happened to be, not necessarily logical 1),
+default workspace.
+
+**Quit cleanup**:
+On exit, switching to the **Home desktop** and destroying every Virtual Desktop whose
+**Provenance** is `createdByWinspace`, so the session ends with exactly the desktops that
+existed before winspace started. **Foreign desktops** survive untouched — "clean up all" never
+means "delete your stuff." Windows are never lost: `RemoveDesktop` takes a **fallback**
+desktop and migrates them to it (home), so cleanup can only *consolidate* windows, never
+destroy them. Unconditional, **not** empty-only: once winspace exits the user no longer has
+`workspace N` binds, so a window parked on a removed desktop does not become neutral, it
+becomes *harder to reach* — recoverable only by walking Win+Ctrl+→. Consolidating on home is
+the kind option; stranding windows on desktops the user can no longer address is the
+destructive one. Empty-only would also make shutdown *unpredictable* — whether quit tidies up
+would depend on where windows happened to sit. The switch to home must **complete** before any
+removal (else it removes the desktop it is standing on), an ordering constraint inside the
+Effect, not a `reduce` concern — and one that cannot lean on `currentWorkspace`, which is now
+eventually consistent (see **WorkspaceChanged**).
+_Avoid_: reaping (that is the live, empty-only, still-deferred form), teardown, reset.
 
 **Display**:
 One physical monitor. All Displays switch Workspace together (global switch); each window
@@ -102,6 +208,21 @@ fullscreen. The *policy* (the AND of these facts, `isEligible`) is a pure predic
 Reducer; the *Probe* that gathers the facts is the adapter's job.
 _Note_: `WS_THICKFRAME` is a hold-over from tiling (only resizable windows could tile) and
 is a candidate to loosen for focus candidacy later; kept as-is for now.
+
+**Fullscreen**:
+The one Eligibility fact that is **not** a style bit: a window that covers its Display's full
+bounds (`rcMonitor`, taskbar included) **and is not OS-maximized** (`IsZoomed`). The
+`!IsZoomed` half is load-bearing — geometry alone cannot tell fullscreen from **maximized**,
+because on a Display with no taskbar the work area *is* the monitor bounds, so ADR-0020's
+auto-maximize makes every window there cover `rcMonitor`. Defining Fullscreen by geometry
+alone therefore made every window on a taskbar-less second Display Ineligible, and Spatial
+focus could neither enter nor move within it. The distinction was never geometry; it is
+window *state*. Fullscreen serves two exclusions, not one: a Fullscreen window is no focus
+Candidate, **and** Distribute never grabs it on `Appeared` (so an app that opens fullscreen is
+not maximized out of it). Accepted edge case: a window manually dragged and sized to exactly
+cover a taskbar-less Display reads as Fullscreen.
+_Avoid_: maximized (the opposite — a maximized window is emphatically not Fullscreen),
+covers-the-screen, borderless.
 
 **Eligible window**:
 A window that passes the Eligibility gate — a real top-level application window winspace
@@ -286,6 +407,25 @@ move an already-placed window), never emits `MoveWindowToWorkspace`, and leaves 
 DWM-cloaked → Ineligible → skipped. Stays on `RegisterHotKey` like every other Dispatcher (ADR-0014).
 _Avoid_: retile-all (it is current-Workspace only), auto-tile (nothing is automatic — it is an
 explicit press; only `tile` rebalances already-placed windows).
+
+**MoveToDisplay** *(the Dispatcher / Event)*:
+`movetodisplay left|right|up|down` — move the foreground window to the neighbouring **Display**
+in the given **Direction** and **maximize** it there. The destination is resolved by a pure
+function over Display rects mirroring `resolveFocus`: from the subject's current Display
+centre, the nearest Display whose centre lies ahead in the Direction. Nothing ahead (or a
+single-Display machine) → no-op, no special case needed. Named **directionally, never by
+index**: `EnumDisplayMonitors` order is not user-visible, does not match the numbers in Windows
+Display Settings, and is not stable across a replug or a dock — a bind to `2` would silently
+mean a different monitor tomorrow. Reuses the existing `PositionWindow{target, slot}` Effect
+with the fixed Slot `maximized`; under ADR-0020 nearly every window is maximized already, so
+this is invisible in the common case, and `tile` remains the button that restores a Slot rule.
+Like **Tile** it is explicit and repeatable: it neither consults nor writes `placed`, and it
+**never** emits `MoveWindowToWorkspace` — Display and geometry only, never a Workspace change,
+the same boundary **Distribute** holds. The retired `movetomonitor` therefore stops earning the
+"removed with tiling" Diagnostic (now a lie) and earns a **"renamed to `movetodisplay`"** one
+instead — the glossary's _Avoid_: Monitor asserting itself on the config surface.
+_Avoid_: movetomonitor (the old Hyprland spelling — Display is the term), movetoscreen,
+movewindow (died with tiling).
 
 ### Launcher
 
