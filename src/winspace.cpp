@@ -730,6 +730,123 @@ inline std::optional<MonitorId> pickDistributeTarget(const std::vector<DisplayOc
     return min->id;
 }
 
+// ── pending move: the pure retry policy (ADR-0022) ───────────────────────────
+//
+// The Pending move set (CONTEXT.md) — the bounded set of MoveWindowToWorkspace
+// attempts awaiting View registration. Only its ARITHMETIC lives here; the
+// mechanism (SetTimer / GetViewForHwnd / reading the clock) is the adapter's, and
+// this type knows nothing of Win32, COM, or timers. Pure for the same reason
+// pickDistributeTarget is: "which entries are due, which have expired, and should a
+// timer exist at all" is policy over plain data, exercisable without a VM.
+//
+// Deliberately NOT in State (ADR-0022): "the shell has not registered a view yet,
+// ask again" is not a domain decision — there is no policy for the Reducer to
+// reason about and no alternative outcome. This type is a value the Worker's I/O
+// layer owns, defined here only so its edges are unit-testable.
+//
+// Arming is a DERIVED property — `armed()` is just "non-empty" — never a pair of
+// arm/disarm commands the adapter could get out of sync with. That is what makes
+// "zero wakeups when idle" a consequence of the data rather than of remembering to
+// call KillTimer.
+
+// Milliseconds from an arbitrary fixed origin, injected by the adapter. The core
+// never reads a clock; time only ever enters as one of these.
+using Tick = uint64_t;
+
+// Re-attempt cadence and total budget (ADR-0022): ~10 attempts over 250ms, which is
+// 5–10x the measured 31–63ms CREATE→SHOW gap in which View registration lands.
+// Success is expected on the first or second attempt. Named constants so widening
+// the budget after a real Edge/Teams measurement is a one-line change.
+inline constexpr Tick k_pendingMovePollMs = 25;
+inline constexpr Tick k_pendingMoveBudgetMs = 250;
+
+// How one move attempt ended, in winspace vocabulary — the bridge seam speaks this,
+// never an HRESULT (ADR-0004: "the abstraction keeps speaking pure winspace
+// vocabulary"). Exactly one outcome is actionable to the caller:
+//
+//   Moved              — it landed.
+//   ViewNotRegistered  — the shell has not finished View registration for this
+//                        brand-new HWND yet. The ONE transient worth re-asking
+//                        about, and the only reason this enum has three arms
+//                        instead of a bool.
+//   Failed             — anything else (a degraded bridge, an unresolvable target,
+//                        a refused move). Already logged where it happened
+//                        (ADR-0004 degrade-and-log) and final; re-asking cannot fix it.
+enum class MoveOutcome { Moved, ViewNotRegistered, Failed };
+
+// One outstanding attempt. `logical` is captured at ISSUE time rather than
+// re-derived, so a config reload mid-retry cannot silently redirect the window; the
+// `exe` rides along solely so the give-up warn can name the app.
+struct PendingMove {
+    WindowId id{};
+    int logical = 0;
+    std::string exe;
+    Tick nextAttempt = 0;
+    Tick deadline = 0;
+};
+
+// What one poll yields: the entries to re-attempt now, and the ones whose budget ran
+// out (already erased — each expires exactly once, so the warn cannot repeat).
+struct PendingMoveTick {
+    std::vector<PendingMove> due;
+    std::vector<PendingMove> expired;
+};
+
+class PendingMoves {
+public:
+    // Record how a move attempt ended. Returns true iff it entered the set — i.e.
+    // iff the outcome is the one retryable transient. A window already pending keeps
+    // its original deadline, so a repeat failure can never extend the budget.
+    bool noteFailure(WindowId id, int logical, std::string exe, MoveOutcome outcome, Tick now) {
+        if (outcome != MoveOutcome::ViewNotRegistered) return false;
+        if (std::ranges::find(m_entries, id, &PendingMove::id) != m_entries.end()) return true;
+        m_entries.push_back(PendingMove{.id = id,
+                                        .logical = logical,
+                                        .exe = std::move(exe),
+                                        .nextAttempt = now + k_pendingMovePollMs,
+                                        .deadline = now + k_pendingMoveBudgetMs});
+        return true;
+    }
+
+    // Advance to `now`: drop and report every expired entry, then report (and
+    // reschedule) every entry due for a re-attempt. Expiry is checked FIRST, so an
+    // entry whose budget ran out is given up on rather than attempted once more.
+    //
+    // Rescheduling from `now` — not from the old nextAttempt — is what makes a
+    // coalesced, low-priority WM_TIMER safe: a late tick spends FEWER attempts
+    // against the same wall-clock deadline, never a backlog of catch-up ones.
+    PendingMoveTick tick(Tick now) {
+        PendingMoveTick out;
+        // Copy the expired entries out BEFORE erasing them. Not remove_if: that
+        // returns a tail of moved-from, unspecified values, so reading the give-up
+        // warn's exe out of it would name the wrong app (or none).
+        const auto isExpired = [&](const PendingMove& e) { return now >= e.deadline; };
+        std::ranges::copy_if(m_entries, std::back_inserter(out.expired), isExpired);
+        std::erase_if(m_entries, isExpired);
+
+        for (PendingMove& e : m_entries) {
+            if (now < e.nextAttempt) continue;
+            e.nextAttempt = now + k_pendingMovePollMs;
+            out.due.push_back(e);
+        }
+        return out;
+    }
+
+    // The other two exits: a landed re-attempt, and a Vanished for a pending id
+    // (mandatory — Windows recycles HWNDs, and a retry against a recycled handle
+    // would move an unrelated window). Unknown ids are a no-op.
+    void erase(WindowId id) {
+        std::erase_if(m_entries, [&](const PendingMove& e) { return e.id == id; });
+    }
+
+    // Non-empty ⇒ a timer should be running; empty ⇒ none should exist. The whole
+    // zero-idle-wakeups guarantee, as one derived predicate.
+    bool armed() const { return !m_entries.empty(); }
+
+private:
+    std::vector<PendingMove> m_entries;
+};
+
 // ── the seam ────────────────────────────────────────────────────────────────
 
 inline ReduceResult reduce(const State& s, const Event& e) {

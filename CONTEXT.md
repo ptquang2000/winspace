@@ -63,6 +63,32 @@ least-occupied and maximizes there (overlap accepted). The pure decision is
 _Avoid_: Empty Display (retired — occupancy is now a count, not empty/occupied), Free monitor,
 Floating (there is no layout to float above — that term died with tiling, ADR-0007).
 
+**View registration** *(ADR-0022)*:
+The shell's **asynchronous** binding of a new HWND to an `IApplicationView` — the internal
+object `MoveViewToDesktop` consumes, and the only route by which winspace can move a window it
+does not own (ADR-0010: the public `MoveWindowToDesktop` returns `E_ACCESSDENIED` for foreign
+windows). Measured to land **tens of ms after `OBJECT_CREATE`**, normally *before* `OBJECT_SHOW`
+but not reliably — which is why a `workspace N` rule fails **intermittently** rather than always,
+with `GetViewForHwnd` returning `0x8002802B` "Element not found". **No event announces it**
+(`SYSTEM_FOREGROUND` is measurably too early; the only reliable postdate besides `SHOW` is the
+undocumented `0x4005`), so the only remedy is to re-ask — see **Pending move**. This is
+winspace's **only** asynchronous shell dependency: geometry writes go through `SetWindowPos` and
+need no view, so Distribute, Slots, and `tile` are unaffected.
+_Avoid_: window ready, fully opened (nothing marks that; the window is already created and
+visible — it is the shell's side table that lags).
+
+**Pending move** *(ADR-0022)*:
+The bounded, **Worker-local** set of `MoveWindowToWorkspace` attempts awaiting **View
+registration**. Lives in the I/O layer, not in `State`: armed on the first `0x8002802B` failure
+(`SetTimer`, 25ms), re-attempted while non-empty, **disarmed the moment it drains** — so the idle
+cost is exactly **zero wakeups**, and ADR-0007's no-polling promise is untouched (nothing wakes to
+inspect winspace's own world). Three exits: **success**, **`Vanished`** (mandatory — Windows
+recycles HWNDs, and a retry on a recycled handle would move an *unrelated* window), and the
+**250ms deadline** (give up, `warn`). Invisible to the Reducer — no Event, no Effect, no State:
+`placed` was already set before the Effect ran (ADR-0009), so it briefly asserts a placement that
+has not happened yet and becomes true when the retry lands.
+_Avoid_: retry queue (it is not ordered and nothing is dequeued), backoff, watchdog, poll loop.
+
 ### The core seam
 
 **Reducer**:
@@ -149,7 +175,10 @@ _Avoid_: Target (that's the single chosen one), option.
 **Probe**:
 A one-shot synchronous read of a window's live attributes (styles, cloak state, rect) taken
 *reactively* at the moment they are needed — on a `focus` keypress (Spatial focus), never on
-a timer. The hook adapter also Probes on a lifecycle edge (an `Appeared`).
+a timer. The hook adapter also Probes on a lifecycle edge (an `Appeared`). "Never on a timer"
+is a statement about **window attributes**: winspace's one timer (the **Pending move** retry)
+waits on *shell bookkeeping* — a third party's asynchronous state, with no notification to
+subscribe to — and never reads a window's own attributes (ADR-0022).
 _Avoid_: Poll, scan, snapshot-loop (there is no interval).
 
 **Appeared / Vanished** *(PRD 06)*:
