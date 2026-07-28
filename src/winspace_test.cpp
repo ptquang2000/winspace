@@ -1217,25 +1217,45 @@ TEST_CASE("reconcile is idempotent — running it twice on the same live set cha
     REQUIRE(twice == once);
 }
 
-TEST_CASE("reordering the live key list does not change the result", "[reducer][reconcile]") {
+TEST_CASE("reordering the live key list does not disturb EXISTING bindings",
+          "[reducer][reconcile]") {
     // A Task View drag reorders the OS's dense array; the GUID-anchored bindings
-    // (ADR-0003) must not notice, and neither must the numbering of newcomers.
+    // (ADR-0003) must not notice. Numbers and Provenance are matched by identity, so
+    // they are immune to argument order — which is the half that must hold.
     const std::vector<DesktopBinding> previous{{1, key(0xA), false}, {2, key(0xB), true}};
 
-    const auto ordered = reconcile(previous, {key(0xA), key(0xB), key(0xC), key(0xD)});
-    const auto shuffled = reconcile(previous, {key(0xD), key(0xB), key(0xC), key(0xA)});
+    const auto ordered = reconcile(previous, {key(0xA), key(0xB)});
+    const auto shuffled = reconcile(previous, {key(0xB), key(0xA)});
 
     REQUIRE(shuffled == ordered);
+    REQUIRE(shuffled == previous);
 }
 
-TEST_CASE("reconciling an empty previous binds every live key from 1 upward", "[reducer][reconcile]") {
-    const auto next = reconcile({}, {key(0xA), key(0xB)});
+TEST_CASE("newcomers are numbered in the OS's desktop order, not by identity",
+          "[reducer][reconcile]") {
+    // The other half, and NOT order-independent on purpose. `live` arrives in the
+    // OS's own desktop order — the left-to-right order Task View shows — which is
+    // meaningful and user-visible. Numbering newcomers by their identity bytes
+    // instead would make `workspace 1` stop meaning the leftmost desktop the moment
+    // Adoption came through here (ADR-0025 folded it in), silently scrambling every
+    // workspace number at startup.
+    const std::vector<DesktopBinding> previous{{1, key(0xA), false}};
 
-    REQUIRE(next.size() == 2);
-    REQUIRE(next[0].logical == 1);
-    REQUIRE(next[1].logical == 2);
-    REQUIRE_FALSE(next[0].createdByWinspace);
-    REQUIRE_FALSE(next[1].createdByWinspace);
+    // key(0xD) sits BEFORE key(0xC) on the desktop, so it takes the lower number
+    // even though its identity sorts higher.
+    const auto next = reconcile(previous, {key(0xA), key(0xD), key(0xC)});
+
+    REQUIRE(next == std::vector<DesktopBinding>{
+                        {1, key(0xA), false}, {2, key(0xD), false}, {3, key(0xC), false}});
+}
+
+TEST_CASE("reconciling an empty previous binds every live key from 1 upward IN DESKTOP ORDER",
+          "[reducer][reconcile]") {
+    // This case IS Adoption (ADR-0025): no previous bindings, so every desktop is
+    // bound 1..N in the order the OS reports them, and every one is foreign.
+    const auto next = reconcile({}, {key(0xB), key(0xA)});
+
+    REQUIRE(next == std::vector<DesktopBinding>{{1, key(0xB), false}, {2, key(0xA), false}});
 }
 
 // ── quit cleanup: the pure selection (ADR-0024) ──────────────────────────────
@@ -1280,6 +1300,112 @@ TEST_CASE("a created binding stays selectable after reconciles", "[reducer][clea
     const auto reconciled = reconcile(previous, {key(0xA), key(0xB), key(0xC)});
 
     REQUIRE(desktopsToCleanup(reconciled) == std::vector<DesktopKey>{key(0xB)});
+}
+
+// ── the cleanup anchor: the third pure policy over the bindings (ADR-0024 §amend) ─
+//
+// The desktop cleanup stands on. It used to be the Home desktop by assumption,
+// which held only because home always survived — until the user destroys it by hand
+// in Task View, after which quit left EVERY winspace-created desktop standing. The
+// preference order is unit-testable precisely because the anchor is now a total
+// function over the bindings rather than a fact read out of COM at quit time.
+
+TEST_CASE("the anchor is the Home desktop while home is still live", "[reducer][cleanup][anchor]") {
+    const std::vector<DesktopBinding> bindings{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    REQUIRE(cleanupAnchor(bindings, key(0xC)) == key(0xC));
+}
+
+TEST_CASE("home destroyed by hand falls back to the lowest-logical foreign desktop",
+          "[reducer][cleanup][anchor]") {
+    // key(0xZ) is home but no longer in the live (reconciled) set.
+    const std::vector<DesktopBinding> bindings{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    REQUIRE(cleanupAnchor(bindings, key(0xF)) == key(0xA));
+}
+
+TEST_CASE("with every desktop winspace's, the anchor is the lowest-logical one",
+          "[reducer][cleanup][anchor]") {
+    // The genuine last resort: keeping one of our own is unavoidable, because
+    // cleanup cannot remove the ground it stands on.
+    const std::vector<DesktopBinding> bindings{{2, key(0xB), true}, {3, key(0xC), true}};
+
+    REQUIRE(cleanupAnchor(bindings, key(0xF)) == key(0xB));
+}
+
+TEST_CASE("no bindings yields no anchor, so cleanup is skipped", "[reducer][cleanup][anchor]") {
+    REQUIRE_FALSE(cleanupAnchor({}, key(0xA)).has_value());
+    REQUIRE_FALSE(cleanupAnchor({}, std::nullopt).has_value());
+}
+
+TEST_CASE("a higher-logical foreign desktop beats a lower-logical winspace one",
+          "[reducer][cleanup][anchor]") {
+    // Preference beats ordering. Anchoring on logical 1 here would exempt one of
+    // winspace's own desktops from removal — the exact accumulation being fixed.
+    const std::vector<DesktopBinding> bindings{
+        {1, key(0xA), true}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    REQUIRE(cleanupAnchor(bindings, std::nullopt) == key(0xC));
+}
+
+TEST_CASE("the chosen anchor is never one of the doomed desktops unless every desktop is",
+          "[reducer][cleanup][anchor]") {
+    // The safety property the preference order exists to deliver, stated directly.
+    const std::vector<DesktopBinding> mixed{
+        {1, key(0xA), true}, {2, key(0xB), false}, {3, key(0xC), true}};
+
+    const auto anchor = cleanupAnchor(mixed, std::nullopt);
+    REQUIRE(anchor.has_value());
+    REQUIRE_FALSE(std::ranges::contains(desktopsToCleanup(mixed), *anchor));
+}
+
+// ── reconciliation is the reconnect repair path (ADR-0025) ───────────────────
+//
+// Re-acquisition re-derives the bindings through this same pure policy rather than
+// re-running Adoption. These three properties are what makes that safe — their
+// violation is silent until quit, and its two directions are "leaves the user's
+// desktops littered with winspace's" and "deletes the user's desktops".
+
+TEST_CASE("Provenance survives a rebuild against an unchanged live set",
+          "[reducer][reconcile][reacquire]") {
+    // THE test. Re-running Adoption here would tag key(0xB) foreign, after which
+    // quit would leave behind every desktop winspace created.
+    const std::vector<DesktopBinding> before{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), true}};
+    const std::vector<DesktopKey> live{key(0xA), key(0xB), key(0xC)};
+
+    const auto after = reconcile(before, live);
+
+    REQUIRE(after == before);
+    REQUIRE(desktopsToCleanup(after) == desktopsToCleanup(before));
+}
+
+TEST_CASE("logical numbers address the same desktops after a rebuild",
+          "[reducer][reconcile][reacquire]") {
+    // Muscle memory keeps working: `workspace 3` lands where it did before the
+    // shell died. The live set is deliberately re-reported in a DIFFERENT order,
+    // since a fresh enumeration carries no promise about ordering.
+    const std::vector<DesktopBinding> before{
+        {1, key(0xA), false}, {2, key(0xB), true}, {3, key(0xC), false}};
+
+    const auto after = reconcile(before, {key(0xC), key(0xA), key(0xB)});
+
+    REQUIRE(after == before);
+}
+
+TEST_CASE("a rebuild that finds a desktop created during the outage binds it lowest-free",
+          "[reducer][reconcile][reacquire]") {
+    // The shell came back with an extra desktop the user made while winspace was
+    // disconnected. It is bound (addressable) and FOREIGN (never destroyed at quit),
+    // and the existing numbers are undisturbed.
+    const std::vector<DesktopBinding> before{{1, key(0xA), false}, {3, key(0xC), true}};
+
+    const auto after = reconcile(before, {key(0xA), key(0xC), key(0xD)});
+
+    REQUIRE(after == std::vector<DesktopBinding>{
+                         {1, key(0xA), false}, {2, key(0xD), false}, {3, key(0xC), true}});
 }
 
 // ── launcher: Started / Reloaded → LaunchApp ─────────────────────────────────

@@ -703,10 +703,22 @@ constexpr bool isEligible(const WindowAttrs& a) {
 //     Lowest-free, not max+1 — otherwise numbering ratchets upward all session and
 //     you end up binding `workspace 17` on a four-desktop machine.
 //
-// A function of its inputs alone: no I/O, no COM, idempotent, and independent of
-// the order the live keys arrive in. That last property is why several new keys
-// are assigned in a deterministic order derived from their identity rather than
-// from enumeration order, and why the result is returned sorted by logical number.
+// A function of its inputs alone: no I/O, no COM, and idempotent.
+//
+// **Newcomers are numbered in the order `live` presents them**, which is the OS's
+// own desktop order — the left-to-right order Task View shows. That is meaningful,
+// user-visible, and exactly what **Adoption** relied on before ADR-0025 folded it
+// into this function: with no previous bindings, `reconcile({}, live)` must bind
+// `1..N` in DESKTOP order, or `workspace 1` stops meaning the leftmost desktop.
+//
+// An earlier revision sorted newcomers by their raw identity bytes to make the
+// result independent of argument order. That was safe while this ran only
+// mid-session (where newcomers arrive one at a time, so ordering never showed) and
+// silently wrong the moment Adoption came through here — it scrambled every
+// workspace number at startup. Argument order is not arbitrary and never was;
+// preserving it is the property worth having. Existing bindings are unaffected by
+// ordering either way, since they are matched by identity (ADR-0003), and the
+// result is still returned sorted by logical number.
 inline std::vector<DesktopBinding> reconcile(const std::vector<DesktopBinding>& previous,
                                              const std::vector<DesktopKey>& live) {
     std::vector<DesktopBinding> next;
@@ -716,10 +728,9 @@ inline std::vector<DesktopBinding> reconcile(const std::vector<DesktopBinding>& 
         if (prior != previous.end())
             next.push_back(*prior);   // number and Provenance both survive
         else
-            fresh.push_back(key);
+            fresh.push_back(key);     // in the OS's desktop order
     }
 
-    std::ranges::sort(fresh, {}, &DesktopKey::bytes);
     const auto taken = [&](int n) {
         return std::ranges::any_of(next, [&](const DesktopBinding& b) { return b.logical == n; });
     };
@@ -743,6 +754,45 @@ inline std::vector<DesktopBinding> reconcile(const std::vector<DesktopBinding>& 
 inline std::vector<DesktopKey> desktopsToCleanup(const std::vector<DesktopBinding>& bindings) {
     return bindings | std::views::filter(&DesktopBinding::createdByWinspace) |
            std::views::transform(&DesktopBinding::key) | std::ranges::to<std::vector>();
+}
+
+// The **Cleanup anchor**: the desktop Quit cleanup switches to and migrates windows
+// onto (ADR-0024's amendment). Distinct from the **Home desktop**, which those two
+// jobs were fused into only because home always used to survive. Home is a fact
+// about the past — *where winspace found the user*. The anchor is a REQUIREMENT: it
+// must survive the cleanup, and the user can destroy home by hand in Task View
+// mid-session, after which quit used to log and leave every winspace-created
+// desktop standing.
+//
+// `bindings` must be the FRESHLY RECONCILED set, which makes it exactly the live
+// desktop set (reconcile drops every key the OS no longer reports) — so "home still
+// names a live desktop" is decidable here, with no OS call and no Windows type in
+// the signature. Preference order:
+//
+//   1. the Home desktop, if it is still live;
+//   2. otherwise the lowest-logical FOREIGN desktop;
+//   3. otherwise the lowest-logical desktop.
+//
+// Foreign-first is load-bearing, not a taste. Cleanup never removes the ground it
+// stands on, so anchoring on a `createdByWinspace` desktop would exempt one of
+// winspace's own from removal — the exact accumulation ADR-0024 exists to end.
+// Preferring foreign makes that exemption reachable only in the genuine last resort
+// where EVERY desktop is winspace's. No bindings at all → no anchor, and the caller
+// skips cleanup, exactly as before.
+inline std::optional<DesktopKey> cleanupAnchor(const std::vector<DesktopBinding>& bindings,
+                                               const std::optional<DesktopKey>& home) {
+    if (bindings.empty()) return std::nullopt;
+    if (home && std::ranges::find(bindings, *home, &DesktopBinding::key) != bindings.end())
+        return *home;
+
+    auto foreign = bindings | std::views::filter([](const DesktopBinding& b) {
+                       return !b.createdByWinspace;
+                   });
+    if (const auto it = std::ranges::min_element(foreign, {}, &DesktopBinding::logical);
+        it != std::ranges::end(foreign))
+        return it->key;
+
+    return std::ranges::min_element(bindings, {}, &DesktopBinding::logical)->key;
 }
 
 // ── directional focus resolution: the pure rule (ADR-0008) ───────────────────

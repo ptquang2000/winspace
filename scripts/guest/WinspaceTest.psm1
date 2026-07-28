@@ -73,6 +73,12 @@ if (-not ([System.Management.Automation.PSTypeName]'Winspace.Native').Type) {
     public delegate bool EnumProc(System.IntPtr hWnd, System.IntPtr lParam);
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     public static extern bool EnumWindows(EnumProc lpEnumFunc, System.IntPtr lParam);
+
+    // Shell_TrayWnd presence — the "the guest is usable again" signal after a shell
+    // restart. Deliberately NOT used as a winspace readiness signal: it fires ~200 ms
+    // before the virtual desktop services answer (ADR-0025's measurement table).
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr FindWindowW(string lpClassName, string lpWindowName);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool IsWindowVisible(System.IntPtr hWnd);
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
@@ -311,6 +317,20 @@ function Get-WinspaceRoot {
 }
 function Get-WinspaceExe { Join-Path (Get-WinspaceRoot) 'winspace.exe' }
 function Get-WinspaceLog { Join-Path (Get-WinspaceRoot) 'run.log' }
+
+# winspace's own size-capped diagnostics file (ADR-0025). Distinct from run.log,
+# which is the harness's stderr redirect: THIS one is what a user who never
+# redirected anything gets, and the whole point of the file sink is that it exists
+# without the harness doing anything.
+function Get-WinspaceFileLog { Join-Path $env:LOCALAPPDATA 'winspace\winspace.log' }
+
+function Get-WinspaceFileLogText {
+    param([string]$Path = (Get-WinspaceFileLog))
+    if (-not (Test-Path $Path)) { return '' }
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try { [System.IO.StreamReader]::new($fs).ReadToEnd() } finally { $fs.Dispose() }
+}
 
 # winspace reads %USERPROFILE%\.config\winspace\winspace.conf at startup (src/win32.cpp
 # configPath()). This is the SAME session as the runner, so the profile we write to is the
@@ -633,10 +653,14 @@ function Start-Winspace {
         # WINSPACE_FORCE_VD_VARIANT). Set on this process only long enough for
         # Start-Process to inherit them, then restored so no other seam is affected.
         [hashtable]$Env,
-        # The log line that means "ready". Default: adoption ran (24H2 bridge up).
-        # A forced stub variant NEVER logs 'adopted' (its bridge is null), so those
-        # launches wait on their loud diagnostic instead.
-        [string]$ReadyPattern = 'adopted',
+        # The log line that means "ready". Default: the bridge reached Connected —
+        # all required shell services acquired together and the bindings derived
+        # (ADR-0025 folded Adoption into that one path, so there is no separate
+        # 'adopted' milestone any more). The `(re)?` alternation matches both the
+        # first acquisition and a post-outage one WITHOUT matching 'disconnected'.
+        # A forced stub variant never reaches Connected, and a forced outage does not
+        # reach it immediately, so those launches wait on their own diagnostic.
+        [string]$ReadyPattern = 'bridge: (re)?connected',
         [int]$ReadyTimeoutSec = 10
     )
     if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
@@ -661,6 +685,31 @@ function Start-Winspace {
         (Get-WinspaceLogText -LogPath $LogPath) -match $ReadyPattern
     }
     return $proc
+}
+
+# ── the outage lever: restart the shell out from under a running winspace ─────
+# The genuine trigger for ADR-0025's recovery path, not a simulation: killing
+# explorer.exe destroys the process hosting the ImmersiveShell, so winspace's COM
+# proxies go stale exactly as they do when the shell crashes on its own. Windows
+# restarts the shell itself; we wait for a NEW process AND for its taskbar window,
+# which is the earliest point the guest is usable again (it is NOT the point the
+# virtual desktop services start answering — that is 200-450 ms later, which is the
+# whole reason winspace verifies readiness rather than observing it).
+function Restart-Shell {
+    [CmdletBinding()]
+    param([int]$TimeoutSec = 30)
+    $oldPids = @(Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object Id)
+    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    Wait-Until -TimeoutSec $TimeoutSec -Because 'a NEW shell process to come up' -Condition {
+        $now = @(Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object Id)
+        $now.Count -gt 0 -and (@($now | Where-Object { $oldPids -notcontains $_ }).Count -gt 0)
+    }
+    # Windows does not always auto-restart the shell after a force kill; if it did
+    # not, start it ourselves so the guest is left usable either way.
+    Wait-Until -TimeoutSec $TimeoutSec -Because 'the shell taskbar window to exist' -Condition {
+        [Winspace.Native]::FindWindowW('Shell_TrayWnd', $null) -ne [IntPtr]::Zero
+    }
 }
 
 function Stop-Winspace {
@@ -1032,9 +1081,9 @@ Export-ModuleMember -Function Assert-InteractiveSession, Send-Chord, Get-VdState
     Get-WinspaceWindows, Set-DesktopCount,
     Get-WinspaceAutostartTask, Get-WinspaceAutostartTaskCount, Remove-WinspaceAutostartTask,
     ConvertFrom-VirtualDesktopIDs, ConvertFrom-CurrentVirtualDesktop, Read-WinspaceLog,
-    Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey,
+    Wait-Until, Start-Winspace, Stop-Winspace, Register-ConflictingHotkey, Restart-Shell,
     Get-WinspaceLogText, Save-FailureScreenshot, Set-RunnerConsoleVisible, Invoke-WinspaceSeams, Get-WinspaceLiveSeamTags,
-    Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog,
+    Get-WinspaceRoot, Get-WinspaceExe, Get-WinspaceLog, Get-WinspaceFileLog, Get-WinspaceFileLogText,
     Get-WinspaceConfigPath, Set-WinspaceConfig, Clear-WinspaceConfig,
     Get-ForegroundWindow, Set-ForegroundByClick, Get-WindowDesktopId,
     Get-WindowRect, Get-FrameBounds, Get-WorkArea, Test-WindowCloaked, Find-WindowsByTitle,

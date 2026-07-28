@@ -167,4 +167,131 @@ Describe 'launcher' {
             Stop-Winspace -Process $winspace
         }
     }
+
+    # ADR-0025's launcher half: `exec-once = msedge` used to fail with "file not
+    # found" even though msedge starts fine from the Run dialog. CreateProcessW parses
+    # the command line itself and searches %PATH% — but NOT the shell's registered
+    # application paths, which is where installers put most normally-installed
+    # applications (browsers, Office, developer tools). The fallback widens WHERE
+    # Win32 looks; the command is still stored unparsed and handed over verbatim.
+    #
+    # The registration is a FIXTURE the seam creates, not an app it hopes the guest
+    # has: a synthetic bare name — on no PATH anywhere, so CreateProcessW must fail
+    # not-found first — registered in HKCU App Paths pointing at msinfo32. That makes
+    # the fallback the only possible route to a running process, and it exercises the
+    # HKCU-before-HKLM precedence too. Discovering a real installed app instead was
+    # tried and is a trap: an arbitrary App Paths entry is as likely to be a
+    # fire-and-exit diagnostic tool as a long-running app, so the Oracle would be
+    # racing the target's own exit.
+    It 'apppath: a Launch entry naming a registered application not on PATH starts it' -Tag 'launcher-apppath' {
+        $winspace = $null
+        $bare = 'winspace-apppath-probe'
+        $key = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$bare.exe"
+        try {
+            $realExe = Join-Path $env:SystemRoot "System32\$script:LaunchExe.exe"
+            Test-Path $realExe | Should -BeTrue -Because 'the fixture points the registration at a real image'
+
+            # The bare name must genuinely be unresolvable, or the fallback is not what
+            # started anything.
+            Get-Command $bare -CommandType Application -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty -Because 'the whole point is a name PATH cannot resolve'
+            Get-Process $script:LaunchExe -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty -Because 'the seam proves winspace STARTED it, so none may pre-exist'
+
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name '(default)' -Value $realExe
+
+            Set-WinspaceConfig -Content @"
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
+exec-once = $bare
+"@ | Out-Null
+
+            $winspace = Start-Winspace
+
+            # The Oracle is the running process — not the log. Bare unresolvable name
+            # in, real process out; only the application-path fallback can do that.
+            Wait-Until -TimeoutSec 20 -Because "winspace to start '$bare' via its registered application path" -Condition {
+                [bool](Get-Process $script:LaunchExe -ErrorAction SilentlyContinue)
+            }
+            Get-Process $script:LaunchExe -ErrorAction SilentlyContinue |
+                Should -Not -BeNullOrEmpty -Because 'exec-once must work for a bare registered application name'
+        } catch {
+            Save-FailureScreenshot -Name 'launcher-apppath'
+            throw
+        } finally {
+            Get-Process $script:LaunchExe -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+            Stop-Winspace -Process $winspace
+        }
+    }
+
+    # The fallback must widen WHERE Win32 looks without touching WHAT it was given.
+    # The retry passes the resolved image as lpApplicationName and the ORIGINAL command
+    # line unchanged, so arguments have to survive — the registration here points at
+    # cmd.exe and the arguments are what actually produce the observable process.
+    It 'apppath: a Launch entry WITH ARGUMENTS still works when resolved through the fallback' -Tag 'launcher-apppath' {
+        $winspace = $null
+        $bare = 'winspace-apppath-args'
+        $key = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$bare.exe"
+        try {
+            Get-Command $bare -CommandType Application -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty -Because 'the bare name must be unresolvable on PATH'
+            Get-Process 'PING' -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty -Because 'the Oracle process must not pre-exist'
+
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name '(default)' -Value (Join-Path $env:SystemRoot 'System32\cmd.exe')
+
+            # Only the ARGUMENTS can produce a ping; if they were dropped or rewritten,
+            # cmd would start with no command and nothing would be observable.
+            Set-WinspaceConfig -Content @"
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
+exec-once = $bare /c ping -n 60 127.0.0.1
+"@ | Out-Null
+
+            $winspace = Start-Winspace
+
+            Wait-Until -TimeoutSec 20 -Because 'the arguments to survive the fallback retry' -Condition {
+                [bool](Get-Process 'PING' -ErrorAction SilentlyContinue)
+            }
+            Get-Process 'PING' -ErrorAction SilentlyContinue |
+                Should -Not -BeNullOrEmpty -Because 'the command line is passed through verbatim on the retry'
+        } catch {
+            Save-FailureScreenshot -Name 'launcher-apppath-args'
+            throw
+        } finally {
+            Get-Process 'PING', 'cmd' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+            Stop-Winspace -Process $winspace
+        }
+    }
+
+    # The negative half: something that exists nowhere still fails, and the diagnostic
+    # names the CAUSE — not on PATH and not a registered application — rather than
+    # only echoing the raw Win32 error. One bad entry never takes the WM down.
+    It 'apppath: a Launch entry naming nothing that exists fails with a diagnostic that names the cause' -Tag 'launcher-apppath' {
+        $winspace = $null
+        try {
+            Set-WinspaceConfig -Content @"
+`$mod = ALT
+bind = `$mod SHIFT, Q, quit
+exec-once = winspace-no-such-program-xyz
+"@ | Out-Null
+
+            # winspace still starts and still reaches Connected — a failed launch
+            # degrades and continues (ADR-0004).
+            $winspace = Start-Winspace
+            Wait-Until -Because 'the launch failure to be diagnosed' -Condition {
+                (Get-WinspaceLogText) -match 'not found on PATH and is not a registered application'
+            }
+            $winspace.HasExited | Should -BeFalse -Because 'one bad exec entry must never take down the WM'
+        } catch {
+            Save-FailureScreenshot -Name 'launcher-apppath-missing'
+            throw
+        } finally {
+            Stop-Winspace -Process $winspace
+        }
+    }
 }

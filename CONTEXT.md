@@ -45,12 +45,19 @@ is `{logical, DesktopKey, createdByWinspace}`.
 _Avoid_: desktop GUID (that is the Windows type it is narrowed from), desktop id, index.
 
 **Adoption**:
-At startup, binding the Virtual Desktops that already exist to logical numbers `1..N` (by
-GUID), and seeding the current workspace from the active desktop — so winspace inherits the
-session rather than resetting it. Every adopted desktop is recorded with **Provenance**
-`foreign`: winspace inherits the session, it does not annex it. This is a **Workspace**-level
-concept — the desktops, not the windows on them. _Distinct from_ **Rule adoption** (the
-window-level startup sweep).
+Binding the Virtual Desktops that already exist to logical numbers `1..N` (by GUID), and
+seeding the current workspace from the active desktop — so winspace inherits the session
+rather than resetting it. Every adopted desktop is recorded with **Provenance** `foreign`:
+winspace inherits the session, it does not annex it. This is a **Workspace**-level concept —
+the desktops, not the windows on them. _Distinct from_ **Rule adoption** (the window-level
+startup sweep).
+
+Adoption is **not a separate mechanism**: it is what **Reconciliation** does when there are no
+previous bindings, since `reconcile({}, live)` assigns `1..N` and records every key foreign.
+ADR-0025 made that literal — one code path serves the first acquisition and every
+**Re-acquisition** after it, which is *why* **Provenance** and the **Home desktop** survive a
+reconnect. Re-running Adoption on reconnect instead would tag every desktop foreign, and the
+loss would be invisible until **Quit cleanup**.
 
 **Provenance**:
 The one bool carried beside each binding's **DesktopKey**, recording whether **winspace
@@ -76,8 +83,9 @@ _Avoid_: external desktop (reads as off-machine), unmanaged, orphan.
 **Reconciliation**:
 Keeping the bindings true to the live Virtual Desktop set as it changes for reasons
 **other than winspace** — the policy ADR-0003 explicitly deferred ("Reconciliation of desktops
-created outside winspace mid-run is a separate deferred policy"). Distinct from **Adoption**,
-which is the one-shot startup form of the same reconciliation. Driven by
+created outside winspace mid-run is a separate deferred policy"). **Adoption** is the same
+mechanism with no previous bindings, not a second one — the two share a single code path
+(ADR-0025), which is also the path a **Re-acquisition** repairs through. Driven by
 `IVirtualDesktopNotification`, and **split by layer**: the map maintenance (`Created`,
 `Destroyed`, `Moved`, `NameChanged`) stays bridge-internal per ADR-0003, while the single fact
 the Reducer models — which Workspace is current — re-enters as the **WorkspaceChanged** Event.
@@ -106,6 +114,72 @@ reconcile always runs on a clean pump turn.
 _Avoid_: notification thread (there isn't one — it lives on the Worker STA), listener,
 observer.
 
+**Disconnected** *(bridge availability, ADR-0025)*:
+The bridge has no live COM connection to the shell, **recoverably** — the shell is not serving
+*yet* (the logon race, where winspace's Logon task wins the start against the shell) or not
+serving *any more* (a shell restart, after which the proxies stay non-null and callable but
+every call fails with `RPC_S_SERVER_UNAVAILABLE`). Retried indefinitely, by
+**Re-acquisition**. While Disconnected, `workspace N` presses are **dropped** and Workspace
+moves become **Pending moves**; everything that does not need the bridge — directional focus,
+`tile`, `movetodisplay`, Ignore rules, Distribute, Slot placement — keeps working normally.
+
+**Unsupported** *(bridge availability, ADR-0025)*:
+**Terminal.** No known `IVirtualDesktopManagerInternal` IID matched, or one matched a variant
+whose vtable winspace has not captured. Diagnosed loudly exactly once and **never retried**;
+ADR-0002's fail-closed guarantee is unchanged — winspace never calls through an unverified
+vtable.
+
+Keeping these two apart is the whole point. They used to be one value (`m_bridge == nullptr`),
+which is precisely how a shell that was merely late became a session-long outage.
+**Collapsing them back reintroduces that bug.** The discriminator is deliberately time-aware:
+within an acquisition attempt's budget an unmatched IID counts as *Disconnected*, because a
+shell that is starting up may accept the ImmersiveShell object creation before it has
+registered the virtual desktop interfaces. Unsupported is concluded only after the budget
+elapses.
+_Avoid_: unavailable / disabled / null bridge (each spans both states — the conflation being
+removed).
+
+**Re-acquisition**:
+Rebuilding the bridge's COM connection after it is lost, **without rebuilding the bridge
+object**. The object persists for the process lifetime and owns the bindings, their
+**Provenance**, the **Home desktop** and the **Pending move** queue; only the COM pointers are
+replaced. Reconstructing it instead would re-run **Adoption** and silently destroy Provenance.
+
+Two triggers converge on one **idempotent, coalesced** rebuild: proactively, a thread-pool wait
+on the shell **process handle** (a kernel transition cannot be missed — no queue to overflow,
+no broadcast to be excluded from, no dependence on a pump that may be blocked inside an
+outbound COM call), re-armed on the new process after each success; and reactively, any bridge
+call reporting `RPC_S_SERVER_UNAVAILABLE`, `RPC_E_DISCONNECTED` or `CO_E_OBJNOTCONNECTED` — so
+recovery keys off the *failure*, not off a theory about which process hosts the ImmersiveShell.
+
+**Readiness is verified, never observed.** There is no readiness signal: every candidate fires
+200–450 ms early and the required services start answering at *different* times (ADR-0025's
+measurement table). So an event says *when to start asking*; only a successful acquisition
+answers. The asking runs **off the Worker**, on a probe thread, and posts exactly **one**
+message back — nothing periodic joins the pump and nothing touches the input path, so a healthy
+winspace does no recovery work at all. Acquisition is **all-or-nothing**: every required
+service together, or none.
+_Avoid_: reconnect loop (the loop is an implementation detail of one attempt), bridge restart
+(the bridge object is never restarted — that is the failure being avoided).
+
+**Pending move**:
+A Workspace move recorded instead of failed because the bridge was **Disconnected** — a window
+identity plus a target Logical number, and nothing else. Replayed on a successful
+**Re-acquisition**, discarding entries whose window has since closed (closing a window must
+never resurrect it somewhere else). The collection is capped, with a loud diagnostic on drop.
+Lives entirely in the bridge: neither the **Reducer**, **State**, the Event set nor the Effect
+set learns it happened.
+
+It exists because of **Place-once**: a Place rule's Workspace move is attempted exactly once,
+on an edge nobody is watching, so a move lost during an outage is lost *permanently* — the
+user-visible "apps launched at login don't go to their workspace". **Switches are dropped, not
+queued**, and the asymmetry is deliberate: a move replayed late produces exactly the configured
+outcome, while a switch replayed after the outage is not a delayed success but the desktop
+moving out from under someone who already gave up. Only the Workspace move needs the bridge —
+Ignore-set insertion, Distribute and Slot placement are plain geometry writes.
+_Avoid_: retry queue (it is not a retry of a failure — it is a deferral of an intent),
+deferred placement (placement is geometry; this is a Workspace assignment).
+
 **WorkspaceChanged** *(the Event)*:
 The `CurrentVirtualDesktopChanged` notification, translated to a Logical workspace number and
 posted to the Worker — and the **sole writer** of `State.currentWorkspace`. The notification
@@ -129,26 +203,50 @@ GUID-anchored mapping is what makes it safe. _Distinct from_ **Quit cleanup**, w
 blocked by that gap — a one-shot question needs no continuous tracking.
 
 **Home desktop**:
-The Virtual Desktop that was active at **Adoption** — where winspace found the user. The
-switch-back target and the `RemoveDesktop` fallback for **Quit cleanup**.
+The Virtual Desktop that was active at **Adoption** — where winspace found the user. A **fact
+about the past**, and the polite place to leave someone at quit. Latched on the FIRST
+successful bridge acquisition only and **never re-seeded**, so a **Re-acquisition** cannot
+relocate it to wherever the user happened to stand when the shell died.
+
+It is **not** the migration target, and it is not guaranteed to survive: the user can destroy
+it by hand in Task View mid-session. The desktop **Quit cleanup** actually stands on and
+migrates windows to is the **Cleanup anchor**, which is derived at quit time and merely
+*prefers* home (ADR-0024's amendment). Naming the second job is what fixed it; the concept
+being unnamed is why home was quietly required to survive.
 _Avoid_: desktop 1 (home is wherever the user happened to be, not necessarily logical 1),
-default workspace.
+default workspace, cleanup target (that is the **Cleanup anchor**).
+
+**Cleanup anchor**:
+The desktop **Quit cleanup** switches to and passes to `RemoveDesktop` as the migration
+fallback. Not a preference but a **requirement**: it must *survive* the cleanup, i.e. not be
+among the doomed. Chosen at quit time by the pure core function
+`cleanupAnchor(bindings, home)` over the freshly reconciled bindings, preferring, in order:
+the **Home desktop** if it still names a live desktop; otherwise the lowest-logical **foreign
+desktop**; otherwise the lowest-logical desktop. No bindings at all → no anchor, and cleanup
+is skipped.
+
+**Foreign-first is load-bearing, not a taste.** Cleanup never removes the ground it stands on,
+so anchoring on a `createdByWinspace` desktop would exempt one of winspace's own from removal
+— the exact accumulation ADR-0024 exists to end. Preferring foreign makes that exemption
+reachable only in the genuine last resort where *every* desktop is winspace's.
+_Avoid_: home (that is one of three candidates, not the definition), fallback desktop (that is
+the `RemoveDesktop` parameter it is passed as), landing desktop.
 
 **Quit cleanup**:
-On exit, switching to the **Home desktop** and destroying every Virtual Desktop whose
+On exit, switching to the **Cleanup anchor** and destroying every Virtual Desktop whose
 **Provenance** is `createdByWinspace`, so the session ends with exactly the desktops that
 existed before winspace started. **Foreign desktops** survive untouched — "clean up all" never
 means "delete your stuff." Windows are never lost: `RemoveDesktop` takes a **fallback**
 desktop and migrates them to it (home), so cleanup can only *consolidate* windows, never
 destroy them. Unconditional, **not** empty-only: once winspace exits the user no longer has
 `workspace N` binds, so a window parked on a removed desktop does not become neutral, it
-becomes *harder to reach* — recoverable only by walking Win+Ctrl+→. Consolidating on home is
-the kind option; stranding windows on desktops the user can no longer address is the
+becomes *harder to reach* — recoverable only by walking Win+Ctrl+→. Consolidating on the anchor
+is the kind option; stranding windows on desktops the user can no longer address is the
 destructive one. Empty-only would also make shutdown *unpredictable* — whether quit tidies up
-would depend on where windows happened to sit. The switch to home must **complete** before any
-removal (else it removes the desktop it is standing on), an ordering constraint inside the
-Effect, not a `reduce` concern — and one that cannot lean on `currentWorkspace`, which is now
-eventually consistent (see **WorkspaceChanged**).
+would depend on where windows happened to sit. The switch to the anchor must **complete**
+before any removal (else it removes the desktop it is standing on), an ordering constraint
+inside the Effect, not a `reduce` concern — and one that cannot lean on `currentWorkspace`,
+which is now eventually consistent (see **WorkspaceChanged**).
 _Avoid_: reaping (that is the live, empty-only, still-deferred form), teardown, reset.
 
 **Display**:
@@ -325,6 +423,11 @@ or for Distribute (ADR-0020) — the same gate serves all three. This is the del
 reintroduction of window state that [ADR-0009](docs/adr/0009-window-rules-place-once-state.md)
 records against ADR-0007's otherwise stateless window side. `tile` deliberately does **not**
 consult `placed` — it is an explicit, re-placeable rebalance.
+
+A move deferred by a **Disconnected** bridge is **not a second placement**: the id is inserted
+and its one placement spent exactly as before, and the **Pending move** the bridge records is
+that same single attempt finishing late. Place-once counts *decisions*, not *retries*, so the
+gate is untouched by connection lifetime — and the Reducer never learns a connection exists.
 _Avoid_: continuous enforcement, pinning-forever.
 
 **Ignore-set**:
@@ -437,7 +540,19 @@ starts a process (and detaches — winspace tracks nothing about the child). To 
 app on a Workspace, pair it with a **WindowRule** matching the app's `exe`. The originally
 specified PID-match placement was dropped before it was built — see
 [ADR-0011](docs/adr/0011-launcher-launch-only-placement-via-windowrule.md).
-_Avoid_: PID match, placement (the launcher places nothing — WindowRule does).
+
+**The application-path fallback** (ADR-0025): `CreateProcessW` searches `%PATH%` but **not**
+the shell's registered application paths, where installers put most normally-installed
+applications — which is why `exec-once = msedge` failed with "file not found" while `msedge`
+started fine from the Run dialog. On a not-found failure winspace looks the program token up in
+the registered application paths and retries **once** with the resolved image, passing the
+command line through unchanged. This widens *where Win32 looks*; it does not parse, expand, or
+transform the command, so the verbatim contract above is intact. Deliberately **not**
+ShellExecute: that would resolve application paths for free but requires the shell, and Launch
+entries fire at winspace startup — at login, the exact window ADR-0025 exists to survive.
+_Avoid_: PID match, placement (the launcher places nothing — WindowRule does), shell execute
+(rejected — it would reintroduce the shell dependency in the one path guaranteed to run inside
+the danger window).
 
 **exec / exec-once**:
 The two kinds of Launch entry. **exec-once** runs only at the initial start; **exec** runs at
@@ -619,3 +734,19 @@ _Avoid_: Agent, driver.
 **Host orchestrator**:
 The host-side controller that stages the VM around a Guest runner invocation — revert the
 snapshot, deploy the build, launch the runner, collect and summarise its results.
+
+**Forced-state hook**:
+An environment variable read at startup that drives winspace into an I/O-layer state a normal
+development machine cannot otherwise reach, so a Smoke seam can assert on it. Production code
+that exists for tests — an accepted trade, twice over, because the alternative is a path
+covered only by a race that passes on fast machines. Both are **inert when unset**:
+
+* `WINSPACE_FORCE_VD_VARIANT=21h2|22h2|23h2-kb` — force selection of a stubbed OS variant, so
+  its **Unsupported** diagnostic can be observed on a 24H2 machine (ADR-0002).
+* `WINSPACE_FORCE_VD_UNAVAILABLE_MS=<n>` — make every bridge acquisition fail as
+  **Disconnected** for the first *n* milliseconds of the process, then behave normally. The
+  only way to cover the **Pending move** path: a shell restart cannot, because no windows are
+  appearing during one (ADR-0025).
+
+_Avoid_: mock, stub (nothing is substituted — the real code runs, driven into a real state),
+debug flag.

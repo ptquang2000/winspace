@@ -174,6 +174,66 @@ Describe 'quit-cleanup' {
         }
     }
 
+    # ADR-0024's amendment, live: the **Cleanup anchor**. Home used to do two jobs
+    # that only looked like one, because until now it always survived. Destroy it by
+    # hand in Task View and cleanup used to log and return — leaving EVERY
+    # winspace-created desktop standing, which is the accumulation this ADR exists to
+    # end. The anchor is derived instead, preferring a FOREIGN desktop so cleanup never
+    # exempts one of its own by standing on it.
+    It 'home-destroyed: quit still removes created desktops after home is destroyed by hand' -Tag 'home-destroyed' {
+        $winspace = $null
+        try {
+            # Three desktops, all foreign. winspace starts on the LAST (Set-DesktopCount
+            # leaves the active desktop there), so that one becomes home — and it is the
+            # one we then destroy.
+            Set-DesktopCount 3
+            $before = Get-VdState
+            $before.Count | Should -Be 3
+            $homeGuid = $before.CurrentGuid
+            $survivors = @($before.Guids | Where-Object { $_ -ne $homeGuid })
+
+            $winspace = Start-Winspace
+
+            # winspace materializes a 4th desktop: this is the one that must NOT be
+            # left standing when home disappears.
+            Send-Chord 'Alt+4'
+            Wait-Until -Because 'winspace to materialize a 4th desktop' -Condition {
+                (Get-VdState).Count -eq 4
+            }
+
+            # Land back on home and destroy it by hand — Win+Ctrl+F4 closes the ACTIVE
+            # desktop, which is exactly the Task View action being modelled.
+            Send-Chord 'Alt+3'
+            Wait-Until -Because 'to be standing on the home desktop again' -Condition {
+                (Get-VdState).CurrentGuid -eq $homeGuid
+            }
+            Send-Chord 'Win+Ctrl+F4'
+            Wait-Until -Because 'the home desktop to be destroyed by hand' -Condition {
+                (Get-VdState).Guids -notcontains $homeGuid
+            }
+
+            Stop-WinspaceAndWait -Process $winspace
+            $winspace = $null
+
+            # The created desktop is gone even though home is; the user's two survive.
+            Wait-Until -Because 'the created desktop to be removed despite home being gone' -Condition {
+                (Get-VdState).Count -eq $survivors.Count
+            }
+            $after = Get-VdState
+            $after.Count | Should -Be $survivors.Count `
+                -Because 'a destroyed home must not spare every winspace-created desktop'
+            foreach ($guid in $survivors) {
+                $after.Guids | Should -Contain $guid `
+                    -Because 'foreign desktops survive quit untouched, anchor or not'
+            }
+        } catch {
+            Save-FailureScreenshot -Name 'quit-home-destroyed'
+            throw
+        } finally {
+            Stop-Winspace -Process $winspace
+        }
+    }
+
     # All three Quit paths converge on `reduce`, so each inherits cleanup for free.
     # The uninstall path matters most: uninstalling and leaving eight desktops
     # behind would be the worst version of this feature.

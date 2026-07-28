@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>        // std::FILE, stderr
 #include <cstring>       // std::memcpy — GUID ⇄ DesktopKey narrowing (vd_bridge)
 #include <expected>
@@ -37,6 +39,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <ranges>
@@ -83,7 +86,106 @@ namespace winspace::io {
 // ── leveled diagnostics sink ─────────────────────────────────────────────────
 // One line per event, prefixed with a bold ANSI-colored level. Shared I/O sink
 // used for variant logging. Narrow (UTF-8) throughout.
+//
+// TWO sinks sit behind one choke point (ADR-0025): stderr, and a size-capped file
+// under %LOCALAPPDATA%. The file sink exists because ADR-0004's degrade-and-log
+// strategy is load-bearing everywhere and, in every SHIPPED configuration, stderr
+// has nowhere to go — the Logon task starts a /SUBSYSTEM:WINDOWS binary whose
+// stderr is discarded, so "degrade and log" was really degrade SILENTLY. A fault
+// that happens at login is only diagnosable afterwards if it was written down.
+//
+// The file carries no ANSI colouring: escape codes are a terminal affordance and
+// make a file harder to read.
 namespace lg {
+
+namespace sink_detail {
+
+// The cap. A winspace that logs continuously all session cannot grow the log
+// without bound; when the live file crosses this, it is rolled aside ONCE and a
+// fresh one started, so the messages that get dropped are always the OLDEST.
+inline constexpr std::uintmax_t k_capBytes = 1024 * 1024;  // 1 MiB
+
+// %LOCALAPPDATA%\winspace\winspace.log — a fixed, predictable per-user location
+// a bug reporter can be told to attach. Empty when LOCALAPPDATA is unset (a
+// service-like context), which degrades the whole sink to stderr-only.
+inline std::filesystem::path fileSinkPath() {
+    std::wstring buf(MAX_PATH, L'\0');
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf.data(),
+                                            static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return {};
+    buf.resize(n);
+    return std::filesystem::path(buf) / L"winspace" / L"winspace.log";
+}
+
+// The file half of the choke point. Opened lazily on the first message and kept
+// open (a per-line open/close would triple the cost of every diagnostic). Every
+// failure is TERMINAL FOR THIS SINK and silent: it flips m_usable off so the
+// process never retries and never recurses into lg:: from inside lg::. stderr is
+// unaffected, and winspace still starts (ADR-0004).
+class FileSink {
+public:
+    void write(std::string_view line) {
+        if (!m_opened) open();
+        if (!m_usable) return;
+        if (m_size + line.size() > k_capBytes) roll();
+        if (!m_usable) return;
+        m_out.write(line.data(), static_cast<std::streamsize>(line.size()));
+        m_out.flush();   // a crash must not swallow the diagnostic explaining it
+        if (!m_out) {
+            m_usable = false;
+            return;
+        }
+        m_size += line.size();
+    }
+
+private:
+    void open() {
+        m_opened = true;
+        m_path = fileSinkPath();
+        if (m_path.empty()) return;
+        std::error_code ec;
+        std::filesystem::create_directories(m_path.parent_path(), ec);
+        if (ec) return;
+        m_size = std::filesystem::file_size(m_path, ec);
+        if (ec) m_size = 0;   // absent — the first write creates it
+        m_out.open(m_path, std::ios::out | std::ios::app | std::ios::binary);
+        m_usable = m_out.is_open();
+    }
+
+    // Roll aside, do not truncate in place: the previous generation stays readable
+    // as winspace.log.1 while the live file starts empty. Two files is the whole
+    // rotation policy — a single cap, no levels, no dating (out of scope).
+    void roll() {
+        m_out.close();
+        std::error_code ec;
+        std::filesystem::rename(m_path, m_path.string() + ".1", ec);
+        if (ec) std::filesystem::remove(m_path, ec);   // cannot roll — start over
+        m_out.open(m_path, std::ios::out | std::ios::trunc | std::ios::binary);
+        m_usable = m_out.is_open();
+        m_size = 0;
+    }
+
+    std::ofstream m_out;
+    std::filesystem::path m_path;
+    std::uintmax_t m_size = 0;
+    bool m_opened = false;
+    bool m_usable = false;
+};
+
+// The single choke point every level funnels through. Diagnostics arrive from the
+// Worker, Hotkey, Hook and re-acquisition threads, so the file sink is serialized;
+// stderr is written outside the lock (std::print is already atomic per call, and
+// holding the lock across it would serialize on the console too).
+inline void emit(std::string_view coloured, std::string_view plain,
+                 std::string_view message) {
+    std::print(stderr, "{} {}\n", coloured, message);
+    static std::mutex mutex;
+    static FileSink sink;
+    const std::scoped_lock lock(mutex);
+    sink.write(std::format("{} {}\n", plain, message));
+}
+
+}  // namespace sink_detail
 
 // Each level is a variadic format wrapper over a compile-time-checked format
 // string, so no call site hand-writes std::format. No string_view escape hatch:
@@ -91,20 +193,20 @@ namespace lg {
 // is needed.
 template <class... Args>
 inline void info(std::format_string<Args...> fmt, Args&&... args) {
-    std::print(stderr, "\033[1m\033[34m[INFO]\033[0m {}\n",
-               std::format(fmt, std::forward<Args>(args)...));
+    sink_detail::emit("\033[1m\033[34m[INFO]\033[0m", "[INFO]",
+                      std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <class... Args>
 inline void warn(std::format_string<Args...> fmt, Args&&... args) {
-    std::print(stderr, "\033[1m\033[33m[WARN]\033[0m {}\n",
-               std::format(fmt, std::forward<Args>(args)...));
+    sink_detail::emit("\033[1m\033[33m[WARN]\033[0m", "[WARN]",
+                      std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <class... Args>
 inline void error(std::format_string<Args...> fmt, Args&&... args) {
-    std::print(stderr, "\033[1m\033[31m[ERROR]\033[0m {}\n",
-               std::format(fmt, std::forward<Args>(args)...));
+    sink_detail::emit("\033[1m\033[31m[ERROR]\033[0m", "[ERROR]",
+                      std::format(fmt, std::forward<Args>(args)...));
 }
 
 }  // namespace lg
@@ -1296,51 +1398,24 @@ inline GUID toGuid(const DesktopKey& key) {
     return g;
 }
 
-// ── the seam: pure winspace vocabulary, no COM type in sight ─────────────────
+// ── bridge availability: three states, never a null pointer (ADR-0025) ───────
 
-// The abstraction the rest of winspace sees. Logical workspace numbers in,
-// switches out. The Worker holds one of these and never learns it is COM.
-class IVirtualDesktopBridge {
-public:
-    virtual ~IVirtualDesktopBridge() = default;
-
-    // Switch to the Logical workspace, materializing it on demand (sparse model,
-    // ADR-0003): hit → resolve the stored GUID to its live desktop → SwitchDesktop;
-    // miss → create exactly one desktop (appended), bind logical→GUID, switch.
-    // Returns true iff the OS desktop is now the requested workspace.
-    virtual bool switchTo(int logical) = 0;
-
-    // The Logical workspace active at startup, seeded from the OS active desktop
-    // during adoption. Lets the Worker align its State with reality on boot.
-    virtual int currentWorkspace() const = 0;
-
-    // Re-derive the bindings from the LIVE Virtual Desktop set (ADR-0023): the pure
-    // `reconcile` policy applied to what the OS currently reports. Idempotent, so
-    // running it more often than strictly needed is always safe. Also recomputes
-    // which Logical workspace is current.
-    virtual void reconcileDesktops() = 0;
-
-    // Register the Notification sink on the caller's STA so external desktop
-    // changes are noticed AS THEY HAPPEN (ADR-0023). `worker` is the message-only
-    // window the sink posts its reconcile trigger to. False means the interface
-    // could not be acquired — a future Windows build moved the vtable — and the
-    // caller stays on the on-demand degrade path: slower to notice, never wrong.
-    virtual bool startNotifications(HWND worker) = 0;
-
-    // Leave the session as winspace found it (ADR-0024): switch to the Home desktop
-    // and destroy every desktop whose Provenance says winspace created it, with home
-    // as the RemoveDesktop fallback so windows migrate onto it rather than being
-    // lost. Foreign desktops survive. Degrade-and-log throughout — quitting must
-    // never be blockable.
-    virtual void cleanupCreatedDesktops() = 0;
-
-    // Move a window to the Logical workspace, materializing the target on demand
-    // WITHOUT switching to it (ADR-0010, revised). Implemented with the INTERNAL
-    // IApplicationViewCollection::GetViewForHwnd + MoveViewToDesktop — the public
-    // IVirtualDesktopManager::MoveWindowToDesktop returns E_ACCESSDENIED for windows
-    // the caller does not own, which is precisely winspace's case (a foreground app
-    // window from another process). Returns true iff the move landed.
-    virtual bool moveWindowToWorkspace(WindowId window, int logical) = 0;
+// The bridge used to be a `unique_ptr` where NULL MEANT "this OS is unsupported,
+// permanently" — one value standing for two entirely different facts. A shell that
+// is not serving *yet* (the logon race) and a shell that has died and come back (a
+// shell restart) both produced the same absence as a genuinely unsupported Windows
+// build, so winspace ran the whole session with Virtual Desktop support silently
+// off. Collapsing these back into one state reintroduces a session-long outage.
+enum class BridgeAvailability {
+    // All required shell services acquired and verified, together.
+    Connected,
+    // RECOVERABLE. The shell is not serving yet, or is not serving any more.
+    // Retried, indefinitely.
+    Disconnected,
+    // TERMINAL. No known interface identity matched, or one matched a variant whose
+    // vtable is not implemented. Diagnosed loudly once, never retried — ADR-0002's
+    // fail-closed guarantee: winspace never calls through an unverified vtable.
+    Unsupported,
 };
 
 // ── hand-declared undocumented COM ABI (RE lineage; see file header) ─────────
@@ -1507,6 +1582,18 @@ IVirtualDesktopNotificationService : public IUnknown {
 // because the sink — declared above the Worker — is what posts it.
 inline constexpr UINT k_wmReconcile = WM_APP + 3;
 
+// The shell process handle signalled: the process winspace's COM proxies live in
+// has exited (ADR-0025). Posted from the thread-pool wait callback, which does
+// nothing else — a kernel-object wait cannot be missed, and the response belongs on
+// the Worker's STA where the COM pointers are owned.
+inline constexpr UINT k_wmShellLost = WM_APP + 4;
+
+// The shell services have been PROVEN to answer again: the re-acquisition probe
+// obtained every required service on its own thread, released them, and is telling
+// the Worker to rebuild for real on the STA that owns the apartment (ADR-0025).
+// Nothing periodic is added to the pump — this arrives once per recovery.
+inline constexpr UINT k_wmReacquire = WM_APP + 5;
+
 // winspace's IVirtualDesktopNotification implementation (ADR-0023), registered on
 // the WORKER's existing STA — no second apartment, no cross-apartment marshalling.
 //
@@ -1656,57 +1743,355 @@ inline std::wstring forcedVariantOverride() {
     return buf;
 }
 
-}  // namespace bridge_detail
+// The second smoke-test hook, joining WINSPACE_FORCE_VD_VARIANT above:
+// WINSPACE_FORCE_VD_UNAVAILABLE_MS=<n> makes every acquisition attempt fail as
+// DISCONNECTED for the first n milliseconds of the process, then behave normally.
+// Unset or unparseable → inert.
+//
+// It exists because the Pending-move path cannot be reached any other way. A shell
+// restart cannot cover it (no windows are appearing during one), and a login-timed
+// test would pass or fail on machine speed. Production code that exists for tests,
+// accepted for the same reason the forced-variant hook was.
+inline bool forcedOutageActive() {
+    // Latched on the FIRST call, so the window is measured from winspace's own
+    // startup rather than from whenever the bridge first happens to be asked.
+    static const std::chrono::steady_clock::time_point deadline = [] {
+        std::wstring buf(16, L'\0');
+        const DWORD n = GetEnvironmentVariableW(L"WINSPACE_FORCE_VD_UNAVAILABLE_MS", buf.data(),
+                                                static_cast<DWORD>(buf.size()));
+        const auto now = std::chrono::steady_clock::now();
+        if (n == 0 || n >= buf.size()) return now;
+        buf.resize(n);
+        const unsigned long ms = wcstoul(buf.c_str(), nullptr, 10);
+        if (ms > 0)
+            lg::warn("virtual desktop bridge: WINSPACE_FORCE_VD_UNAVAILABLE_MS={} — forcing a "
+                     "{} ms disconnected window (test fixture)",
+                     ms, ms);
+        return now + std::chrono::milliseconds(ms);
+    }();
+    return std::chrono::steady_clock::now() < deadline;
+}
 
-// ── the 24H2 implementation ──────────────────────────────────────────────────
+// The set of shell services winspace cannot run Virtual Desktops without. Acquired
+// TOGETHER or not at all: the measurements in ADR-0025 show the notification service
+// answering as little as 3 ms after the desktop manager, and accepting a partial
+// acquisition would leave the sink unregistered and permanently degrade
+// Reconciliation to its per-operation fallback.
+struct Services {
+    Microsoft::WRL::ComPtr<IServiceProvider> shell;
+    Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager;
+    Microsoft::WRL::ComPtr<vd::IApplicationViewCollection> views;
+    Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotificationService> notifications;
+    VdVariant variant = VdVariant::None;
+    const GUID* iid = nullptr;
+};
 
-// GUID-anchored sparse bridge (ADR-0003). Owns the logical→GUID map, adoption,
-// create-on-demand, and live GUID→desktop resolution — none of which the pure
-// reducer ever sees. Constructed on (and destroyed on) the Worker's STA thread,
-// so every COM pointer here is touched only by its apartment owner.
-class VirtualDesktop24H2Bridge final : public IVirtualDesktopBridge {
-public:
-    // Takes the already-QI'd manager (its S_OK proved the vtable) and runs
-    // adoption immediately, binding pre-existing desktops to logical 1..N by GUID.
-    // Takes the already-QI'd internal manager (its S_OK proved the vtable) plus the
-    // ImmersiveShell service provider used to acquire the view collection. Runs
-    // adoption immediately, binding pre-existing desktops to logical 1..N by GUID.
-    VirtualDesktop24H2Bridge(
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> manager,
-        Microsoft::WRL::ComPtr<IServiceProvider> shell)
-        : m_manager(std::move(manager)), m_shell(shell) {
-        adopt();
+// The human name of a stubbed variant, for the loud one-shot diagnostic.
+inline std::string_view variantName(VdVariant v) {
+    switch (v) {
+        case VdVariant::W24H2: return "24H2";
+        case VdVariant::W23H2KB: return "23H2-KB5034204";
+        case VdVariant::W22H2: return "22H2 / pre-KB 23H2";
+        case VdVariant::W21H2: return "21H2";
+        case VdVariant::None: return "unknown";
+    }
+    return "unknown";
+}
 
-        // Acquire the internal IApplicationViewCollection (ADR-0010, revised): the
-        // move path needs an IApplicationView for the target HWND, and only
-        // GetViewForHwnd yields one. QueryService takes the same GUID for the service
-        // and the interface. A failure degrades move-to-workspace to a no-op (loud
-        // diagnostic); switch / enumerate are unaffected.
-        auto views = ok([&](vd::IApplicationViewCollection** pp) {
-            return shell->QueryService(vd::k_iidApplicationViewCollection,
+// Why an acquisition attempt did not produce a Connected bridge.
+enum class AcquireFailure {
+    // The shell is not serving (yet, or any more). Recoverable — retry.
+    NotServing,
+    // The ImmersiveShell object was created, but no known IVirtualDesktopManagerInternal
+    // IID matched. Within an attempt's budget this is treated as Disconnected, NOT as
+    // Unsupported: a shell that is starting up may accept the object creation before it
+    // has registered the virtual desktop interfaces, and latching the terminal state
+    // there would turn ordinary startup into a permanent outage — the exact bug this
+    // work exists to fix.
+    NoKnownInterface,
+    // A known IID matched a variant whose vtable winspace has not captured. Terminal,
+    // and knowable immediately: no amount of waiting makes an unimplemented vtable
+    // implemented.
+    StubbedVariant,
+};
+
+// A failure plus the text that names it. ADR-0004 is degrade-AND-LOG, and ADR-0025
+// notes that recovery is only as observable as the log, so `detail` always carries
+// something worth printing: the rendered io::Error for a service that would not
+// answer, or WHICH variant was refused for a vtable winspace has not captured.
+struct AcquireError {
+    AcquireFailure why;
+    std::string detail;
+};
+
+// One acquisition attempt, all-or-nothing. Runs on the caller's apartment and lets
+// no pointer escape on failure. Sequence per ADR-0002: CoCreateInstance(ImmersiveShell,
+// IServiceProvider) → QueryService(VirtualDesktopManagerInternal, <probed IID>)
+// newest→oldest, first S_OK wins (QI-success ⟺ correct vtable) → the two remaining
+// services off the same provider.
+inline std::expected<Services, AcquireError> acquireServices() {
+    const auto fail = [](AcquireFailure why, std::string detail = {}) {
+        return std::unexpected(AcquireError{why, std::move(detail)});
+    };
+    if (forcedOutageActive())
+        return fail(AcquireFailure::NotServing,
+                    "WINSPACE_FORCE_VD_UNAVAILABLE_MS has not elapsed (test fixture)");
+
+    Services out;
+    auto shell = ok([&](IServiceProvider** pp) {
+        return CoCreateInstance(vd::k_clsidImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER,
+                                IID_IServiceProvider, reinterpret_cast<void**>(pp));
+    });
+    if (!shell)
+        return fail(AcquireFailure::NotServing,
+                    std::format("CoCreateInstance(ImmersiveShell): {}", shell.error()));
+    out.shell = std::move(*shell);
+
+    // The probe table, newest→oldest: each row is an IID to QI and the variant it
+    // denotes. QI succeeds only when the vtable matches, so the first S_OK is
+    // self-validating (ADR-0002).
+    struct Probe {
+        const GUID& iid;
+        VdVariant variant;
+    };
+    static constexpr std::array probes = {
+        Probe{vd::k_iidVDMInternal_53F5CA0B, VdVariant::W24H2},  // resolved by build below
+        Probe{vd::k_iidVDMInternal_A3175F2D, VdVariant::W22H2},
+        Probe{vd::k_iidVDMInternal_B2F925B9, VdVariant::W21H2},
+    };
+    const DWORD build = readBuildNumber();
+    const std::wstring forced = forcedVariantOverride();
+
+    for (const Probe& probe : probes) {
+        auto manager = ok([&](vd::IVirtualDesktopManagerInternal** pp) {
+            return out.shell->QueryService(vd::k_clsidVirtualDesktopManagerInternal, probe.iid,
+                                           reinterpret_cast<void**>(pp));
+        });
+        if (!manager) continue;
+
+        // The shared 53F5CA0B IID is 24H2 only on build ≥ 26100; on 22631 it is
+        // 23H2-KB with a DIFFERENT vtable and must not drive 24H2.
+        out.variant = probe.variant;
+        if (IsEqualGUID(probe.iid, vd::k_iidVDMInternal_53F5CA0B))
+            out.variant = (build >= 26100) ? VdVariant::W24H2 : VdVariant::W23H2KB;
+        if (forced == L"21h2") out.variant = VdVariant::W21H2;
+        else if (forced == L"22h2") out.variant = VdVariant::W22H2;
+        else if (forced == L"23h2-kb") out.variant = VdVariant::W23H2KB;
+
+        out.iid = &probe.iid;
+        out.manager = std::move(*manager);
+        break;
+    }
+    if (!out.manager)
+        return fail(AcquireFailure::NoKnownInterface,
+                    "no known IVirtualDesktopManagerInternal IID matched — a new OS variant "
+                    "needs capturing");
+    if (out.variant != VdVariant::W24H2)
+        return fail(AcquireFailure::StubbedVariant,
+                    std::format("IID {} resolved to the {} variant — NOT YET IMPLEMENTED (its "
+                                "vtable differs from the captured 24H2 one)",
+                                toUtf8(guidToWString(*out.iid)), variantName(out.variant)));
+
+    // IApplicationViewCollection — the HWND→IApplicationView resolver the move path
+    // needs (ADR-0010, revised). QueryService takes the same GUID for the service and
+    // the interface.
+    auto views = ok([&](vd::IApplicationViewCollection** pp) {
+        return out.shell->QueryService(vd::k_iidApplicationViewCollection,
                                        vd::k_iidApplicationViewCollection,
                                        reinterpret_cast<void**>(pp));
-        });
-        if (views) {
-            m_viewCollection = std::move(*views);
-        } else {
-            lg::error("virtual desktop bridge: QueryService(IApplicationViewCollection) failed "
-                      "— move-to-workspace disabled: {}",
-                      views.error());
-        }
-    }
+    });
+    if (!views)
+        return fail(AcquireFailure::NotServing,
+                    std::format("QueryService(IApplicationViewCollection): {}", views.error()));
+    out.views = std::move(*views);
+
+    // IVirtualDesktopNotificationService — live Reconciliation (ADR-0023).
+    auto notifications = ok([&](vd::IVirtualDesktopNotificationService** pp) {
+        return out.shell->QueryService(vd::k_clsidVirtualDesktopNotificationService,
+                                       vd::k_iidVirtualDesktopNotificationService,
+                                       reinterpret_cast<void**>(pp));
+    });
+    if (!notifications)
+        return fail(AcquireFailure::NotServing,
+                    std::format("QueryService(IVirtualDesktopNotificationService): {}",
+                                notifications.error()));
+    out.notifications = std::move(*notifications);
+
+    return out;
+}
+
+// Is this HRESULT the shell telling us the connection is gone? The reactive
+// backstop (ADR-0025). The shell process exiting and the shell services becoming
+// unavailable are CORRELATED, NOT IDENTICAL — which process hosts the ImmersiveShell
+// is an implementation detail Microsoft may change — so recovery must also key off
+// the failure itself, not only off our theory of the hosting arrangement.
+inline bool isDisconnectHr(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) || hr == RPC_E_DISCONNECTED ||
+           hr == CO_E_OBJNOTCONNECTED;
+}
+
+inline bool isDisconnectError(const Error& e) {
+    const auto* hr = std::get_if<HrError>(&e.code);
+    return hr && isDisconnectHr(hr->hr);
+}
+
+}  // namespace bridge_detail
+
+// ── the bridge: one object, a connection that can drop and be rebuilt ────────
+
+// GUID-anchored sparse bridge (ADR-0003), and the owner of the connection's whole
+// lifetime (ADR-0025). Owns the logical→GUID map, create-on-demand, and live
+// GUID→desktop resolution — none of which the pure reducer ever sees. Constructed
+// on (and destroyed on) the Worker's STA thread, so every COM pointer here is
+// touched only by its apartment owner.
+//
+// THE BRIDGE OBJECT OUTLIVES ITS CONNECTION. It is constructed unconditionally, once,
+// and persists for the process lifetime; only the COM pointers are replaced. That is
+// not tidiness, it is the correctness requirement: `m_bindings`, their **Provenance**
+// and the **Home desktop** are owned here, and destroying-and-reconstructing the
+// bridge on a reconnect would re-run Adoption, tag every desktop foreign, and make
+// Quit cleanup leave behind every desktop winspace created while relocating home to
+// wherever the user happened to stand when the shell died. That failure is silent
+// and surfaces only at quit.
+class VirtualDesktopBridge {
+public:
+    explicit VirtualDesktopBridge(HWND worker) : m_worker(worker) {}
 
     // Unregister the sink before the COM pointers drop, so the shell never holds a
-    // reference to a sink whose Worker window is about to be destroyed.
-    ~VirtualDesktop24H2Bridge() override {
-        if (m_notificationService && m_notificationCookie != 0)
-            if (const auto r = ok(m_notificationService->Unregister(m_notificationCookie)); !r)
-                lg::warn("virtual desktop bridge: notification Unregister failed: {}", r.error());
+    // reference to a sink whose Worker window is about to be destroyed, and stop the
+    // shell-death wait before its handle closes.
+    ~VirtualDesktopBridge() {
+        disarmShellWait();
+        unregisterNotificationSink();
     }
 
-    bool switchTo(int logical) override {
-        if (!m_manager) return false;
+    VirtualDesktopBridge(const VirtualDesktopBridge&) = delete;
+    VirtualDesktopBridge& operator=(const VirtualDesktopBridge&) = delete;
+
+    BridgeAvailability availability() const { return m_availability; }
+    bool connected() const { return m_availability == BridgeAvailability::Connected; }
+
+    // ONE acquisition attempt, on the caller's STA. All-or-nothing: the state becomes
+    // Connected only when every required shell service is obtained together, never on
+    // a partial success — the notification service came up 3 ms after the desktop
+    // manager in ADR-0025's measurements, and a partial acquisition would leave the
+    // sink unregistered and permanently degrade Reconciliation to its per-operation
+    // fallback.
+    //
+    // On success the desktop set is repaired through the existing pure `reconcile`
+    // policy rather than by re-running Adoption. With no previous bindings reconcile
+    // yields 1..N, which IS Adoption's binding behaviour — so the two are one code
+    // path, making literal what CONTEXT.md already asserted.
+    void acquire() {
+        if (m_availability == BridgeAvailability::Unsupported) return;
+
+        auto services = bridge_detail::acquireServices();
+        if (!services) {
+            classifyFailure(services.error());
+            return;
+        }
+
+        m_shell = std::move(services->shell);
+        m_manager = std::move(services->manager);
+        m_viewCollection = std::move(services->views);
+        m_notificationService = std::move(services->notifications);
+        m_unmatchedSince.reset();
+
+        const bool first = !m_connectedOnce;
+        m_connectedOnce = true;
+        m_availability = BridgeAvailability::Connected;
+        m_failures = 0;
+
+        registerNotificationSink();
+        rebuildBindings(first);
+        // rebuildBindings enumerates, so the reactive backstop can fire inside it and
+        // put us straight back to Disconnected — a shell that died again between the
+        // probe proving it live and this acquisition running. Do not arm, replay, or
+        // announce a connection that is already gone; the rebuild is already requested.
+        if (!connected()) return;
+
+        armShellWait();
+        replayPendingMoves();
+
+        // "connected" / "reconnected" are the two liveness milestones the Smoke seams
+        // sequence on, and they are deliberately distinguishable from "disconnected"
+        // by the `bridge: (re)?connected` prefix.
+        if (first)
+            lg::info("virtual desktop bridge: connected — matched IID {} ({}) — 24H2 variant; "
+                     "bound {} desktop(s); current workspace = {}",
+                     toUtf8(bridge_detail::guidToWString(*services->iid)),
+                     std::format("build {}.{}", bridge_detail::readBuildNumber(),
+                                 bridge_detail::readUbr()),
+                     m_bindings.size(), m_current);
+        else
+            lg::info("virtual desktop bridge: reconnected — {} desktop(s) bound, current "
+                     "workspace = {}",
+                     m_bindings.size(), m_current);
+    }
+
+    // The shell process handle signalled (ADR-0025's proactive detector). The proxies
+    // are stale but still non-null and callable, so nothing would fault on its own —
+    // every call would simply fail and return to a caller that logs and moves on.
+    void onShellLost() {
+        markDisconnected("the shell process exited");
+        requestReacquire();
+    }
+
+    // The probe has PROVEN the services answer again; rebuild for real on this STA.
+    // Idempotent and coalesced by construction: if the attempt does not land, the
+    // next request simply starts another probe.
+    void onReacquireSignal() {
+        m_probeInFlight->store(false);
+        acquire();
+        // Still not Connected: either the shell died again between the probe and this
+        // acquisition, or the shell is answering with an identity we do not know and
+        // the Unsupported budget has not elapsed yet. Both want another round; the
+        // Unsupported latch inside acquire() is what eventually stops it.
+        if (!connected()) requestReacquire();
+    }
+
+    // Start (or join) the one coalesced rebuild. Both triggers — the shell-process
+    // wait and the reactive HRESULT backstop — converge here, so overlapping triggers
+    // are no-ops rather than a race, the same property ADR-0023 relies on.
+    //
+    // The probe runs OFF the Worker: there is no readiness signal to wait for (every
+    // candidate fires 200–450 ms early and the three services come up at different
+    // times — ADR-0025's measurement table), so readiness can only be VERIFIED by
+    // successfully acquiring. Doing that polling on the Worker would put a periodic
+    // message into the pump that must stay clear. Nothing is added to the input path,
+    // and a healthy winspace does no recovery work at all.
+    void requestReacquire() {
+        if (m_availability == BridgeAvailability::Unsupported) return;   // never retried
+        if (m_probeInFlight->exchange(true)) return;                     // already rebuilding
+
+        // The probe thread touches only the Worker's HWND and this flag, and lets no
+        // COM pointer escape its own apartment — the real acquisition happens back on
+        // the STA that owns them. The flag is shared so a detached probe outliving the
+        // bridge at shutdown still has something valid to clear.
+        std::thread(probeUntilServing, m_worker, m_probeInFlight).detach();
+    }
+
+    // Switch to the Logical workspace, materializing it on demand (sparse model,
+    // ADR-0003): hit → resolve the stored GUID to its live desktop → SwitchDesktop;
+    // miss → create exactly one desktop (appended), bind logical→GUID, switch.
+    //
+    // A press made while DISCONNECTED is DROPPED, never queued. The asymmetry with a
+    // Workspace move is deliberate and rests on who is waiting: a move is a promise
+    // made to a window on an edge nobody is watching, with no second chance under
+    // Place-once, so replaying it late produces exactly the configured outcome. A
+    // switch is a live response to a keypress — replaying it after the outage is not
+    // a delayed success but a surprise, and it would race the reconcile that is
+    // recomputing the current Workspace at the least trustworthy moment.
+    bool switchTo(int logical) {
+        if (!connected()) {
+            lg::warn("workspace {}: the virtual desktop bridge is {} — the press is dropped",
+                     logical, stateName());
+            return false;
+        }
         reconcileBeforeOperation();
+        // The reconcile enumerates, so the reactive backstop may have dropped the
+        // connection underneath us. Re-check before touching a proxy it just released.
+        if (!connected()) return false;
 
         // Hit path as an and_then chain: resolve the binding to its live desktop
         // (matched by identity, so it survives a Task View reorder), then switch.
@@ -1727,100 +2112,69 @@ public:
 
         if (!result) {
             lg::error("{}", result.error());
+            noteError(result.error());
             return false;
         }
         return true;
     }
 
-    int currentWorkspace() const override { return m_current; }
+    int currentWorkspace() const { return m_current; }
 
     // Re-derive the bindings from the live desktop set via the PURE reconcile policy
     // (ADR-0023). All the deciding — keep, drop, lowest-free — happens in core; this
     // arm only enumerates, installs the answer, and recomputes `m_current`.
-    void reconcileDesktops() override {
-        if (!m_manager) return;
-        const std::vector<DesktopKey> live = liveDesktopKeys();
-        // A machine always has at least one desktop, so an empty read means the
-        // enumeration FAILED (already logged). Keeping the old bindings is strictly
-        // better than wiping every workspace number on a transient COM error.
-        if (live.empty()) return;
-
-        m_bindings = reconcile(m_bindings, live);
-        if (const std::optional<DesktopKey> active = activeDesktopKey())
-            if (const auto* bound = bindingForKey(*active)) m_current = bound->logical;
+    void reconcileDesktops() {
+        if (!connected()) return;
+        rebuildBindings(false);
     }
 
-    // Acquire IVirtualDesktopNotificationService off the same ImmersiveShell service
-    // provider the manager came from, and Register a sink that only posts. Failure
-    // is DEGRADE-AND-LOG (ADR-0004), not fatal: the cookie stays 0, which is exactly
-    // what makes reconcileBeforeOperation resume reconciling on every keypress.
-    bool startNotifications(HWND worker) override {
-        if (!m_shell || !worker) return false;
-
-        auto service = ok([&](vd::IVirtualDesktopNotificationService** pp) {
-            return m_shell->QueryService(vd::k_clsidVirtualDesktopNotificationService,
-                                         vd::k_iidVirtualDesktopNotificationService,
-                                         reinterpret_cast<void**>(pp));
-        });
-        if (!service) {
-            lg::warn("virtual desktop bridge: QueryService(IVirtualDesktopNotificationService) "
-                     "failed — reconciling on demand instead: {}",
-                     service.error());
-            return false;
-        }
-
-        // Attach (not assign): the sink is born with one reference, which the ComPtr
-        // takes over rather than adding a second.
-        Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotification> sink;
-        sink.Attach(new VirtualDesktopNotificationSink(worker));
-
-        DWORD cookie = 0;
-        if (const auto registered = ok((*service)->Register(sink.Get(), &cookie)); !registered) {
-            lg::warn("virtual desktop bridge: notification Register failed — reconciling on "
-                     "demand instead: {}",
-                     registered.error());
-            return false;
-        }
-
-        m_notificationService = std::move(*service);
-        m_notificationSink = std::move(sink);
-        m_notificationCookie = cookie;
-        lg::info("virtual desktop bridge: notification sink registered (live reconcile)");
-        return true;
-    }
-
-    // Quit cleanup (ADR-0024). Two constraints shape this arm:
+    // Quit cleanup (ADR-0024, as amended). Three constraints shape this arm:
     //
-    //   * the switch to home must COMPLETE before any removal, or cleanup removes
-    //     the desktop it is standing on — hence the explicit
+    //   * the anchor is DERIVED, not assumed. The Home desktop and the **Cleanup
+    //     anchor** are two jobs that only looked like one while home always survived;
+    //     the user can destroy it by hand in Task View, after which this used to log
+    //     and leave every winspace-created desktop standing. `cleanupAnchor` is a pure
+    //     core function over the freshly reconciled bindings, preferring home, then
+    //     the lowest-logical foreign desktop, then the lowest-logical desktop;
+    //   * the switch to the anchor must COMPLETE before any removal, or cleanup
+    //     removes the desktop it is standing on — hence the explicit
     //     WaitForAnimationToComplete between the two phases; and
     //   * it must NOT consult the Reducer's current workspace, which ADR-0023 makes
-    //     eventually consistent — it may still name the old Workspace right now. The
-    //     home identity captured at Adoption is the only thing it trusts.
+    //     eventually consistent — it may still name the old Workspace right now.
     //
-    // Every step degrades and logs (ADR-0004): a failed switch or a failed removal
-    // is skipped, and Exit — emitted right after this Effect — always runs.
-    void cleanupCreatedDesktops() override {
-        if (!m_manager) return;
-        if (!m_home) {
-            lg::warn("quit cleanup: no home desktop was captured at adoption — skipping");
-            return;
-        }
+    // Every step degrades and logs (ADR-0004): a failed switch or a failed removal is
+    // skipped, and Exit — emitted right after this Effect — always runs.
+    void cleanupCreatedDesktops() {
+        if (!connected()) return;
+
+        // Reconcile first, so the bindings the pure anchor policy reasons over ARE the
+        // live desktop set — that is what makes "home is still live" decidable in core
+        // with no COM in the signature.
+        rebuildBindings(false);
+        if (!connected()) return;   // the shell went away mid-quit; nothing to be done
 
         const std::vector<DesktopKey> doomed = desktopsToCleanup(m_bindings);
         if (doomed.empty()) return;   // created nothing, so remove nothing
 
-        const auto home = resolveLiveDesktop(toGuid(*m_home));
-        if (!home) {
-            lg::warn("quit cleanup: home desktop is gone — leaving {} desktop(s) standing: {}",
-                     doomed.size(), home.error());
+        const std::optional<DesktopKey> anchorKey = cleanupAnchor(m_bindings, m_home);
+        if (!anchorKey) {
+            lg::warn("quit cleanup: no surviving desktop to anchor on — leaving {} desktop(s) "
+                     "standing",
+                     doomed.size());
+            return;
+        }
+        const auto anchor = resolveLiveDesktop(toGuid(*anchorKey));
+        if (!anchor) {
+            lg::warn("quit cleanup: the cleanup anchor is gone — leaving {} desktop(s) "
+                     "standing: {}",
+                     doomed.size(), anchor.error());
             return;
         }
 
-        // Phase one: land on home, and let the switch settle. Removing the desktop
-        // we are standing on is the failure this ordering exists to prevent.
-        if (const auto switched = ok(m_manager->SwitchDesktop((*home).Get())); !switched) {
-            lg::warn("quit cleanup: could not switch to the home desktop — leaving {} "
+        // Phase one: land on the anchor, and let the switch settle. Removing the
+        // desktop we are standing on is the failure this ordering exists to prevent.
+        if (const auto switched = ok(m_manager->SwitchDesktop((*anchor).Get())); !switched) {
+            lg::warn("quit cleanup: could not switch to the cleanup anchor — leaving {} "
                      "desktop(s) standing: {}",
                      doomed.size(), switched.error());
             return;
@@ -1829,15 +2183,15 @@ public:
             lg::warn("quit cleanup: WaitForAnimationToComplete failed; continuing: {}",
                      settled.error());
 
-        // Phase two: destroy ours, with home as the fallback so any windows parked
-        // on a removed desktop MIGRATE there rather than being destroyed.
+        // Phase two: destroy ours, with the anchor as the fallback so any windows
+        // parked on a removed desktop MIGRATE there rather than being destroyed.
         int removed = 0;
         for (const DesktopKey& key : doomed) {
-            if (key == *m_home) continue;   // never remove the ground we stand on
+            if (key == *anchorKey) continue;   // never remove the ground we stand on
             const auto desktop = resolveLiveDesktop(toGuid(key));
-            if (!desktop) continue;         // already gone — nothing to do
+            if (!desktop) continue;            // already gone — nothing to do
             if (const auto r =
-                    ok(m_manager->RemoveDesktop((*desktop).Get(), (*home).Get()));
+                    ok(m_manager->RemoveDesktop((*desktop).Get(), (*anchor).Get()));
                 !r)
                 lg::warn("quit cleanup: RemoveDesktop failed; skipping: {}", r.error());
             else
@@ -1852,73 +2206,371 @@ public:
     // Move `window` to Logical workspace `logical` (ADR-0010, revised): resolve the
     // HWND to its IApplicationView, resolve the target desktop — materializing
     // (create + bind, NO switch) on a miss — then MoveViewToDesktop. The internal
-    // path is what moves a FOREIGN window; the public HWND API cannot. Null view
-    // collection (acquisition failed) → no-op.
-    bool moveWindowToWorkspace(WindowId window, int logical) override {
-        if (!m_manager || !m_viewCollection) return false;
+    // path is what moves a FOREIGN window; the public HWND API cannot.
+    //
+    // A move attempted while DISCONNECTED becomes a **Pending move** rather than a
+    // failure. This is the other half of the reported bug: at login the Launch entries
+    // fire immediately and their windows appear while the shell is still coming up, and
+    // **Place-once** attempts a Place rule's Workspace move exactly once — so the move
+    // was lost permanently and the app sat on the wrong Workspace all session. Only the
+    // Workspace move needs the bridge; Ignore-set insertion, Distribute and Slot
+    // placement are plain geometry writes and keep working throughout an outage.
+    bool moveWindowToWorkspace(WindowId window, int logical) {
+        if (!connected()) {
+            queuePendingMove(window, logical);
+            return false;
+        }
         reconcileBeforeOperation();
+        if (!connected()) {   // the backstop fired inside the reconcile
+            queuePendingMove(window, logical);
+            return false;
+        }
+        // (queuePendingMove itself refuses to queue on an Unsupported build — see there.)
 
         auto view = ok([&](vd::IApplicationView** pp) {
             return m_viewCollection->GetViewForHwnd(toHwnd(window), pp);
         });
         if (!view) {
             lg::error("move window to workspace {}: GetViewForHwnd: {}", logical, view.error());
-            return false;
+            return queueIfDisconnected(view.error(), window, logical);
         }
         const std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> desktop =
             resolveMoveTarget(logical);
         if (!desktop) {
             lg::error("{}", desktop.error());
-            return false;
+            return queueIfDisconnected(desktop.error(), window, logical);
         }
         if (const auto moved = ok(m_manager->MoveViewToDesktop((*view).Get(), (*desktop).Get()));
             !moved) {
             lg::error("move window to workspace {}: {}", logical, moved.error());
-            return false;
+            return queueIfDisconnected(moved.error(), window, logical);
         }
         return true;
     }
 
 private:
-    // Bind every pre-existing desktop to logical 1..N by GUID and seed the current
-    // workspace from the active desktop (ADR-0003 startup adoption). Best-effort:
-    // an enumeration failure logs once and leaves the bridge with no bindings; a
-    // single unreadable desktop is skipped, as the pre-refactor filtered pipeline did.
-    void adopt() {
+    // ── the connection lifecycle (ADR-0025) ──────────────────────────────────
+
+    // Re-derive the bindings from the live Virtual Desktop set through the PURE
+    // `reconcile` policy — the single path for both **Adoption** and
+    // **Reconciliation**, which are now one mechanism rather than two. All the
+    // deciding (keep, drop, lowest-free, preserve Provenance) happens in core; this
+    // arm only enumerates, installs the answer, and recomputes `m_current`.
+    //
+    // With no previous bindings reconcile assigns 1..N and records every desktop
+    // FOREIGN — exactly Adoption's behaviour: winspace inherits the session, it does
+    // not annex it, so Quit cleanup leaves these standing.
+    //
+    // `latchHome` is true only on the FIRST successful acquisition. The **Home
+    // desktop** is a fact about the past — where winspace found the user — so a
+    // reconnect must never re-seed it to wherever the user happened to stand when the
+    // shell died. The **Cleanup anchor** is derived at quit time instead.
+    void rebuildBindings(bool latchHome) {
         const std::vector<DesktopKey> live = liveDesktopKeys();
+        // A machine always has at least one desktop, so an empty read means the
+        // enumeration FAILED (already logged). Keeping the old bindings is strictly
+        // better than wiping every workspace number on a transient COM error.
+        if (live.empty()) return;
 
-        // Bind each readable desktop to its 1-based logical slot, every one recorded
-        // as FOREIGN (Provenance false): winspace inherits the session, it does not
-        // annex it, so Quit cleanup leaves these standing.
-        m_bindings.clear();
-        for (const auto [i, key] : std::views::enumerate(live))
-            m_bindings.push_back({static_cast<int>(i) + 1, key, false});
-
-        // The HOME desktop: the one active at Adoption — where winspace found the
-        // user. This is the only moment it can be observed, and Quit cleanup needs it
-        // as both a switch-back target and the RemoveDesktop fallback.
+        m_bindings = reconcile(m_bindings, live);
         if (const std::optional<DesktopKey> active = activeDesktopKey()) {
-            m_home = *active;
+            if (latchHome && !m_home) m_home = *active;
             if (const auto* bound = bindingForKey(*active)) m_current = bound->logical;
         }
+    }
 
-        lg::info(
-            "virtual desktop bridge: adopted {} desktop(s); current workspace = {}",
-            m_bindings.size(), m_current);
+    // Decide what an acquisition failure MEANS. The discriminator is deliberately
+    // time-aware: a shell that is starting up may accept the ImmersiveShell object
+    // creation before it has registered the virtual desktop interfaces, so treating
+    // "created, but no known IID matched" as Unsupported the instant it is seen would
+    // latch the terminal state during ordinary startup — turning a transient fault
+    // into the permanent one this work exists to remove. Within an attempt's budget
+    // an unmatched identity counts as Disconnected; a genuinely unsupported build
+    // reports a few hundred milliseconds later, once.
+    void classifyFailure(const bridge_detail::AcquireError& failure) {
+        switch (failure.why) {
+            case bridge_detail::AcquireFailure::NotServing:
+                markDisconnected(failure.detail);
+                return;
+            case bridge_detail::AcquireFailure::StubbedVariant:
+                // Knowable immediately: no amount of waiting makes an uncaptured
+                // vtable implemented, and calling through it is what ADR-0002 forbids.
+                latchUnsupported(failure.detail);
+                return;
+            case bridge_detail::AcquireFailure::NoKnownInterface:
+                if (!m_unmatchedSince) m_unmatchedSince = std::chrono::steady_clock::now();
+                if (std::chrono::steady_clock::now() - *m_unmatchedSince < k_unsupportedBudget) {
+                    markDisconnected("the shell has not registered the virtual desktop "
+                                     "interfaces yet");
+                    return;
+                }
+                latchUnsupported(failure.detail);
+                return;
+        }
+    }
+
+    // Enter the recoverable state and drop the stale proxies. They stay non-null and
+    // callable once the shell dies, so nothing faults on its own — every call simply
+    // fails with RPC_S_SERVER_UNAVAILABLE and returns to a caller that logs and moves
+    // on. Releasing them makes the fact explicit. The bindings, their Provenance and
+    // the Home desktop are untouched: they belong to this object, not to the
+    // connection.
+    void markDisconnected(std::string_view reason) {
+        if (m_availability == BridgeAvailability::Unsupported) return;
+        const bool wasConnected = m_availability == BridgeAvailability::Connected;
+        m_availability = BridgeAvailability::Disconnected;
+        disarmShellWait();
+        unregisterNotificationSink();
+        m_manager.Reset();
+        m_viewCollection.Reset();
+        m_notificationService.Reset();
+        m_shell.Reset();
+
+        // Loud on the first failure, quiet after: a long shell outage must not flood
+        // the log with one line per retry.
+        if (wasConnected || m_failures == 0)
+            lg::warn("virtual desktop bridge: disconnected ({}) — reconnecting; workspace "
+                     "switching is unavailable until then",
+                     reason);
+        ++m_failures;
+    }
+
+    // The terminal state. Diagnosed loudly ONCE and never retried — the whole point of
+    // separating it from Disconnected is that an unsupported build must not enter a
+    // retry loop, and a lost connection must not be mistaken for one.
+    //
+    // WARN rather than ERROR, deliberately: an ERROR line in this codebase carries a
+    // rendered io::Error (source location + native code + system text), and this fact
+    // has no HRESULT behind it — there is nothing to render. Same level the
+    // pre-ADR-0025 factory used for exactly the same diagnostic.
+    void latchUnsupported(std::string_view reason) {
+        m_availability = BridgeAvailability::Unsupported;
+        disarmShellWait();
+        m_manager.Reset();
+        m_viewCollection.Reset();
+        m_notificationService.Reset();
+        m_shell.Reset();
+        lg::warn("virtual desktop bridge: UNSUPPORTED (build {}.{}): {}; COM VD switching "
+                 "disabled — this is terminal and is never retried",
+                 bridge_detail::readBuildNumber(), bridge_detail::readUbr(), reason);
+    }
+
+    // The reactive backstop. Any bridge call reporting that the RPC server is
+    // unavailable, that the object has disconnected, or that the proxy was never
+    // connected marks the bridge Disconnected and starts a rebuild — so recovery
+    // depends on the FAILURE itself rather than on our theory about which process
+    // hosts the ImmersiveShell.
+    void noteError(const Error& e) {
+        if (!bridge_detail::isDisconnectError(e)) return;
+        markDisconnected("a bridge call reported the shell is gone");
+        requestReacquire();
+    }
+
+    // A move that failed because the connection dropped mid-call is still a promise
+    // worth keeping, so it is queued. A move that failed for ANY OTHER reason is not:
+    // the queue is for connection loss, not for every failure.
+    bool queueIfDisconnected(const Error& e, WindowId window, int logical) {
+        if (!bridge_detail::isDisconnectError(e)) return false;
+        noteError(e);
+        queuePendingMove(window, logical);
+        return false;
+    }
+
+    // ── pending moves (ADR-0025) ─────────────────────────────────────────────
+
+    // Record a Workspace move to replay on reconnection. Capped, because an outage of
+    // unknown length must not let an unbounded queue grow; a window queued twice keeps
+    // only its latest target, which is what Place-once would have produced anyway.
+    // Neither the Reducer nor State learns any of this happened.
+    void queuePendingMove(WindowId window, int logical) {
+        // A **Disconnected** bridge queues; an **Unsupported** one must not. There is no
+        // reconnection coming, so a queue here would fill to its cap and then log a
+        // drop for every subsequent window — noise promising a replay that can never
+        // happen. On an unsupported build a Workspace move is simply unavailable.
+        if (m_availability != BridgeAvailability::Disconnected) return;
+
+        if (const auto it = std::ranges::find(m_pending, window, &PendingMove::window);
+            it != m_pending.end()) {
+            it->logical = logical;
+            return;
+        }
+        if (m_pending.size() >= k_pendingMoveCap) {
+            lg::error("virtual desktop bridge: pending move queue is full ({}) — DROPPING the "
+                      "move of window {} to workspace {}",
+                      k_pendingMoveCap, static_cast<uint64_t>(window), logical);
+            return;
+        }
+        m_pending.push_back({window, logical});
+        lg::info("virtual desktop bridge: bridge is {} — queued the move of window {} to "
+                 "workspace {} until reconnection",
+                 stateName(), static_cast<uint64_t>(window), logical);
+    }
+
+    // Replay on reconnection, discarding entries whose window has since closed —
+    // closing a window must never resurrect it somewhere else. Taken by value first so
+    // a replay that fails and re-queues cannot iterate its own growth.
+    void replayPendingMoves() {
+        if (m_pending.empty()) return;
+        std::vector<PendingMove> queued;
+        queued.swap(m_pending);
+        for (const PendingMove& move : queued) {
+            if (!IsWindow(toHwnd(move.window))) continue;   // gone — discard
+            moveWindowToWorkspace(move.window, move.logical);
+        }
+        lg::info("virtual desktop bridge: replayed {} pending workspace move(s) after "
+                 "reconnection",
+                 queued.size());
+    }
+
+    // ── shell-death detection + the re-acquisition probe (ADR-0025) ──────────
+
+    // Wait on the shell PROCESS as a kernel object. This cannot be missed: there is no
+    // message queue to overflow, no broadcast to be excluded from (the Worker window is
+    // HWND_MESSAGE and broadcasts reach only top-level windows), and no dependence on a
+    // pump that may be blocked inside an outbound COM call. Re-armed on the new process
+    // after each successful reconnect.
+    void armShellWait() {
+        disarmShellWait();
+        const HWND shell = GetShellWindow();
+        if (!shell) return;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(shell, &pid);
+        if (pid == 0) return;
+        m_shellProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (!m_shellProcess) {
+            lg::warn("virtual desktop bridge: could not open the shell process for the liveness "
+                     "wait — relying on the reactive backstop alone");
+            return;
+        }
+        // The callback runs on a thread-pool thread and does exactly one thing: post.
+        // It is handed the HWND rather than `this`, so it can never touch a bridge that
+        // is being torn down.
+        if (!RegisterWaitForSingleObject(&m_shellWait, m_shellProcess, &onShellExit, m_worker,
+                                         INFINITE, WT_EXECUTEONLYONCE)) {
+            CloseHandle(m_shellProcess);
+            m_shellProcess = nullptr;
+            m_shellWait = nullptr;
+        }
+    }
+
+    void disarmShellWait() {
+        // INVALID_HANDLE_VALUE: block until any in-flight callback has finished, so the
+        // process handle below is never closed out from under it.
+        if (m_shellWait) UnregisterWaitEx(m_shellWait, INVALID_HANDLE_VALUE);
+        if (m_shellProcess) CloseHandle(m_shellProcess);
+        m_shellWait = nullptr;
+        m_shellProcess = nullptr;
+    }
+
+    static VOID CALLBACK onShellExit(PVOID context, BOOLEAN) {
+        PostMessageW(static_cast<HWND>(context), k_wmShellLost, 0, 0);
+    }
+
+    // The probe: ask, on our own apartment, until the answer is one only the Worker can
+    // act on, then hand back. It lets NO pointer escape — COM interface pointers are
+    // apartment-affine, so what travels to the STA is the PROOF, not the proxies. An
+    // event says WHEN TO START ASKING; only an acquisition answers, because there is no
+    // readiness signal to observe (ADR-0025).
+    //
+    // Two outcomes end the probe, and getting this wrong is how **Unsupported** becomes
+    // unreachable:
+    //
+    //   * every service answered — the Worker acquires for real; or
+    //   * the shell answered but told us something asking again cannot change (no known
+    //     IID matched, or a variant whose vtable is not captured). Only the WORKER owns
+    //     the budget that decides whether that is a shell still starting up or a build
+    //     winspace genuinely cannot drive, so it must be handed back rather than
+    //     retried here. Polling through it instead would spin forever on exactly the
+    //     machines Unsupported exists to serve, and the terminal diagnostic would never
+    //     be printed.
+    //
+    // Only "the shell is not serving" is retried here — indefinitely, so a long outage
+    // still ends in recovery — and it stops when the Worker window is gone, i.e.
+    // winspace is exiting.
+    static void probeUntilServing(HWND worker, std::shared_ptr<std::atomic<bool>> inFlight) {
+        const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+        const auto handBack = [&] {
+            // Clear BEFORE posting: a post that fails (a torn-down window, a full queue)
+            // must not leave the flag latched, or requestReacquire would early-return
+            // for the rest of the session and BOTH triggers would be dead. A spurious
+            // extra probe is recoverable; a permanently coalesced-out rebuild is not.
+            inFlight->store(false);
+            PostMessageW(worker, k_wmReacquire, 0, 0);
+            if (com) CoUninitialize();
+        };
+
+        while (IsWindow(worker)) {
+            const auto services = bridge_detail::acquireServices();
+            if (services) {
+                handBack();   // the fast path: no delay between proof and acquisition
+                return;
+            }
+            // Pace BOTH continuations. The classify hand-back is paced too, because the
+            // Worker's answer while the budget is unelapsed is "try again" — without the
+            // wait, probe and Worker would spin thread-per-round for the whole budget.
+            std::this_thread::sleep_for(k_probeInterval);
+            if (services.error().why != bridge_detail::AcquireFailure::NotServing) {
+                handBack();
+                return;
+            }
+        }
+        if (com) CoUninitialize();
+        inFlight->store(false);
+    }
+
+    void registerNotificationSink() {
+        // Attach (not assign): the sink is born with one reference, which the ComPtr
+        // takes over rather than adding a second.
+        Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotification> sink;
+        sink.Attach(new VirtualDesktopNotificationSink(m_worker));
+        DWORD cookie = 0;
+        if (const auto registered = ok(m_notificationService->Register(sink.Get(), &cookie));
+            !registered) {
+            lg::warn("virtual desktop bridge: notification Register failed — reconciling on "
+                     "demand instead: {}",
+                     registered.error());
+            return;
+        }
+        m_notificationSink = std::move(sink);
+        m_notificationCookie = cookie;
+    }
+
+    void unregisterNotificationSink() {
+        if (m_notificationService && m_notificationCookie != 0)
+            if (const auto r = ok(m_notificationService->Unregister(m_notificationCookie)); !r)
+                lg::warn("virtual desktop bridge: notification Unregister failed: {}", r.error());
+        m_notificationSink.Reset();
+        m_notificationCookie = 0;
+    }
+
+    std::string_view stateName() const {
+        switch (m_availability) {
+            case BridgeAvailability::Connected: return "connected";
+            case BridgeAvailability::Disconnected: return "disconnected";
+            case BridgeAvailability::Unsupported: return "unsupported";
+        }
+        return "unknown";
     }
 
     // Every live desktop's identity, in enumeration order. The single COM
     // enumeration both Adoption and Reconciliation read the world through; an
     // unreadable desktop is skipped, as the pre-refactor filtered pipeline did.
+    // Every helper below re-checks m_manager rather than assuming its caller did. The
+    // reactive backstop RELEASES the proxies from inside a failing call, so an
+    // enumeration that fails partway through can leave a caller mid-sequence holding
+    // a manager that is now null.
     std::vector<DesktopKey> liveDesktopKeys() {
+        if (!m_manager) return {};
         auto desktops = ok([&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
         if (!desktops) {
             lg::error("{}", desktops.error());
+            noteError(desktops.error());   // the reactive backstop's busiest call site
             return {};
         }
         UINT count = 0;
         if (const auto r = ok((*desktops)->GetCount(&count)); !r) {
             lg::error("{}", r.error());
+            noteError(r.error());
             return {};
         }
         const auto readKey = [&](UINT i) -> std::optional<DesktopKey> {
@@ -1940,6 +2592,7 @@ private:
     // The identity of the desktop the OS says is active right now, or nullopt if it
     // cannot be read.
     std::optional<DesktopKey> activeDesktopKey() {
+        if (!m_manager) return std::nullopt;
         auto active =
             ok([&](vd::IVirtualDesktop** pp) { return m_manager->GetCurrentDesktop(pp); });
         if (!active) return std::nullopt;
@@ -1984,6 +2637,10 @@ private:
     // a GUID that no longer names any live desktop is NotFound (routine, recoverable).
     std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> resolveLiveDesktop(
         const GUID& target) {
+        // CO_E_OBJNOTCONNECTED, never NotFound: NotFound is the routine absence that
+        // switchTo's .or_else recovers by CREATING a desktop, and a lost connection
+        // must never be mistaken for "workspace N does not exist yet".
+        if (!m_manager) return std::unexpected(disconnectedError());
         auto desktops = ok(
             [&](vd::IObjectArray** pp) { return m_manager->GetDesktops(pp); });
         if (!desktops) return std::unexpected(desktops.error());
@@ -2022,6 +2679,7 @@ private:
     // The ONE place Provenance is recorded true: this desktop is ours, so Quit
     // cleanup may destroy it. Every other binding path records false.
     std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktop>, Error> createAndBind(int logical) {
+        if (!m_manager) return std::unexpected(disconnectedError());
         auto created = ok(
             [&](vd::IVirtualDesktop** pp) { return m_manager->CreateDesktop(pp); });
         if (!created) return std::unexpected(created.error());
@@ -2063,132 +2721,65 @@ private:
     // says we are" rather than "where we hoped to go". It no longer takes the
     // logical number, because there is nothing left to do with it.
     std::expected<Success, Error> doSwitch(vd::IVirtualDesktop* desktop) {
+        if (!m_manager) return std::unexpected(disconnectedError());
         return ok(m_manager->SwitchDesktop(desktop));
     }
 
+    // The error a released proxy stands for. Deliberately one of the three HRESULTs
+    // the reactive backstop already recognises, so an internal short-circuit and a
+    // real RPC failure travel the same path.
+    static Error disconnectedError(
+        std::source_location loc = std::source_location::current()) {
+        return Error{HrError{CO_E_OBJNOTCONNECTED}, loc};
+    }
+
+    // A Workspace move deferred by a lost connection: a window identity and a target
+    // Logical number, and nothing else. Not an Event, not State — the Reducer must not
+    // learn that a connection exists.
+    struct PendingMove {
+        WindowId window{};
+        int logical = 0;
+    };
+
+    // How long an acquisition attempt may keep seeing "object created, no known IID
+    // matched" before concluding the build is genuinely Unsupported. Sized well past
+    // the measured gap between the ImmersiveShell object accepting creation and the
+    // virtual desktop manager answering (ADR-0025's measurement tables): a real
+    // unsupported build waits this out once, a slow shell never trips it.
+    static constexpr std::chrono::milliseconds k_unsupportedBudget{3000};
+
+    // The probe cadence. A short poll, honestly: there is no readiness signal, so
+    // asking is the only observation available. It lives on the probe thread, off the
+    // Worker and off the input path.
+    static constexpr std::chrono::milliseconds k_probeInterval{150};
+
+    // The pending-move cap. Bounded so a long outage cannot grow the queue without
+    // bound; exceeding it drops with a loud diagnostic rather than silently.
+    static constexpr size_t k_pendingMoveCap = 64;
+
+    // ── owned by the OBJECT: survives every reconnect ────────────────────────
+    HWND m_worker = nullptr;
+    std::vector<DesktopBinding> m_bindings;  // logical workspace → identity + Provenance
+    std::optional<DesktopKey> m_home;        // the desktop active at the FIRST acquisition
+    std::vector<PendingMove> m_pending;      // replayed on reconnection
+    int m_current = 1;
+    BridgeAvailability m_availability = BridgeAvailability::Disconnected;
+    bool m_connectedOnce = false;            // gates the one-shot Home latch
+    int m_failures = 0;                      // keeps a long outage from flooding the log
+    std::optional<std::chrono::steady_clock::time_point> m_unmatchedSince;
+    std::shared_ptr<std::atomic<bool>> m_probeInFlight =
+        std::make_shared<std::atomic<bool>>(false);   // coalesces overlapping triggers
+
+    // ── owned by the CONNECTION: replaced on every reconnect ─────────────────
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal> m_manager;
-    Microsoft::WRL::ComPtr<IServiceProvider> m_shell;  // kept: the notification service comes off it
+    Microsoft::WRL::ComPtr<IServiceProvider> m_shell;
     Microsoft::WRL::ComPtr<vd::IApplicationViewCollection> m_viewCollection;  // HWND→view (move)
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotificationService> m_notificationService;
     Microsoft::WRL::ComPtr<vd::IVirtualDesktopNotification> m_notificationSink;
-    std::vector<DesktopBinding> m_bindings;  // logical workspace → identity + Provenance
-    std::optional<DesktopKey> m_home;        // the desktop active at Adoption
     DWORD m_notificationCookie = 0;          // non-zero ⇔ the sink is live (ADR-0023)
-    int m_current = 1;
+    HANDLE m_shellProcess = nullptr;         // SYNCHRONIZE-only; the liveness wait's object
+    HANDLE m_shellWait = nullptr;            // the thread-pool wait registration
 };
-
-// ── acquisition + IID-probe variant selection (the factory) ──────────────────
-
-// Build the bridge, or return null (with a loud diagnostic) if no known variant
-// resolves. Must run on the STA thread owning the COM apartment (the Worker).
-// Sequence per ADR-0002: CoCreateInstance(ImmersiveShell, IServiceProvider) →
-// QueryService(VirtualDesktopManagerInternal, <probed IID>) newest→oldest → first
-// S_OK wins (QI-success ⟺ correct vtable).
-inline std::unique_ptr<IVirtualDesktopBridge> makeVirtualDesktopBridge() {
-    using bridge_detail::VdVariant;
-    const DWORD build = bridge_detail::readBuildNumber();
-    const DWORD ubr = bridge_detail::readUbr();
-    const std::string buildStr = std::format("build {}.{}", build, ubr);
-
-    auto shell = ok([&](IServiceProvider** pp) {
-        return CoCreateInstance(vd::k_clsidImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER,
-                                IID_IServiceProvider, reinterpret_cast<void**>(pp));
-    });
-    if (!shell) {
-        lg::error("virtual desktop bridge: CoCreateInstance(ImmersiveShell) failed — "
-                  "COM VD switching disabled: {}",
-                  shell.error());
-        return nullptr;
-    }
-
-    // The probe table, newest→oldest: each row is an IID to QI and the variant it
-    // denotes. QI succeeds only when the vtable matches, so the first S_OK is
-    // self-validating (ADR-0002).
-    struct Probe {
-        const GUID& iid;
-        VdVariant variant;
-    };
-    static constexpr std::array probes = {
-        Probe{vd::k_iidVDMInternal_53F5CA0B, VdVariant::W24H2},  // resolved by build below
-        Probe{vd::k_iidVDMInternal_A3175F2D, VdVariant::W22H2},
-        Probe{vd::k_iidVDMInternal_B2F925B9, VdVariant::W21H2},
-    };
-
-    const std::wstring forced = bridge_detail::forcedVariantOverride();
-
-    // Resolve a probe to its QI result plus the variant it denotes. The shared
-    // 53F5CA0B IID is 24H2 only on build ≥ 26100; on 22631 it is 23H2-KB with a
-    // different vtable and must not drive 24H2. WINSPACE_FORCE_VD_VARIANT overrides
-    // the variant to test a stub.
-    struct Resolved {
-        const GUID* iid;
-        std::expected<Microsoft::WRL::ComPtr<vd::IVirtualDesktopManagerInternal>, Error>
-            manager;
-        VdVariant variant;
-    };
-    const auto resolve = [&](const Probe& probe) -> Resolved {
-        auto manager = ok([&](vd::IVirtualDesktopManagerInternal** pp) {
-            return (*shell)->QueryService(vd::k_clsidVirtualDesktopManagerInternal,
-                                          probe.iid, reinterpret_cast<void**>(pp));
-        });
-        VdVariant variant = probe.variant;
-        if (IsEqualGUID(probe.iid, vd::k_iidVDMInternal_53F5CA0B))
-            variant = (build >= 26100) ? VdVariant::W24H2 : VdVariant::W23H2KB;
-        if (forced == L"21h2") variant = VdVariant::W21H2;
-        else if (forced == L"22h2") variant = VdVariant::W22H2;
-        else if (forced == L"23h2-kb") variant = VdVariant::W23H2KB;
-        return {&probe.iid, std::move(manager), variant};
-    };
-
-    // Probe newest→oldest; the first IID whose vtable matches (QI succeeds) wins.
-    auto resolved = probes | std::views::transform(resolve);
-    const auto found = std::ranges::find_if(
-        resolved, [](const Resolved& r) { return r.manager.has_value(); });
-
-    // No known IID matched: a newer Windows bumped the interface. Fail LOUDLY
-    // (null + diagnostic) — never call through a mismatched vtable (ADR-0002).
-    if (found == std::ranges::end(resolved)) {
-        lg::error(
-            "virtual desktop bridge: NO known IVirtualDesktopManagerInternal IID matched ({}) "
-            "— a new OS variant needs capturing; COM VD switching disabled",
-            buildStr);
-        return nullptr;
-    }
-
-    Resolved winner = *found;
-    const std::string iidName = toUtf8(bridge_detail::guidToWString(*winner.iid));
-    switch (winner.variant) {
-        case VdVariant::W24H2:
-            lg::info("virtual desktop bridge: matched IID {} ({}) — 24H2 variant", iidName,
-                     buildStr);
-            // The bridge needs the shell service provider too, to QueryService the
-            // IApplicationViewCollection for the move path (ADR-0010, revised).
-            return std::make_unique<VirtualDesktop24H2Bridge>(std::move(*winner.manager),
-                                                              std::move(*shell));
-
-        case VdVariant::W23H2KB:
-            lg::warn(
-                "virtual desktop bridge: IID {} resolved to 23H2-KB5034204 variant ({}) — "
-                "NOT YET IMPLEMENTED (its vtable differs from 24H2); COM VD switching disabled",
-                iidName, buildStr);
-            return nullptr;
-        case VdVariant::W22H2:
-            lg::warn(
-                "virtual desktop bridge: IID {} resolved to 22H2 / pre-KB 23H2 variant ({}) — "
-                "NOT YET IMPLEMENTED; COM VD switching disabled",
-                iidName, buildStr);
-            return nullptr;
-        case VdVariant::W21H2:
-            lg::warn(
-                "virtual desktop bridge: IID {} resolved to 21H2 variant ({}) — NOT YET "
-                "IMPLEMENTED; COM VD switching disabled",
-                iidName, buildStr);
-            return nullptr;
-        case VdVariant::None:
-            break;  // unreachable — a matched probe always names a variant
-    }
-    return nullptr;  // unreachable — the None arm never triggers on a matched probe
-}
 
 }  // namespace winspace::io
 
@@ -2345,6 +2936,128 @@ inline void postEvent(HWND workerHwnd, Event* ev) {
     }
 }
 
+// ── the launcher: CreateProcessW, widened by the registered application paths ──
+
+namespace launch_detail {
+
+// The program token of a verbatim command line — the leading quoted string, or
+// everything up to the first whitespace. This is a READ, not a rewrite: the
+// command itself is still handed to Win32 exactly as the user wrote it (ADR-0011's
+// unparsed contract). We only need to know WHICH name to look up.
+inline std::wstring_view programToken(std::wstring_view cmdline) {
+    while (!cmdline.empty() && (cmdline.front() == L' ' || cmdline.front() == L'\t'))
+        cmdline.remove_prefix(1);
+    if (!cmdline.empty() && cmdline.front() == L'"') {
+        cmdline.remove_prefix(1);
+        return cmdline.substr(0, cmdline.find(L'"'));
+    }
+    return cmdline.substr(0, cmdline.find_first_of(L" \t"));
+}
+
+// The shell's registered application path for `name`, or empty. This is where the
+// installers of most normally-installed applications (browsers, Office, developer
+// tools) record themselves, and it is what makes `msedge` work in the Run dialog
+// while CreateProcessW — which searches %PATH% and nothing else — reports
+// file-not-found. Per-user first, then machine-wide, mirroring the shell's own
+// precedence. RegGetValueW expands a REG_EXPAND_SZ value for us.
+inline std::wstring registeredApplicationPath(std::wstring_view name) {
+    std::wstring key = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\";
+    key += name;
+    // App Paths keys are named with the extension; a bare `msedge` needs `.exe`.
+    if (name.find(L'.') == std::wstring_view::npos) key += L".exe";
+
+    for (const HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+        DWORD cb = 0;
+        if (RegGetValueW(root, key.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, nullptr, &cb) !=
+                ERROR_SUCCESS ||
+            cb < sizeof(wchar_t))
+            continue;
+        std::wstring value(cb / sizeof(wchar_t), L'\0');
+        if (RegGetValueW(root, key.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, value.data(),
+                         &cb) != ERROR_SUCCESS)
+            continue;
+        value.resize(cb / sizeof(wchar_t));
+        while (!value.empty() && value.back() == L'\0') value.pop_back();
+        // The recorded path is sometimes quoted; CreateProcessW's lpApplicationName
+        // takes a bare path.
+        if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+            value = value.substr(1, value.size() - 2);
+        if (!value.empty()) return value;
+    }
+    return {};
+}
+
+}  // namespace launch_detail
+
+// Start a detached child from a verbatim Launch entry command (ADR-0011), falling
+// back to the shell's registered application paths on a file-not-found (ADR-0025).
+//
+// CreateProcessW parses exe + args out of the command line itself and searches
+// %PATH% — but NOT the registered application paths, which is where most installed
+// applications live. So `exec-once = msedge` failed while `msedge` worked from the
+// Run dialog. On a not-found failure we resolve the program token to its registered
+// path and retry ONCE with that as lpApplicationName; the command line is passed
+// through unchanged both times, so arguments survive and nothing is expanded.
+//
+// Deliberately NOT ShellExecute: that would resolve application paths for free but
+// requires the shell, and Launch entries fire at winspace startup — at login, the
+// exact window this work exists to survive.
+inline void launchDetached(const std::string& command) {
+    // CreateProcessW WRITES to lpCommandLine, so the widened command goes into a
+    // mutable buffer. cwd/env are inherited (nullptr). On success both handles are
+    // closed immediately, fully detaching the child so it outlives winspace.
+    std::wstring cmdline = toWide(command);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    const auto spawn = [&](const wchar_t* application) {
+        return ok(CreateProcessW(application, cmdline.data(), nullptr, nullptr, FALSE, 0,
+                                 nullptr, nullptr, &si, &pi));
+    };
+    const auto detach = [&] {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    };
+
+    const auto launched = spawn(nullptr);
+    if (launched) {
+        detach();
+        return;
+    }
+
+    // Only a not-found failure is a candidate for the fallback. Access denied, a
+    // corrupt image, or anything else is a real failure the fallback cannot fix.
+    const auto* failure = std::get_if<Win32Error>(&launched.error().code);
+    const bool notFound = failure && (failure->code == ERROR_FILE_NOT_FOUND ||
+                                      failure->code == ERROR_PATH_NOT_FOUND);
+    if (!notFound) {
+        lg::warn("exec: launch failed for '{}': {}", command, launched.error());
+        return;
+    }
+
+    const std::wstring_view name = launch_detail::programToken(cmdline);
+    const std::wstring resolved = launch_detail::registeredApplicationPath(name);
+    if (resolved.empty()) {
+        lg::warn("exec: launch failed for '{}': '{}' was not found on PATH and is not a "
+                 "registered application: {}",
+                 command, toUtf8(name), launched.error());
+        return;
+    }
+
+    // Retry with the resolved image as lpApplicationName and the ORIGINAL command
+    // line untouched, so arguments (and argv[0] as the user wrote it) survive.
+    cmdline = toWide(command);   // the failed attempt may have written to the buffer
+    if (const auto retried = spawn(resolved.c_str())) {
+        lg::info("exec: '{}' resolved via the registered application path {}", command,
+                 toUtf8(resolved));
+        detach();
+    } else {
+        lg::warn("exec: launch failed for '{}' even via its registered application path {}: {}",
+                 command, toUtf8(resolved), retried.error());
+    }
+}
+
 // The Worker thread's window and behavioral core. Constructed on the Worker
 // thread so its COM apartment and its message-only window share that thread's
 // affinity; destroyed on the same thread so teardown (DestroyWindow /
@@ -2395,21 +3108,21 @@ public:
             lg::error("worker: message-only window creation failed: {}", created.error());
         }
 
-        // Build the COM Virtual Desktop bridge on this STA thread — its sole owner.
-        // Null on an unsupported OS variant (a loud diagnostic is already logged);
-        // switch Effects then no-op rather than calling through a wrong vtable.
-        // Adoption ran in the factory, so seed State from the active desktop.
-        m_bridge = makeVirtualDesktopBridge();
-        if (m_bridge) {
+        // Construct the COM Virtual Desktop bridge on this STA thread — its sole
+        // owner — UNCONDITIONALLY (ADR-0025). The object is not the connection: it
+        // owns the bindings, their Provenance and the Home desktop, all of which must
+        // survive every reconnect, so it is built before anything is known about
+        // whether the shell is serving and it is never rebuilt.
+        m_bridge = std::make_unique<VirtualDesktopBridge>(m_hwnd);
+        m_bridge->acquire();
+        if (m_bridge->connected()) {
             m_state.currentWorkspace = m_bridge->currentWorkspace();
-            // Subscribe to the OS's Virtual Desktop notifications on THIS STA
-            // (ADR-0023). The sink only posts k_wmReconcile back to the window
-            // created above; the reconcile itself runs on a clean pump turn, in
-            // onReconcile. A failure is not fatal — the bridge falls back to
-            // reconciling at the top of each workspace operation.
-            if (!m_bridge->startNotifications(m_hwnd))
-                lg::warn("worker: virtual desktop notifications unavailable — external desktop "
-                         "changes will be noticed on the next workspace keypress instead");
+        } else if (m_bridge->availability() == BridgeAvailability::Disconnected) {
+            // The logon race: winspace won, and the shell is not serving yet. This is
+            // recoverable and is retried off the Worker until it lands — a winspace
+            // started before the shell reaches Connected on its own, with no keypress
+            // and no restart needed.
+            m_bridge->requestReacquire();
         }
     }
 
@@ -2459,6 +3172,19 @@ private:
         }
         if (self && msg == k_wmReconcile) {
             self->onReconcile();
+            return 0;
+        }
+        // The shell process exited (ADR-0025). The wait callback did nothing but post
+        // this, so the whole response — dropping the stale proxies and starting the
+        // coalesced rebuild — happens here, on the STA that owns the COM pointers.
+        if (self && msg == k_wmShellLost) {
+            self->m_bridge->onShellLost();
+            return 0;
+        }
+        // The probe proved the shell services answer again; acquire for real on this
+        // STA. ONE message per recovery — nothing periodic joins this pump.
+        if (self && msg == k_wmReacquire) {
+            self->onReacquire();
             return 0;
         }
         if (self && msg == k_wmSetHotkeyThread) {
@@ -2515,8 +3241,22 @@ private:
     // coalesced notifications collapse into one reconcile with no ordering
     // assumptions, because a full re-enumeration is idempotent.
     void onReconcile() {
-        if (!m_bridge) return;
         m_bridge->reconcileDesktops();
+        publishCurrentWorkspace();
+    }
+
+    // A reconnection landed (or did not). Either way the bridge decides; the Worker's
+    // only job afterwards is the same one reconcile has: tell the Reducer where the OS
+    // says we are, if that changed while we were away. A `workspace N` press made
+    // during the outage is NOT replayed here — it was dropped when it happened.
+    void onReacquire() {
+        m_bridge->onReacquireSignal();
+        if (m_bridge->connected()) publishCurrentWorkspace();
+    }
+
+    // Post the one fact the Reducer models — and only if it actually differs, so a
+    // no-op reconcile stays a no-op.
+    void publishCurrentWorkspace() {
         if (const int current = m_bridge->currentWorkspace();
             current != m_state.currentWorkspace)
             postEvent(m_hwnd, new Event{WorkspaceChanged{current}});
@@ -2538,19 +3278,20 @@ private:
                 [&](const SwitchToWorkspace& s) {
                     // The bridge (sole owner: this thread) resolves the Logical
                     // number to a Virtual Desktop GUID and calls SwitchDesktop,
-                    // materializing the workspace on demand. Null bridge (an
-                    // unsupported OS variant) → the switch is a no-op.
-                    if (m_bridge) m_bridge->switchTo(s.logical);
+                    // materializing the workspace on demand. The bridge itself decides
+                    // what a press means while it is Disconnected or Unsupported — the
+                    // Worker no longer tests a pointer to find out whether Virtual
+                    // Desktop support exists (ADR-0025).
+                    m_bridge->switchTo(s.logical);
                 },
                 [&](const CleanupWorkspaces&) {
                     // Emitted immediately BEFORE Exit, so it runs while the COM
-                    // bridge is still alive (ADR-0024). The bridge owns both ordering
-                    // constraints — switch to home first and let it complete, and
-                    // never read the eventually-consistent currentWorkspace — because
-                    // both are I/O sequencing, not a `reduce` concern. Null bridge (an
-                    // unsupported OS variant) → nothing was ever created, so nothing
-                    // to clean.
-                    if (m_bridge) m_bridge->cleanupCreatedDesktops();
+                    // bridge is still alive (ADR-0024). The bridge owns all three
+                    // ordering constraints — derive the cleanup anchor, switch to it
+                    // and let that complete before any removal, and never read the
+                    // eventually-consistent currentWorkspace — because they are I/O
+                    // sequencing, not a `reduce` concern.
+                    m_bridge->cleanupCreatedDesktops();
                 },
                 [&](const Exit&) {
                     // End run()'s loop; the process then unwinds cleanly.
@@ -2609,7 +3350,6 @@ private:
                     // without ever painting it on the current one, so no DWM cloak
                     // is needed (and DWMWA_CLOAK is same-process-only anyway — it
                     // returns E_ACCESSDENIED on a foreign window; ADR-0010 revised).
-                    if (!m_bridge) return;
                     const HWND fg = GetForegroundWindow();
                     if (!fg) {
                         lg::warn("move to workspace {}: no foreground window", m.logical);
@@ -2622,8 +3362,10 @@ private:
                     // Appeared, by id — no GetForegroundWindow, no cloak. The
                     // internal MoveViewToDesktop reassigns the desktop without ever
                     // painting on the current one (ADR-0010 revised), so a
-                    // cross-Workspace pin never flashes here. Null bridge → no-op.
-                    if (m_bridge) m_bridge->moveWindowToWorkspace(m.id, m.logical);
+                    // cross-Workspace pin never flashes here. While the bridge is
+                    // Disconnected this becomes a **Pending move** replayed on
+                    // reconnection, rather than a placement lost forever to Place-once.
+                    m_bridge->moveWindowToWorkspace(m.id, m.logical);
                 },
                 [&](const ResolveDistribute& rd) {
                     // Phase one of the Distribute round-trip (ADR-0020, was Spread's
@@ -2678,28 +3420,13 @@ private:
                     positionWindow(p.id, p.target, p.slot);
                 },
                 [&](const LaunchApp& l) {
-                    // Launch-only (ADR-0011): start a detached child and
-                    // forget it — no PID kept, no Workspace assigned (placement is a
-                    // paired `windowrule`). CreateProcessW itself parses exe + args
-                    // from the command line and searches %PATH%; it WRITES to
-                    // lpCommandLine, so the widened command goes into a mutable
-                    // buffer. cwd/env are inherited (nullptr). On success both handles
-                    // are closed immediately, fully detaching the child so it outlives
-                    // winspace; on failure we degrade-and-log and continue — one bad
-                    // entry never takes down the WM or blocks the others.
-                    std::wstring cmdline = toWide(l.command);
-                    STARTUPINFOW si{};
-                    si.cb = sizeof(si);
-                    PROCESS_INFORMATION pi{};
-                    if (const auto launched =
-                            ok(CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-                                              0, nullptr, nullptr, &si, &pi))) {
-                        CloseHandle(pi.hProcess);
-                        CloseHandle(pi.hThread);
-                    } else {
-                        lg::warn("exec: launch failed for '{}': {}", l.command,
-                                 launched.error());
-                    }
+                    // Launch-only (ADR-0011): start a detached child and forget it —
+                    // no PID kept, no Workspace assigned (placement is a paired
+                    // `windowrule`). The adapter owns the CreateProcessW call and the
+                    // registered-application-path fallback; a failure degrades and
+                    // logs, so one bad entry never takes down the WM or blocks the
+                    // others.
+                    launchDetached(l.command);
                 },
                 [&](const ReloadConfig&) {
                     // Live reload (ADR-0012), executed on THIS thread. Re-read
@@ -2772,7 +3499,11 @@ private:
     HWND m_hwnd = nullptr;
     bool m_comInitialized = false;
     DWORD m_hotkeyThreadId = 0;  // set by k_wmSetHotkeyThread; target of reload's new Binds
-    std::unique_ptr<IVirtualDesktopBridge> m_bridge;  // COM VD bridge; null if unsupported
+    // The COM VD bridge. Constructed unconditionally in the ctor and NEVER null —
+    // absence used to mean "unsupported, permanently", which is the conflation
+    // ADR-0025 removes. Held behind a unique_ptr only so the dtor can release it
+    // before CoUninitialize.
+    std::unique_ptr<VirtualDesktopBridge> m_bridge;
 };
 
 // Worker thread entry. Constructs the Worker (COM + message-only HWND), publishes

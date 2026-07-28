@@ -1,6 +1,6 @@
 # 24. Quit cleanup: destroy every winspace-created desktop, unconditionally
 
-**Status:** Accepted (2026-07-27)
+**Status:** Accepted (2026-07-27); amended (2026-07-28) — see *Amendment: the Cleanup anchor*
 
 ## Context
 
@@ -66,3 +66,62 @@ Cleanup is **unconditional, not empty-only**, and it hangs off a new Effect:
 - The ordered-pair emission follows existing precedent: `MoveToWorkspace` already emits
   `MoveForegroundWindowToWorkspace` before `SwitchToWorkspace` precisely because order
   matters (`winspace.cpp:764-770`).
+
+## Amendment (2026-07-28): the Cleanup anchor
+
+### Context
+
+The decision above says "switch to the **Home desktop** … with home as the `RemoveDesktop`
+fallback", which quietly gives `m_home` **two** jobs that only look like one because, until
+now, home always survived:
+
+- **Home desktop** — *the desktop active at Adoption; where winspace found the user.* A fact
+  about the past, and the polite place to leave someone.
+- **The cleanup anchor** — the desktop cleanup switches to and migrates windows onto. Not a
+  preference but a *requirement*: it must **survive the cleanup**, i.e. not be in `doomed`.
+
+They separate the moment home can vanish — the user destroying it by hand in Task View
+mid-session. `cleanupCreatedDesktops` already degrades safely there (`win32.cpp:1813`: log and
+return), but the consequence is that quit then leaves **every** winspace-created desktop
+standing, which is the accumulation this ADR exists to end.
+
+This surfaced while designing
+[ADR-0025](0025-vd-bridge-liveness-reacquire-on-shell-loss.md), which makes `m_home` persist
+across reconnects. Persistence is not what breaks it — manual destruction is, and that was
+already true.
+
+### Decision
+
+Name the second job and derive it. `m_home` keeps its meaning and is **never re-seeded**. The
+anchor is chosen at quit time by a **pure core function over the bindings**, preferring, in
+order:
+
+1. the **Home desktop**, if it still names a live desktop;
+2. otherwise the lowest-logical **foreign** desktop;
+3. otherwise the lowest-logical desktop.
+
+### Considered options
+
+- **Re-seed `m_home` when it vanishes.** Same runtime behaviour, but it fuses the two jobs
+  permanently and makes Home mean *"where winspace found the user, or wherever we substituted
+  later"* — no longer a fact about anything. It also mutates history to satisfy a need that
+  exists for a few milliseconds at quit, and it can only be exercised through the VM harness.
+- **Re-seed to the currently active desktop.** Rejected: arbitrary, and likely to be one of
+  winspace's own — see below.
+- **Re-seed to logical 1.** Rejected: logical 1 is not guaranteed foreign, so it walks into
+  the same trap.
+
+### Consequences
+
+- **Foreign-first is load-bearing, not a preference.** Cleanup never removes the ground it
+  stands on (`win32.cpp:1836`), so anchoring on a `createdByWinspace` desktop would exempt one
+  of winspace's own from removal — the exact accumulation this ADR forbids. Preferring foreign
+  makes that exemption reachable only in the genuine last resort where *every* desktop is
+  winspace's, where keeping one is unavoidable.
+- **The preference order becomes unit-testable.** As a total function over `DesktopKey`s it
+  sits beside `reconcile` and `desktopsToCleanup` in core, with no COM in it — the third pure
+  policy over the bindings.
+- **The glossary grows by one term** (**Cleanup anchor**), and **Home desktop** must stop
+  implying it is the migration target. The concept being unnamed is why it was wrong.
+- **Still no cleanup when nothing survives.** With no bindings at all there is no anchor and
+  cleanup is skipped, exactly as today.

@@ -98,6 +98,10 @@ exec      = "C:\path with spaces\app.exe"   # run at startup and on every reload
 
 The launcher only *starts* apps; to place one, pair it with a `windowrule` matching its `exe`.
 
+Bare names work the same way they do in the Run dialog: winspace searches `PATH` first, then
+the applications Windows has registered by name — so `exec-once = msedge` works without you
+having to discover an install path.
+
 ### Start at login
 
 ```ini
@@ -106,6 +110,19 @@ start_at_login = true
 
 Then run `winspace install` once. This registers a per-user Task Scheduler logon task; the
 config flag is the single source of truth (installing never enables autostart on its own).
+
+## Diagnostics
+
+winspace is windowless, so it writes its diagnostics to a size-capped file:
+
+```
+%LOCALAPPDATA%\winspace\winspace.log
+```
+
+Attach this to a bug report. It carries the same leveled lines a terminal would show (without
+the colour codes), including anything that happened at login, before you could be watching. The
+file is capped at 1 MiB; when it fills, it rolls once to `winspace.log.1` and starts fresh, so
+the most recent messages are never the ones dropped.
 
 ## Building from source
 

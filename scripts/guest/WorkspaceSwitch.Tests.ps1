@@ -228,6 +228,18 @@ Describe 'workspace-switch' {
                                        -ReadyPattern 'NOT YET IMPLEMENTED'
             $forced = Read-WinspaceLog -Text (Get-WinspaceLogText)
             $forced.ForcedVariantNotImplemented | Should -BeTrue -Because 'a forced stub variant must fail loudly'
+
+            # ADR-0025: **Unsupported** is TERMINAL. Give any retry a bounded window to
+            # show itself, then assert the diagnostic fired exactly once and that
+            # nothing ever reconnected. This is the assertion that keeps Unsupported
+            # from being quietly collapsed back into Disconnected, which would put an
+            # unsupported build into a retry loop forever.
+            Start-Sleep -Seconds 2
+            $text = Get-WinspaceLogText
+            @([regex]::Matches($text, 'NOT YET IMPLEMENTED')).Count | Should -Be 1 `
+                -Because 'a terminal state is diagnosed once, not once per retry'
+            $text | Should -Not -Match 'bridge: reconnected' `
+                -Because 'an unsupported build must never enter the retry loop'
         } catch {
             Save-FailureScreenshot -Name 'variant-diagnostic'
             throw
