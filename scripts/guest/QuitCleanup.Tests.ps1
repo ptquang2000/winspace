@@ -129,7 +129,6 @@ Describe 'quit-cleanup' {
             # One desktop, so home is unambiguous and logical 2 has no binding —
             # the silent move materializes it, making that desktop OURS.
             Set-DesktopCount 1
-            $home = (Get-VdState).CurrentGuid
             $winspace = Start-Winspace
 
             # The runner console is an Eligible top-level window that can hold the
@@ -140,6 +139,16 @@ Describe 'quit-cleanup' {
             Wait-Until -Because 'the test window to be the foreground Origin' -Condition {
                 (Get-ForegroundWindow) -eq $window.Hwnd
             }
+
+            # Home is read off the WINDOW, not the registry. At a single desktop Windows
+            # persists no VirtualDesktopIDs list and no CurrentVirtualDesktop value, so
+            # Get-VdState reports Count 1 (floored) with an EMPTY GUID list and CurrentGuid
+            # [guid]::Empty — reading home from there yields all-zeros and the final
+            # assertion fails as `Expected 00000000-0000-0000-0000-000000000000`.
+            # GetWindowDesktopId is a COM read that answers correctly at one desktop, and
+            # the window's own pre-move desktop IS home by construction: it was created on
+            # the only desktop there was. That is also exactly what the assertion means.
+            $home = Get-WindowDesktopId -Hwnd $window.Hwnd
 
             # Alt+Shift+2 -> movetoworkspacesilent 2: winspace materializes desktop 2
             # (recorded as ours) and parks the window on it.
