@@ -59,16 +59,41 @@ CallWithError(Func&& func, Args&&... args)
 internal LRESULT CALLBACK
 LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-	auto vkCode = static_cast<int>(wParam);
-	switch (vkCode)
+	switch (wParam)
 	{
-		case WM_KEYDOWN:
-		case WM_KEYUP:
 		case WM_SYSKEYDOWN: 
 		case WM_SYSKEYUP:
-			break;
+		case WM_KEYDOWN:
+		case WM_KEYUP:
+		{
+			auto kbDllHook = *reinterpret_cast<
+				PKBDLLHOOKSTRUCT>(lParam);
+			u32 vkCode = static_cast<u32>(kbDllHook.vkCode);
+			u32 flags = static_cast<u32>(kbDllHook.flags);
+			bool isPressed = ((flags & LLKHF_UP) != 0);
+			if (isPressed)
+			{
+				if (vkCode == 'H')
+				{
+					OutputDebugStringA("H is pressed\n");
+				}
+				else if (vkCode == 'J')
+				{
+					OutputDebugStringA("J is pressed\n");
+				}
+				else if (vkCode == 'K')
+				{
+					OutputDebugStringA("K is pressed\n");
+				}
+				else if (vkCode == 'L')
+				{
+					OutputDebugStringA("L is pressed\n");
+				}
+			}
+		} break;
 		default:
-			break;
+		{
+		} break;
 	}
 	return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
@@ -94,12 +119,8 @@ WinMain(HINSTANCE hPrevInstance,
 		while (!running.stop_requested())
 		{
 			MSG msg{};
-			while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE))
+			while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE))
 			{
-				if (msg.message == WM_QUIT)
-				{
-					g_running.request_stop();
-				}
 				TranslateMessage(&msg);
 				DispatchMessageA(&msg);
 			}
