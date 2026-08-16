@@ -21,7 +21,6 @@ global std::stop_source g_running;
 
 enum class winspace_err : u64
 {
-	Success,
 	LastError,
 };
 
@@ -40,11 +39,10 @@ CallWithError(Func&& func, Args&&... args)
 		{
 			return r;
 		}
-		auto ec = GetLastError();
 		LPSTR buffer = nullptr;
 		if (auto bufSize = FormatMessageA(
 			FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM,
-			nullptr, 0, 0, buffer, 0, nullptr
+			nullptr, GetLastError(), 0, (LPSTR)&buffer, 0, nullptr
 		); bufSize != 0)
 		{
 			OutputDebugStringA(buffer);
@@ -68,6 +66,7 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 		case WM_KEYUP:
 		case WM_SYSKEYDOWN: 
 		case WM_SYSKEYUP:
+			break;
 		default:
 			break;
 	}
@@ -86,10 +85,10 @@ WinMain(HINSTANCE hPrevInstance,
 	if (auto hookExp = CallWithError<winspace_err::LastError>(
 				SetWindowsHookExA,
 				WH_KEYBOARD_LL,
-				&LowLevelKeyboardProc,
-				nullptr,
-				GetCurrentThreadId()
-				); hookExp)
+				LowLevelKeyboardProc,
+				GetModuleHandleA(nullptr),
+				0
+	); hookExp.has_value())
 	{
 		auto hook = hookExp.value();
 		while (!running.stop_requested())
