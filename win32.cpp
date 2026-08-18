@@ -69,7 +69,7 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
             u32 vkCode = static_cast<u32>(kbDllHook.vkCode);
             u32 flags = static_cast<u32>(kbDllHook.flags);
-            if (bool isPressed = ((flags & LLKHF_UP) != 0); isPressed)
+            if (bool isPressed = ((flags & LLKHF_UP) == 0); isPressed)
             {
                 if (vkCode == 'H')
                 {
@@ -116,10 +116,14 @@ WinMain(HINSTANCE hPrevInstance,
         while (!running.stop_requested())
         {
             MSG msg{};
-            while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE))
+            if (GetMessageA(&msg, 0, 0, 0) > 0)
             {
                 TranslateMessage(&msg);
                 DispatchMessageA(&msg);
+            }
+            else
+            {
+                g_running.request_stop();
             }
         }
         UnhookWindowsHookEx(hook);
