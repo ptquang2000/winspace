@@ -5,6 +5,8 @@
 #include <stop_token>
 #include <string>
 
+#define WM_KEYBOARD WM_USER
+
 #define internal	static
 #define global		static
 
@@ -66,28 +68,7 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         case WM_KEYDOWN:
         case WM_KEYUP:
         {
-            auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
-            u32 vkCode = static_cast<u32>(kbDllHook.vkCode);
-            u32 flags = static_cast<u32>(kbDllHook.flags);
-            if (bool isPressed = ((flags & LLKHF_UP) == 0); isPressed)
-            {
-                if (vkCode == 'H')
-                {
-                    OutputDebugStringA("H is pressed\n");
-                }
-                else if (vkCode == 'J')
-                {
-                    OutputDebugStringA("J is pressed\n");
-                }
-                else if (vkCode == 'K')
-                {
-                    OutputDebugStringA("K is pressed\n");
-                }
-                else if (vkCode == 'L')
-                {
-                    OutputDebugStringA("L is pressed\n");
-                }
-            }
+            PostMessageA(nullptr, WM_KEYBOARD, wParam, lParam);
         } break;
         default:
         {
@@ -118,8 +99,47 @@ WinMain(HINSTANCE hPrevInstance,
             MSG msg{};
             if (GetMessageA(&msg, 0, 0, 0) > 0)
             {
-                TranslateMessage(&msg);
-                DispatchMessageA(&msg);
+                switch(msg.message)
+                {
+                    case WM_QUIT:
+                    {
+                        g_running.request_stop();
+                    } break;
+
+                    case WM_KEYBOARD:
+                    {
+                        auto kbDllHook = *reinterpret_cast<
+                            PKBDLLHOOKSTRUCT>(msg.lParam);
+                        u32 vkCode = static_cast<u32>(kbDllHook.vkCode);
+                        u32 flags = static_cast<u32>(kbDllHook.flags);
+                        if (bool isPressed = ((flags & LLKHF_UP) == 0
+                        ); isPressed)
+                        {
+                            if (vkCode == 'H')
+                            {
+                                OutputDebugStringA("H is pressed\n");
+                            }
+                            else if (vkCode == 'J')
+                            {
+                                OutputDebugStringA("J is pressed\n");
+                            }
+                            else if (vkCode == 'K')
+                            {
+                                OutputDebugStringA("K is pressed\n");
+                            }
+                            else if (vkCode == 'L')
+                            {
+                                OutputDebugStringA("L is pressed\n");
+                            }
+                        }
+                    } break;
+
+                    default:
+                    {
+                        TranslateMessage(&msg);
+                        DispatchMessageA(&msg);
+                    } break;
+                }
             }
             else
             {
