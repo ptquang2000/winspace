@@ -1,6 +1,8 @@
 #include <windows.h>
 
+#include <deque>
 #include <expected>
+#include <format>
 #include <functional>
 #include <stop_token>
 #include <string>
@@ -19,12 +21,21 @@
 #define u32		uint32_t
 #define u64		uint64_t
 
-global std::stop_source g_running;
+struct KeyboardInputEvent
+{
+    u32 time;
+    u32 key;
+    bool isPressed;
+    bool isAltPressed;
+};
 
 enum class winspace_err : u64
 {
     LastError,
 };
+
+global std::stop_source g_running;
+global std::deque<KeyboardInputEvent> g_keyboardInputEvents;
 
 template<winspace_err Error, typename Func, typename... Args>
 internal auto
@@ -68,7 +79,15 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         case WM_KEYDOWN:
         case WM_KEYUP:
         {
-            PostMessageA(nullptr, WM_KEYBOARD, wParam, lParam);
+            auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
+            u32 flags = static_cast<u32>(kbDllHook.flags);
+            g_keyboardInputEvents.push_back(KeyboardInputEvent{ 
+                    .time = static_cast<u32>(kbDllHook.time),
+                    .key = static_cast<u32>(kbDllHook.vkCode),
+                    .isPressed = ((flags & LLKHF_UP) == 0),
+                    .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
+            });
+            PostMessageA(nullptr, WM_KEYBOARD, 0, 0);
         } break;
         default:
         {
@@ -83,73 +102,53 @@ WinMain(HINSTANCE hPrevInstance,
         LPSTR lpCmdLine,
         int nShowCmd)
 {
-    auto running = g_running.get_token();
-
-    if (auto hookExp = CallWithError<winspace_err::LastError>(
+    auto hookExp = CallWithError<winspace_err::LastError>(
         SetWindowsHookExA,
         WH_KEYBOARD_LL,
         LowLevelKeyboardProc,
         GetModuleHandleA(nullptr),
-        0
-    ); hookExp.has_value())
+        0);
+    if (!hookExp.has_value())
     {
-        auto hook = hookExp.value();
-        while (!running.stop_requested())
-        {
-            MSG msg{};
-            if (GetMessageA(&msg, 0, 0, 0) > 0)
-            {
-                switch(msg.message)
-                {
-                    case WM_QUIT:
-                    {
-                        g_running.request_stop();
-                    } break;
-
-                    case WM_KEYBOARD:
-                    {
-                        auto kbDllHook = *reinterpret_cast<
-                            PKBDLLHOOKSTRUCT>(msg.lParam);
-                        u32 vkCode = static_cast<u32>(kbDllHook.vkCode);
-                        u32 flags = static_cast<u32>(kbDllHook.flags);
-                        if (bool isPressed = ((flags & LLKHF_UP) == 0
-                        ); isPressed)
-                        {
-                            if (vkCode == 'H')
-                            {
-                                OutputDebugStringA("H is pressed\n");
-                            }
-                            else if (vkCode == 'J')
-                            {
-                                OutputDebugStringA("J is pressed\n");
-                            }
-                            else if (vkCode == 'K')
-                            {
-                                OutputDebugStringA("K is pressed\n");
-                            }
-                            else if (vkCode == 'L')
-                            {
-                                OutputDebugStringA("L is pressed\n");
-                            }
-                        }
-                    } break;
-
-                    default:
-                    {
-                        TranslateMessage(&msg);
-                        DispatchMessageA(&msg);
-                    } break;
-                }
-            }
-            else
-            {
-                g_running.request_stop();
-            }
-        }
-        UnhookWindowsHookEx(hook);
-        return 0;
+        OutputDebugStringA("Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
+        return 1;
     }
 
-    OutputDebugStringA("Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
-    return 1;
+    auto hook = hookExp.value();
+    auto running = g_running.get_token();
+    while (!running.stop_requested())
+    {
+        MSG msg{};
+        if (GetMessageA(&msg, 0, 0, 0) < 0)
+        {
+            g_running.request_stop();
+            continue;
+        }
+
+        switch(msg.message)
+        {
+            case WM_QUIT:
+            {
+                g_running.request_stop();
+            } break;
+
+            case WM_KEYBOARD:
+            {
+                auto inputEvent = g_keyboardInputEvents.front();
+                OutputDebugStringA(std::format("{} is {}\n", 
+                        inputEvent.key,
+                        inputEvent.isPressed ? "pressed" : "released"
+                    ).c_str());
+                g_keyboardInputEvents.pop_front();
+            } break;
+
+            default:
+            {
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            } break;
+        }
+    }
+    UnhookWindowsHookEx(hook);
+    return 0;
 }
