@@ -125,7 +125,7 @@ ProcessKeyboardInput(keyboard::input keyboardInput,
 }
 } // win32
 
-internal VOID 
+internal VOID CALLBACK
 Wineventproc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
             LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
 {
