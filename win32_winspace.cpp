@@ -6,9 +6,11 @@
 #include <format>
 #include <functional>
 #include <ranges>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 #define internal	static
 #define global		static
@@ -33,45 +35,6 @@ enum class error : u64
     LastError,
     NullHandle,
 };
-
-namespace keyboard
-{
-struct input
-{
-    u32 time;
-    u32 key;
-    bool isPressed;
-    bool isAltPressed;
-};
-global std::deque<input> g_keyboardInputs;
-
-internal LRESULT CALLBACK
-LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    switch (wParam)
-    {
-        case WM_SYSKEYDOWN: 
-        case WM_SYSKEYUP:
-        case WM_KEYDOWN:
-        case WM_KEYUP:
-        {
-            auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
-            u32 flags = static_cast<u32>(kbDllHook.flags);
-            g_keyboardInputs.push_back(input{ 
-                    .time = static_cast<u32>(kbDllHook.time),
-                    .key = static_cast<u32>(kbDllHook.vkCode),
-                    .isPressed = ((flags & LLKHF_UP) == 0),
-                    .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
-            });
-            PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, 0, 0);
-        } break;
-        default:
-        {
-        } break;
-    }
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
-}
-} // keyboard_lowlevel
 
 template<error Error, typename Func, typename... Args>
 internal auto
@@ -115,6 +78,45 @@ CallWithError(Func&& func, Args&&... args)
     }
 }
 
+namespace keyboard
+{
+struct input
+{
+    u32 time;
+    u32 key;
+    bool isPressed;
+    bool isAltPressed;
+};
+global std::deque<input> g_keyboardInputs;
+
+internal LRESULT CALLBACK
+LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    switch (wParam)
+    {
+        case WM_SYSKEYDOWN: 
+        case WM_SYSKEYUP:
+        case WM_KEYDOWN:
+        case WM_KEYUP:
+        {
+            auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
+            u32 flags = static_cast<u32>(kbDllHook.flags);
+            g_keyboardInputs.push_back(input{ 
+                    .time = static_cast<u32>(kbDllHook.time),
+                    .key = static_cast<u32>(kbDllHook.vkCode),
+                    .isPressed = ((flags & LLKHF_UP) == 0),
+                    .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
+            });
+            PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, 0, 0);
+        } break;
+        default:
+        {
+        } break;
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+} // keyboard_lowlevel
+
 struct controller_input
 {
     struct input_state
@@ -142,10 +144,11 @@ ProcessKeyboardInput(keyboard::input keyboardInput,
     oldInput.wasDown = keyboardInput.isPressed;
     oldInput.lastChangedTime = keyboardInput.time;
 }
-} // win32
 
+namespace window
+{
 internal VOID CALLBACK
-Wineventproc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
+WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
             LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
 {
     switch(event)
@@ -466,7 +469,56 @@ Wineventproc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
         } break;
     }
 }
+} // window
 
+namespace winspace
+{
+enum class command : u32
+{
+    StartProcess,
+    CloseWindow,
+};
+
+struct dispatch_command
+{
+    command type;
+    union
+    {
+        std::string_view commandLine;
+        HWND hWnd;
+    };
+};
+
+struct keybindings
+{
+    std::span<std::vector<u32>> keys;
+    std::span<dispatch_command> commands;
+};
+
+void
+ExecuteCommand(dispatch_command command)
+{
+    switch (command.type)
+    {
+        case command::StartProcess:
+        {
+            STARTUPINFOA startupInfo;
+            PROCESS_INFORMATION processInformation;
+            CreateProcessA(
+                nullptr, const_cast<LPSTR>(command.commandLine.data()), nullptr, 
+                nullptr, false, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
+                &startupInfo, &processInformation);
+        } break;
+        case command::CloseWindow:
+        {
+        } break;
+        default:
+        {
+        } break;
+    }
+}
+} // winspace
+} // win32
 
 int APIENTRY
 WinMain(HINSTANCE hPrevInstance,
@@ -474,11 +526,39 @@ WinMain(HINSTANCE hPrevInstance,
         LPSTR lpCmdLine,
         int nShowCmd)
 {
+    using namespace win32;
     g_mainThreadId = GetCurrentThreadId();
+
+    std::vector<std::vector<u32>> defaultKeybindings =
+    {
+      {VK_MENU, 'E'},
+      {VK_MENU, VK_RETURN},
+      {VK_MENU, 'W'},
+    };
+    std::vector<winspace::dispatch_command> defaultCommands =
+    {
+        {
+            .type = winspace::command::StartProcess,
+            .commandLine = "C:\\Windows\\explorer.exe",
+        },
+        {
+            .type = winspace::command::StartProcess,
+            .commandLine = 
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        },
+        {
+            .type= winspace::command::CloseWindow,
+            .hWnd = 0,
+        },
+    };
+    winspace::keybindings keybindings{
+        .keys = defaultKeybindings,
+        .commands = defaultCommands,
+    };
 
     auto winEventHookExp = win32::CallWithError<win32::error::NullHandle>(
         SetWinEventHook, 
-        EVENT_MIN, EVENT_MAX, nullptr, Wineventproc, 0, 0,
+        EVENT_MIN, EVENT_MAX, nullptr, window::WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (!winEventHookExp.has_value())
     {
@@ -532,6 +612,17 @@ WinMain(HINSTANCE hPrevInstance,
                 ProcessKeyboardInput(
                         keyboard::g_keyboardInputs.front(), controllerInput);
                 keyboard::g_keyboardInputs.pop_front();
+                for (size_t keybindingIndex = 0;
+                    keybindingIndex < defaultKeybindings.size();
+                    keybindingIndex++)
+                {
+                    auto key = defaultKeybindings[keybindingIndex].back();
+                    if (controllerInput.vkeys[key].wasDown)
+                    {
+                      winspace::ExecuteCommand(
+                          defaultCommands[keybindingIndex]);
+                    }
+                }
             } break;
 
             default:
