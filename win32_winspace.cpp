@@ -24,8 +24,10 @@
 #define u16		uint16_t
 #define u32		uint32_t
 #define u64		uint64_t
+#define uptr  uintptr_t
 
 #define WM_KEYBOARD WM_USER
+#define WM_WINEVENT WM_USER + 1
 
 global DWORD g_mainThreadId;
 
@@ -88,7 +90,6 @@ struct input
   bool isPressed;
   bool isAltPressed;
 };
-global std::deque<input> g_keyboardInputs;
 
 internal LRESULT CALLBACK
 LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -102,13 +103,13 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
   {
     auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
     u32 flags = static_cast<u32>(kbDllHook.flags);
-    g_keyboardInputs.push_back(input{ 
+    auto newInput = reinterpret_cast<WPARAM>(new input{ 
       .time = static_cast<u32>(kbDllHook.time),
       .key = static_cast<u32>(kbDllHook.vkCode),
       .isPressed = ((flags & LLKHF_UP) == 0),
       .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
     });
-    PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, 0, 0);
+    PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, newInput, 0);
   } break;
   default:
   {
@@ -120,38 +121,89 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 
 struct controller_input
 {
-struct input_state
+struct state
 {
   int lastChangedTime;
   bool wasDown;
 };
-std::array<input_state, VK_OEM_CLEAR> vkeys;
+std::array<state, VK_OEM_CLEAR> vkeys;
 };
 
 void
-ProcessKeyboardInput(keyboard::input keyboardInput,
-                     controller_input& controllerInput)
+ProcessKeyboardInput(keyboard::input *keyboardInput,
+                    controller_input& controllerInput)
 {
-  auto &oldInput = controllerInput.vkeys[keyboardInput.key];
-  if (keyboardInput.isPressed == oldInput.wasDown)
+  auto key = keyboardInput->key;
+  auto &oldInput = controllerInput.vkeys[key];
+  if (keyboardInput->isPressed == oldInput.wasDown)
   {
     return;
   }
-  oldInput.wasDown = keyboardInput.isPressed;
-  oldInput.lastChangedTime = keyboardInput.time;
-  OutputDebugStringA(std::format("{} is {} at {}\n", 
-        keyboardInput.key,
-        oldInput.wasDown ? "down" : "up",
-        oldInput.lastChangedTime
-        ).c_str());
+  oldInput.wasDown = keyboardInput->isPressed;
+  oldInput.lastChangedTime = keyboardInput->time;
+  // OutputDebugStringA(std::format("{} is {} at {}\n", 
+  //       key,
+  //       oldInput.wasDown ? "down" : "up",
+  //       oldInput.lastChangedTime
+  //       ).c_str());
 }
 
 namespace window
 {
+struct event
+{
+  HWND handle;
+  DWORD time;
+  bool isFocused;
+  bool isShown;
+  bool isDestroyed;
+};
+
+bool isRealWindow(HWND hwnd, LONG idObject, LONG idChild)
+{
+  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
+  {
+    return false;
+  }
+  if (!IsWindow(hwnd) || !IsWindowVisible(hwnd))
+  {
+    return false;
+  }
+  if (GetWindow(hwnd, GW_OWNER) != NULL) 
+  {
+    return false;
+  }
+
+  LONG_PTR exStyle = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+  if (exStyle & WS_EX_TOOLWINDOW)
+  {
+    return false;
+  }
+
+  std::string className(256, 0);
+  if (GetClassNameA(hwnd, className.data(), static_cast<int>(className.size())))
+  {
+    if (className == "Progman" || className == "WorkerW")
+    {
+      return false;
+    }
+  }
+
+  OutputDebugStringA(className.c_str());
+  return true;
+}
+
 internal VOID CALLBACK
 WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
             LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
 {
+  window::event windowEvent = {
+    .handle = hwnd,
+    .time = dwmsEventTime,
+  };
+  const auto cloneEvent = [&windowEvent](){
+    return reinterpret_cast<WPARAM>(new window::event{windowEvent});
+  };
   switch(event)
   {
     case EVENT_SYSTEM_SOUND:
@@ -164,8 +216,10 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     } break;
     case EVENT_SYSTEM_FOREGROUND:
     {
-      // TODO: early indicator???
-      OutputDebugStringA("system foreground\n");
+      // NOTE: this window is on top???
+      // OutputDebugStringA(std::format("system foreground {}\n", reinterpret_cast<uptr>(hwnd)).c_str());
+      windowEvent.isFocused = true;
+      PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
     case EVENT_SYSTEM_MENUSTART:
     {
@@ -305,18 +359,23 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     } break;
     case EVENT_OBJECT_CREATE:
     {
-      // XXX: noise
+      // XXX: a window is created
       // OutputDebugStringA("object create\n");
     } break;
     case EVENT_OBJECT_DESTROY:
     {
-      // XXX: noise
-      // OutputDebugStringA("object destroy\n");
+      // NOTE: may not apply for crash/kill.
+      // windowEvent.isDestroyed = true;
+      // PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
     case EVENT_OBJECT_SHOW:
     {
-      // XXX: noise
-      // OutputDebugStringA("object show\n");
+      if (isRealWindow(hwnd, idObject, idChild))
+      {
+        windowEvent.isShown = true;
+        PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
+        OutputDebugStringA(std::format("object show {}\n", reinterpret_cast<uptr>(hwnd)).c_str());
+      }
     } break;
     case EVENT_OBJECT_HIDE:
     {
@@ -330,13 +389,13 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     } break;
     case EVENT_OBJECT_FOCUS:
     {
-      // XXX: little noise
+      // XXX: child element has keyboard focus
       // OutputDebugStringA("object focus\n");
     } break;
     case EVENT_OBJECT_SELECTION:
     {
       // TODO: enter ???
-      OutputDebugStringA("object selection\n");
+      // OutputDebugStringA("object selection\n");
     } break;
     case EVENT_OBJECT_SELECTIONADD:
     {
@@ -345,7 +404,7 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_OBJECT_SELECTIONREMOVE:
     {
       // TODO: quit ???
-      OutputDebugStringA("object selection remove\n");
+      // OutputDebugStringA("object selection remove\n");
     } break;
     case EVENT_OBJECT_SELECTIONWITHIN:
     {
@@ -368,7 +427,7 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     } break;
     case EVENT_OBJECT_DESCRIPTIONCHANGE:
     {
-      OutputDebugStringA("object description change\n");
+      // OutputDebugStringA("object description change\n");
     } break;
     case EVENT_OBJECT_VALUECHANGE:
     {
@@ -472,6 +531,38 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
 }
 } // window
 
+struct window_state
+{
+  struct status
+  {
+    u32 lastUpdatedTime;
+    u32 topLevelCount;
+    std::string title;
+  };
+  std::unordered_map<uptr, status> windows;
+};
+
+internal void
+ProcessWindowEvent(window::event *newEvent, window_state& states)
+{
+  auto key = reinterpret_cast<uptr>(newEvent->handle);
+  if (newEvent->isDestroyed)
+  {
+    states.windows.erase(key);
+    return;
+  }
+  auto [it, isWindowNew] = states.windows.try_emplace(key);
+  auto &[_, state] = *it;
+  state.lastUpdatedTime = static_cast<u32>(newEvent->time);
+  if (!isWindowNew)
+  {
+    state.topLevelCount += newEvent->isFocused ? 1 : 0;
+  }
+  if (newEvent->isShown)
+  {
+  }
+}
+
 namespace winspace
 {
 enum class command : u32
@@ -486,12 +577,11 @@ command type;
 union
 {
   std::string_view commandLine;
-  HWND hWnd;
 };
 };
 
 void
-ExecuteCommand(dispatch_command command)
+ExecuteCommand(dispatch_command command, uptr hwnd)
 {
   switch (command.type)
   {
@@ -506,6 +596,7 @@ ExecuteCommand(dispatch_command command)
       } break;
     case command::CloseWindow:
       {
+        PostMessageA(reinterpret_cast<HWND>(hwnd), WM_CLOSE, 0, 0);
       } break;
     default:
       {
@@ -513,45 +604,58 @@ ExecuteCommand(dispatch_command command)
   }
 }
 
-persistent std::array<std::array<u32, 2>, 3> defaultKeybindings =
-{{
-  {VK_LMENU, 'E'},
-  {VK_LMENU, VK_RETURN},
-  {VK_LMENU, 'W'},
-}};
+persistent auto k_openExplorer = std::to_array<u32>({VK_LMENU, 'E'});
+persistent auto k_openPowershell = std::to_array<u32>({VK_LMENU, VK_RETURN});
+persistent auto k_closeWindow = std::to_array<u32>({VK_LMENU, 'W'});
+persistent auto k_defaultKeybindings = std::to_array<std::span<const u32>>({
+    k_openExplorer,
+    k_openPowershell,
+    k_closeWindow,
+    });
 
-persistent std::array<winspace::dispatch_command, 3> defaultCommands =
-{{
-  {
+internal auto k_defaultCommands = std::to_array<winspace::dispatch_command>({
+    {
     .type = winspace::command::StartProcess,
     .commandLine = "C:\\Windows\\explorer.exe",
-  },
-  {
+    },
+    {
     .type = winspace::command::StartProcess,
     .commandLine = 
-      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-  },
-  {
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    },
+    {
     .type= winspace::command::CloseWindow,
-    .hWnd = 0,
-  },
-}};
+    },
+    });
 
 void
-DispatchCommand(controller_input& controllerInput)
+DispatchCommand(controller_input& controllerInput, window_state &windowState)
 {
+  uptr focusWindow = 0;
+  for (auto &[key, window] : windowState.windows)
+  {
+    if (focusWindow == 0)
+    {
+      focusWindow = key;
+    }
+    else if (window.topLevelCount > windowState.windows[focusWindow].topLevelCount)
+    {
+      focusWindow = key;
+    }
+  }
+
   for (size_t keyBindingIndex = 0;
-      keyBindingIndex < defaultKeybindings.size();
+      keyBindingIndex < k_defaultKeybindings.size();
       keyBindingIndex++)
   {
     bool shouldExecute = true;
-    for (auto key : defaultKeybindings[keyBindingIndex])
+    for (auto key : k_defaultKeybindings[keyBindingIndex])
     {
       shouldExecute &= controllerInput.vkeys[key].wasDown;
     }
     if (shouldExecute)
     {
-      ExecuteCommand(defaultCommands[keyBindingIndex]);
+      ExecuteCommand(k_defaultCommands[keyBindingIndex], focusWindow);
     }
   }
 }
@@ -603,6 +707,7 @@ WinMain(HINSTANCE hPrevInstance,
   });
 
   auto controllerInput = win32::controller_input{};
+  auto windowStates = win32::window_state{};
   bool running = true;
   while (running)
   {
@@ -620,10 +725,17 @@ WinMain(HINSTANCE hPrevInstance,
       using namespace win32;
       case WM_KEYBOARD:
       {
-        ProcessKeyboardInput(keyboard::g_keyboardInputs.front(),
-                            controllerInput);
-        keyboard::g_keyboardInputs.pop_front();
-        winspace::DispatchCommand(controllerInput);
+        auto keyboardInput = reinterpret_cast<keyboard::input *>(msg.wParam);
+        ProcessKeyboardInput(keyboardInput, controllerInput);
+        winspace::DispatchCommand(controllerInput, windowStates);
+        delete keyboardInput;
+      } break;
+
+      case WM_WINEVENT:
+      {
+        auto newWindowEvent = reinterpret_cast<window::event *>(msg.wParam);
+        ProcessWindowEvent(newWindowEvent, windowStates);
+        delete newWindowEvent;
       } break;
 
       default:
