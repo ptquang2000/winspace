@@ -12,13 +12,14 @@
 #include <thread>
 #include <vector>
 
-#define internal	static
-#define global		static
+#define internal    static
+#define global      static
+#define persistent  static constexpr
 
 #define i8		int8_t
-#define i6		int16_t
-#define i2		int32_t
-#define i4		int64_t
+#define i16		int16_t
+#define i32		int32_t
+#define i64		int64_t
 #define u8		uint8_t
 #define u16		uint16_t
 #define u32		uint32_t
@@ -136,13 +137,13 @@ ProcessKeyboardInput(keyboard::input keyboardInput,
   {
     return;
   }
-  OutputDebugStringA(std::format("{} is {} at {}\n", 
-        keyboardInput.key,
-        keyboardInput.isPressed ? "pressed" : "released",
-        keyboardInput.time
-        ).c_str());
   oldInput.wasDown = keyboardInput.isPressed;
   oldInput.lastChangedTime = keyboardInput.time;
+  OutputDebugStringA(std::format("{} is {} at {}\n", 
+        keyboardInput.key,
+        oldInput.wasDown ? "down" : "up",
+        oldInput.lastChangedTime
+        ).c_str());
 }
 
 namespace window
@@ -489,32 +490,69 @@ union
 };
 };
 
-struct keybindings
-{
-  std::span<std::vector<u32>> keys;
-  std::span<dispatch_command> commands;
-};
-
 void
 ExecuteCommand(dispatch_command command)
 {
   switch (command.type)
   {
     case command::StartProcess:
-    {
-      STARTUPINFOA startupInfo;
-      PROCESS_INFORMATION processInformation;
-      CreateProcessA(
-          nullptr, const_cast<LPSTR>(command.commandLine.data()), nullptr, 
-          nullptr, false, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
-          &startupInfo, &processInformation);
-    } break;
+      {
+        STARTUPINFOA startupInfo{};
+        PROCESS_INFORMATION processInformation{};
+        CreateProcessA(
+            nullptr, const_cast<LPSTR>(command.commandLine.data()), nullptr, 
+            nullptr, false, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
+            &startupInfo, &processInformation);
+      } break;
     case command::CloseWindow:
-    {
-    } break;
+      {
+      } break;
     default:
+      {
+      } break;
+  }
+}
+
+persistent std::array<std::array<u32, 2>, 3> defaultKeybindings =
+{{
+  {VK_LMENU, 'E'},
+  {VK_LMENU, VK_RETURN},
+  {VK_LMENU, 'W'},
+}};
+
+persistent std::array<winspace::dispatch_command, 3> defaultCommands =
+{{
+  {
+    .type = winspace::command::StartProcess,
+    .commandLine = "C:\\Windows\\explorer.exe",
+  },
+  {
+    .type = winspace::command::StartProcess,
+    .commandLine = 
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  },
+  {
+    .type= winspace::command::CloseWindow,
+    .hWnd = 0,
+  },
+}};
+
+void
+DispatchCommand(controller_input& controllerInput)
+{
+  for (size_t keyBindingIndex = 0;
+      keyBindingIndex < defaultKeybindings.size();
+      keyBindingIndex++)
+  {
+    bool shouldExecute = true;
+    for (auto key : defaultKeybindings[keyBindingIndex])
     {
-    } break;
+      shouldExecute &= controllerInput.vkeys[key].wasDown;
+    }
+    if (shouldExecute)
+    {
+      ExecuteCommand(defaultCommands[keyBindingIndex]);
+    }
   }
 }
 } // winspace
@@ -528,33 +566,6 @@ WinMain(HINSTANCE hPrevInstance,
 {
   using namespace win32;
   g_mainThreadId = GetCurrentThreadId();
-
-  std::vector<std::vector<u32>> defaultKeybindings =
-  {
-    {VK_MENU, 'E'},
-    {VK_MENU, VK_RETURN},
-    {VK_MENU, 'W'},
-  };
-  std::vector<winspace::dispatch_command> defaultCommands =
-  {
-    {
-      .type = winspace::command::StartProcess,
-      .commandLine = "C:\\Windows\\explorer.exe",
-    },
-    {
-      .type = winspace::command::StartProcess,
-      .commandLine = 
-        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    },
-    {
-      .type= winspace::command::CloseWindow,
-      .hWnd = 0,
-    },
-  };
-  winspace::keybindings keybindings{
-    .keys = defaultKeybindings,
-      .commands = defaultCommands,
-  };
 
   auto winEventHookExp = win32::CallWithError<win32::error::NullHandle>(
       SetWinEventHook, 
@@ -612,17 +623,7 @@ WinMain(HINSTANCE hPrevInstance,
         ProcessKeyboardInput(keyboard::g_keyboardInputs.front(),
                             controllerInput);
         keyboard::g_keyboardInputs.pop_front();
-        for (size_t keybindingIndex = 0;
-            keybindingIndex < defaultKeybindings.size();
-            keybindingIndex++)
-        {
-          auto key = defaultKeybindings[keybindingIndex].back();
-          if (controllerInput.vkeys[key].wasDown)
-          {
-            winspace::ExecuteCommand(
-                defaultCommands[keybindingIndex]);
-          }
-        }
+        winspace::DispatchCommand(controllerInput);
       } break;
 
       default:
