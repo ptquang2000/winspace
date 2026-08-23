@@ -15,7 +15,15 @@ vim.keymap.set("n", "<leader>m", function()
 	vim.api.nvim_buf_set_name(new_buf, "winspace://build")
 
 	if not (build_win and vim.api.nvim_win_is_valid(build_win)) then
-		build_win = vim.api.nvim_open_win(new_buf, false, { split = "right", win = -1 })
+		local wins = vim.api.nvim_tabpage_list_wins(0)
+		if #wins == 1 then
+			build_win = vim.api.nvim_open_win(new_buf, false, { split = "right", win = -1 })
+		else
+			local cur_win = vim.api.nvim_get_current_win()
+			build_win = vim.iter(wins):find(function(w)
+				return w ~= cur_win
+			end)
+		end
 	else
 		vim.api.nvim_win_set_buf(build_win, new_buf)
 	end
