@@ -24,7 +24,6 @@
 #define u16		uint16_t
 #define u32		uint32_t
 #define u64		uint64_t
-#define uptr  uintptr_t
 
 #define WM_KEYBOARD WM_USER
 #define WM_WINEVENT WM_USER + 1
@@ -47,17 +46,17 @@ CallWithError(Func&& func, Args&&... args)
   if constexpr (Error == win32::error::LastError)
   {
     if (auto r = std::invoke(
-        func,
-        std::forward<Args>(args)...
-    ); r != nullptr)
+          func,
+          std::forward<Args>(args)...
+          ); r != nullptr)
     {
       return r;
     }
     LPSTR buffer = nullptr;
     if (auto bufSize = FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM,
-        nullptr, GetLastError(), 0, (LPSTR)&buffer, 0, nullptr
-    ); bufSize != 0)
+          FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM,
+          nullptr, GetLastError(), 0, (LPSTR)&buffer, 0, nullptr
+          ); bufSize != 0)
     {
       OutputDebugStringA(buffer);
       LocalFree(buffer);
@@ -67,9 +66,9 @@ CallWithError(Func&& func, Args&&... args)
   else if constexpr (Error == win32::error::NullHandle)
   {
     if (auto handle = std::invoke(
-        func,
-        std::forward<Args>(args)...
-    ); handle != 0)
+          func,
+          std::forward<Args>(args)...
+          ); handle != 0)
     {
       return handle;
     }
@@ -79,6 +78,14 @@ CallWithError(Func&& func, Args&&... args)
   {
     static_assert(0, "unhandle error");
   }
+}
+
+template<typename... Args>
+internal void
+PrintDebug(std::format_string<Args...> formatString, Args&&... args)
+{
+  auto message = std::format(formatString, std::forward<Args>(args)...) + '\n';
+  OutputDebugStringA(message.c_str());
 }
 
 namespace keyboard
@@ -96,24 +103,25 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
   switch (wParam)
   {
-  case WM_SYSKEYDOWN: 
-  case WM_SYSKEYUP:
-  case WM_KEYDOWN:
-  case WM_KEYUP:
-  {
-    auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
-    u32 flags = static_cast<u32>(kbDllHook.flags);
-    auto newInput = reinterpret_cast<WPARAM>(new input{ 
-      .time = static_cast<u32>(kbDllHook.time),
-      .key = static_cast<u32>(kbDllHook.vkCode),
-      .isPressed = ((flags & LLKHF_UP) == 0),
-      .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
-    });
-    PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, newInput, 0);
-  } break;
-  default:
-  {
-  } break;
+    case WM_SYSKEYDOWN: 
+    case WM_SYSKEYUP:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    {
+      auto kbDllHook = *reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
+      u32 flags = static_cast<u32>(kbDllHook.flags);
+      auto newInput = reinterpret_cast<WPARAM>(new input{ 
+          .time = static_cast<u32>(kbDllHook.time),
+          .key = static_cast<u32>(kbDllHook.vkCode),
+          .isPressed = ((flags & LLKHF_UP) == 0),
+          .isAltPressed = ((flags & LLKHF_ALTDOWN) != 0),
+          });
+      PostThreadMessageA(g_mainThreadId, WM_KEYBOARD, newInput, 0);
+    } break;
+
+    default:
+    {
+    } break;
   }
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
@@ -121,17 +129,17 @@ LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 
 struct controller_input
 {
-struct state
-{
-  int lastChangedTime;
-  bool wasDown;
-};
-std::array<state, VK_OEM_CLEAR> vkeys;
+  struct state
+  {
+    int lastChangedTime;
+    bool wasDown;
+  };
+  std::array<state, VK_OEM_CLEAR> vkeys;
 };
 
 void
 ProcessKeyboardInput(keyboard::input *keyboardInput,
-                    controller_input& controllerInput)
+    controller_input& controllerInput)
 {
   auto key = keyboardInput->key;
   auto &oldInput = controllerInput.vkeys[key];
@@ -141,11 +149,6 @@ ProcessKeyboardInput(keyboard::input *keyboardInput,
   }
   oldInput.wasDown = keyboardInput->isPressed;
   oldInput.lastChangedTime = keyboardInput->time;
-  // OutputDebugStringA(std::format("{} is {} at {}\n", 
-  //       key,
-  //       oldInput.wasDown ? "down" : "up",
-  //       oldInput.lastChangedTime
-  //       ).c_str());
 }
 
 namespace window
@@ -159,44 +162,60 @@ struct event
   bool isDestroyed;
 };
 
+internal std::string
+GetWindowTitle(HWND handle)
+{
+  std::string title(256, 0);
+  title.resize(GetWindowTextA(
+        handle,
+        title.data(),
+        static_cast<int>(title.size())
+        ));
+  return title;
+}
+
+internal std::string
+GetWindowExecutablePath(HWND hwnd)
+{    
+  DWORD processId;
+  GetWindowThreadProcessId(hwnd, &processId);
+  if (HANDLE hProcess = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+      hProcess != nullptr)
+  {
+    std::string path(MAX_PATH, 0);
+    DWORD size = MAX_PATH;
+    QueryFullProcessImageNameA(hProcess, 0, path.data(), &size);
+    path.resize(size);
+    CloseHandle(hProcess);
+    return path;
+  }
+  return "";
+}
+
 bool isRealWindow(HWND hwnd, LONG idObject, LONG idChild)
 {
-  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
-  {
-    return false;
-  }
-  if (!IsWindow(hwnd) || !IsWindowVisible(hwnd))
-  {
-    return false;
-  }
-  if (GetWindow(hwnd, GW_OWNER) != NULL) 
-  {
-    return false;
-  }
-
+  bool isWindowObject = idObject == OBJID_WINDOW && idChild == CHILDID_SELF;
+  // bool isVisible = IsWindow(hwnd) && IsWindowVisible(hwnd);
+  bool isOwner = GetWindow(hwnd, GW_OWNER) == NULL;
+  bool isRoot = GetAncestor(hwnd, GA_ROOT) == hwnd;
   LONG_PTR exStyle = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
-  if (exStyle & WS_EX_TOOLWINDOW)
-  {
-    return false;
-  }
-
+  bool isTool = (exStyle & WS_EX_TOOLWINDOW) != 0;
   std::string className(256, 0);
-  if (GetClassNameA(hwnd, className.data(), static_cast<int>(className.size())))
-  {
-    if (className == "Progman" || className == "WorkerW")
-    {
-      return false;
-    }
-  }
-
-  OutputDebugStringA(className.c_str());
-  return true;
+  bool isDesktop = GetClassNameA(
+      hwnd, className.data(), static_cast<int>(className.size())) && 
+    (className == "Progman" || className == "WorkerW");
+  return isWindowObject && isOwner && isRoot && !isTool && !isDesktop;
 }
 
 internal VOID CALLBACK
 WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
-            LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
+    LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
 {
+  if (!isRealWindow(hwnd, idObject, idChild))
+  {
+    return;
+  }
   window::event windowEvent = {
     .handle = hwnd,
     .time = dwmsEventTime,
@@ -206,324 +225,131 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
   };
   switch(event)
   {
-    case EVENT_SYSTEM_SOUND:
-    {
-      OutputDebugStringA("system sound\n");
-    } break;
-    case EVENT_SYSTEM_ALERT:
-    {
-      OutputDebugStringA("system alert\n");
-    } break;
     case EVENT_SYSTEM_FOREGROUND:
     {
-      // NOTE: this window is on top???
-      // OutputDebugStringA(std::format("system foreground {}\n", reinterpret_cast<uptr>(hwnd)).c_str());
+      // NOTE: this window is on top
       windowEvent.isFocused = true;
       PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
-    case EVENT_SYSTEM_MENUSTART:
-    {
-      OutputDebugStringA("menu start\n");
-    } break;
-    case EVENT_SYSTEM_MENUEND:
-    {
-      OutputDebugStringA("menu end\n");
-    } break;
-    case EVENT_SYSTEM_MENUPOPUPSTART:
-    {
-      OutputDebugStringA("menu popup start\n");
-    } break;
-    case EVENT_SYSTEM_MENUPOPUPEND:
-    {
-      OutputDebugStringA("menu popup end\n");
-    } break;
+
     case EVENT_SYSTEM_CAPTURESTART:
     {
       // TODO: onMousePressed
       // OutputDebugStringA("capture start\n");
     } break;
+
     case EVENT_SYSTEM_CAPTUREEND:
     {
       // TODO: onMouseReleased
       // OutputDebugStringA("capture end\n");
     } break;
+
     case EVENT_SYSTEM_MOVESIZESTART:
     {
       // TODO: window moved
       // OutputDebugStringA("move size start\n");
     } break;
+
     case EVENT_SYSTEM_MOVESIZEEND:
     {
       // TODO: window moved
       // OutputDebugStringA("move size end\n");
     } break;
-    case EVENT_SYSTEM_CONTEXTHELPSTART:
-    {
-      OutputDebugStringA("context help start\n");
-    } break;
-    case EVENT_SYSTEM_CONTEXTHELPEND:
-    {
-      OutputDebugStringA("context help end\n");
-    } break;
-    case EVENT_SYSTEM_DRAGDROPSTART:
-    {
-      OutputDebugStringA("drag drop start\n");
-    } break;
-    case EVENT_SYSTEM_DRAGDROPEND:
-    {
-      OutputDebugStringA("drag drop end\n");
-    } break;
-    case EVENT_SYSTEM_DIALOGSTART:
-    {
-      OutputDebugStringA("dialog start\n");
-    } break;
-    case EVENT_SYSTEM_DIALOGEND:
-    {
-      OutputDebugStringA("dialog end\n");
-    } break;
-    case EVENT_SYSTEM_SCROLLINGSTART:
-    {
-      OutputDebugStringA("scrolling start\n");
-    } break;
-    case EVENT_SYSTEM_SCROLLINGEND:
-    {
-      OutputDebugStringA("scrolling end\n");
-    } break;
-    case EVENT_SYSTEM_SWITCHSTART:
-    {
-      OutputDebugStringA("switch start\n");
-    } break;
-    case EVENT_SYSTEM_SWITCHEND:
-    {
-      OutputDebugStringA("switch end\n");
-    } break;
+
     case EVENT_SYSTEM_MINIMIZESTART:
     {
       OutputDebugStringA("minize start\n");
     } break;
+
     case EVENT_SYSTEM_MINIMIZEEND:
     {
       OutputDebugStringA("minize end\n");
     } break;
+
     case EVENT_SYSTEM_DESKTOPSWITCH:
     {
       OutputDebugStringA("desktop switch\n");
     } break;
-    case EVENT_SYSTEM_SWITCHER_APPGRABBED:
-    {
-      OutputDebugStringA("switcher app grabbed\n");
-    } break;
-    case EVENT_SYSTEM_SWITCHER_APPOVERTARGET:
-    {
-      OutputDebugStringA("switcher app over target\n");
-    } break;
-    case EVENT_SYSTEM_SWITCHER_APPDROPPED:
-    {
-      OutputDebugStringA("switcher app dropped\n");
-    } break;
-    case EVENT_SYSTEM_SWITCHER_CANCELLED:
-    {
-      OutputDebugStringA("switcher cancelled\n");
-    } break;
-    case EVENT_SYSTEM_IME_KEY_NOTIFICATION:
-    {
-      OutputDebugStringA("ime key notification\n");
-    } break;
-    case EVENT_CONSOLE_CARET:
-    {
-      OutputDebugStringA("console caret\n");
-    } break;
-    case EVENT_CONSOLE_UPDATE_REGION:
-    {
-      OutputDebugStringA("console update region\n");
-    } break;
-    case EVENT_CONSOLE_UPDATE_SIMPLE:
-    {
-      OutputDebugStringA("console update simple\n");
-    } break;
-    case EVENT_CONSOLE_UPDATE_SCROLL:
-    {
-      OutputDebugStringA("console update scroll\n");
-    } break;
-    case EVENT_CONSOLE_LAYOUT:
-    {
-      OutputDebugStringA("console layout\n");
-    } break;
-    case EVENT_CONSOLE_START_APPLICATION:
-    {
-      OutputDebugStringA("console start application\n");
-    } break;
-    case EVENT_CONSOLE_END_APPLICATION:
-    {
-      OutputDebugStringA("console end application\n");
-    } break;
+
     case EVENT_OBJECT_CREATE:
     {
-      // XXX: a window is created
-      // OutputDebugStringA("object create\n");
+    // XXX: a window is created
+    // OutputDebugStringA("object create\n");
     } break;
+
     case EVENT_OBJECT_DESTROY:
     {
       // NOTE: may not apply for crash/kill.
-      // windowEvent.isDestroyed = true;
-      // PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
+      windowEvent.isDestroyed = true;
+      PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
+
     case EVENT_OBJECT_SHOW:
     {
-      if (isRealWindow(hwnd, idObject, idChild))
-      {
-        windowEvent.isShown = true;
-        PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
-        OutputDebugStringA(std::format("object show {}\n", reinterpret_cast<uptr>(hwnd)).c_str());
-      }
+      // NOTE: this window is shown
+      windowEvent.isShown = true;
+      PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
+
     case EVENT_OBJECT_HIDE:
     {
       // XXX: noise
-      // OutputDebugStringA("object hide\n");
+      OutputDebugStringA("object hide\n");
     } break;
+
     case EVENT_OBJECT_REORDER:
     {
       // TODO: ShellDesktopView???
       // OutputDebugStringA("object reorder\n");
     } break;
+
     case EVENT_OBJECT_FOCUS:
     {
       // XXX: child element has keyboard focus
       // OutputDebugStringA("object focus\n");
     } break;
+
     case EVENT_OBJECT_SELECTION:
     {
       // TODO: enter ???
       // OutputDebugStringA("object selection\n");
     } break;
-    case EVENT_OBJECT_SELECTIONADD:
-    {
-      OutputDebugStringA("object selection add\n");
-    } break;
-    case EVENT_OBJECT_SELECTIONREMOVE:
-    {
-      // TODO: quit ???
-      // OutputDebugStringA("object selection remove\n");
-    } break;
-    case EVENT_OBJECT_SELECTIONWITHIN:
-    {
-      OutputDebugStringA("object selection within\n");
-    } break;
+
     case EVENT_OBJECT_STATECHANGE:
     {
       // XXX: noise
       // OutputDebugStringA("state change\n");
     } break;
+
     case EVENT_OBJECT_LOCATIONCHANGE:
     {
       // TODO: onMouseMoved???
       // OutputDebugStringA("object location change\n");
     } break;
+
     case EVENT_OBJECT_NAMECHANGE:
     {
       // XXX: ???
       // OutputDebugStringA("object name change\n");
     } break;
+
     case EVENT_OBJECT_DESCRIPTIONCHANGE:
     {
       // OutputDebugStringA("object description change\n");
     } break;
-    case EVENT_OBJECT_VALUECHANGE:
-    {
-      OutputDebugStringA("object value change\n");
-    } break;
-    case EVENT_OBJECT_PARENTCHANGE:
-    {
-      // XXX: ???
-      // OutputDebugStringA("object parent change\n");
-    } break;
-    case EVENT_OBJECT_HELPCHANGE:
-    {
-      OutputDebugStringA("object help change\n");
-    } break;
-    case EVENT_OBJECT_DEFACTIONCHANGE:
-    {
-      OutputDebugStringA("object defaction change\n");
-    } break;
-    case EVENT_OBJECT_ACCELERATORCHANGE:
-    {
-      OutputDebugStringA("object accelerator change\n");
-    } break;
-    case EVENT_OBJECT_INVOKED:
-    {
-      OutputDebugStringA("object invoked\n");
-    } break;
-    case EVENT_OBJECT_TEXTSELECTIONCHANGED:
-    {
-      OutputDebugStringA("object text selection changed\n");
-    } break;
-    case EVENT_OBJECT_CONTENTSCROLLED:
-    {
-      OutputDebugStringA("object contents scrolled\n");
-    } break;
-    case EVENT_SYSTEM_ARRANGMENTPREVIEW:
-    {
-      OutputDebugStringA("arrangement preview\n");
-    } break;
+
     case EVENT_OBJECT_CLOAKED:
     {
       // TODO: start menu 
       // OutputDebugStringA("object cloaked\n");
     } break;
+
     case EVENT_OBJECT_UNCLOAKED:
     {
       // TODO: start menu 
       // OutputDebugStringA("object uncloaked\n");
     } break;
-    case EVENT_OBJECT_LIVEREGIONCHANGED:
-    {
-      OutputDebugStringA("object live region changed\n");
-    } break;
-    case EVENT_OBJECT_HOSTEDOBJECTSINVALIDATED:
-    {
-      OutputDebugStringA("object hosted objects invalidated\n");
-    } break;
-    case EVENT_OBJECT_DRAGSTART:
-    {
-      OutputDebugStringA("object drag start\n");
-    } break;
-    case EVENT_OBJECT_DRAGCANCEL:
-    {
-      OutputDebugStringA("object drag cancel\n");
-    } break;
-    case EVENT_OBJECT_DRAGCOMPLETE:
-    {
-      OutputDebugStringA("object drag complete\n");
-    } break;
-    case EVENT_OBJECT_DRAGENTER:
-    {
-      OutputDebugStringA("object drag enter\n");
-    } break;
-    case EVENT_OBJECT_DRAGLEAVE:
-    {
-      OutputDebugStringA("object drag leave\n");
-    } break;
-    case EVENT_OBJECT_DRAGDROPPED:
-    {
-      OutputDebugStringA("object drag dropped\n");
-    } break;
-    case EVENT_OBJECT_IME_SHOW:
-    {
-      OutputDebugStringA("object ime show\n");
-    } break;
-    case EVENT_OBJECT_IME_HIDE:
-    {
-      OutputDebugStringA("object ime hide\n");
-    } break;
-    case EVENT_OBJECT_IME_CHANGE:
-    {
-      OutputDebugStringA("object ime change\n");
-    } break;
-    case EVENT_OBJECT_TEXTEDIT_CONVERSIONTARGETCHANGED:
-    {
-      OutputDebugStringA("object textedit conversion target changed\n");
-    } break;
+
     default:
     {
     } break;
@@ -533,33 +359,36 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
 
 struct window_state
 {
+  HWND topWindow;
   struct status
   {
     u32 lastUpdatedTime;
-    u32 topLevelCount;
-    std::string title;
+    std::string windowTitle;
+    std::string executablePath;
   };
-  std::unordered_map<uptr, status> windows;
+  std::unordered_map<HWND, status> windows;
 };
 
 internal void
-ProcessWindowEvent(window::event *newEvent, window_state& states)
+ProcessWindowEvent(window::event *newEvent, window_state &state)
 {
-  auto key = reinterpret_cast<uptr>(newEvent->handle);
+  auto handle = newEvent->handle;
   if (newEvent->isDestroyed)
   {
-    states.windows.erase(key);
+    state.windows.erase(handle);
     return;
   }
-  auto [it, isWindowNew] = states.windows.try_emplace(key);
-  auto &[_, state] = *it;
-  state.lastUpdatedTime = static_cast<u32>(newEvent->time);
-  if (!isWindowNew)
+  auto [it, isWindowNew] = state.windows.try_emplace(handle);
+  auto &[_, status] = *it;
+  status.lastUpdatedTime = static_cast<u32>(newEvent->time);
+  if (newEvent->isFocused)
   {
-    state.topLevelCount += newEvent->isFocused ? 1 : 0;
+    state.topWindow = handle;
   }
-  if (newEvent->isShown)
+  else if (newEvent->isShown)
   {
+    status.windowTitle = window::GetWindowTitle(handle);
+    status.executablePath = window::GetWindowExecutablePath(handle);
   }
 }
 
@@ -573,34 +402,36 @@ enum class command : u32
 
 struct dispatch_command
 {
-command type;
-union
-{
-  std::string_view commandLine;
-};
+  command type;
+  union
+  {
+    std::string_view commandLine;
+  };
 };
 
 void
-ExecuteCommand(dispatch_command command, uptr hwnd)
+ExecuteCommand(dispatch_command command, HWND hwnd)
 {
   switch (command.type)
   {
     case command::StartProcess:
-      {
-        STARTUPINFOA startupInfo{};
-        PROCESS_INFORMATION processInformation{};
-        CreateProcessA(
-            nullptr, const_cast<LPSTR>(command.commandLine.data()), nullptr, 
-            nullptr, false, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
-            &startupInfo, &processInformation);
-      } break;
+    {
+      STARTUPINFOA startupInfo{};
+      PROCESS_INFORMATION processInformation{};
+      CreateProcessA(
+          nullptr, const_cast<LPSTR>(command.commandLine.data()), nullptr, 
+          nullptr, false, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
+          &startupInfo, &processInformation);
+    } break;
+
     case command::CloseWindow:
-      {
-        PostMessageA(reinterpret_cast<HWND>(hwnd), WM_CLOSE, 0, 0);
-      } break;
+    {
+      PostMessageA(reinterpret_cast<HWND>(hwnd), WM_CLOSE, 0, 0);
+    } break;
+
     default:
-      {
-      } break;
+    {
+    } break;
   }
 }
 
@@ -631,19 +462,6 @@ internal auto k_defaultCommands = std::to_array<winspace::dispatch_command>({
 void
 DispatchCommand(controller_input& controllerInput, window_state &windowState)
 {
-  uptr focusWindow = 0;
-  for (auto &[key, window] : windowState.windows)
-  {
-    if (focusWindow == 0)
-    {
-      focusWindow = key;
-    }
-    else if (window.topLevelCount > windowState.windows[focusWindow].topLevelCount)
-    {
-      focusWindow = key;
-    }
-  }
-
   for (size_t keyBindingIndex = 0;
       keyBindingIndex < k_defaultKeybindings.size();
       keyBindingIndex++)
@@ -655,7 +473,7 @@ DispatchCommand(controller_input& controllerInput, window_state &windowState)
     }
     if (shouldExecute)
     {
-      ExecuteCommand(k_defaultCommands[keyBindingIndex], focusWindow);
+      ExecuteCommand(k_defaultCommands[keyBindingIndex], windowState.topWindow);
     }
   }
 }
@@ -664,9 +482,9 @@ DispatchCommand(controller_input& controllerInput, window_state &windowState)
 
 int APIENTRY
 WinMain(HINSTANCE hPrevInstance,
-        HINSTANCE hInstance,
-        LPSTR lpCmdLine,
-        int nShowCmd)
+    HINSTANCE hInstance,
+    LPSTR lpCmdLine,
+    int nShowCmd)
 {
   using namespace win32;
   g_mainThreadId = GetCurrentThreadId();
@@ -688,20 +506,20 @@ WinMain(HINSTANCE hPrevInstance,
           GetModuleHandleA(nullptr), 0);
       if (!keyboardHookExp.has_value())
       {
-        OutputDebugStringA(
-            "Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
-        return;
+      OutputDebugStringA(
+          "Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
+      return;
       }
 
       while (!running.stop_requested())
       {
-        MSG msg{};
-        if (GetMessageA(&msg, 0, 0, 0) < 0)
-        {
-          continue;
-        }
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+      MSG msg{};
+      if (GetMessageA(&msg, 0, 0, 0) < 0)
+      {
+      continue;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageA(&msg);
       }
       UnhookWindowsHookEx(keyboardHookExp.value());
   });
