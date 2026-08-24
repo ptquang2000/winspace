@@ -193,10 +193,9 @@ GetWindowExecutablePath(HWND hwnd)
   return "";
 }
 
-bool isRealWindow(HWND hwnd, LONG idObject, LONG idChild)
+bool IsRealWindow(HWND hwnd, LONG idObject, LONG idChild)
 {
   bool isWindowObject = idObject == OBJID_WINDOW && idChild == CHILDID_SELF;
-  // bool isVisible = IsWindow(hwnd) && IsWindowVisible(hwnd);
   bool isOwner = GetWindow(hwnd, GW_OWNER) == NULL;
   bool isRoot = GetAncestor(hwnd, GA_ROOT) == hwnd;
   LONG_PTR exStyle = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
@@ -212,7 +211,7 @@ internal VOID CALLBACK
 WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     LONG idChild, DWORD idEventThread, DWORD dwmsEventTime)
 {
-  if (!isRealWindow(hwnd, idObject, idChild))
+  if (!IsRealWindow(hwnd, idObject, idChild))
   {
     return;
   }
@@ -368,6 +367,30 @@ struct window_state
   };
   std::unordered_map<HWND, status> windows;
 };
+
+internal window_state
+InitWindowState()
+{
+  window_state state{};
+  const auto enumWindowsProc = [](HWND hwnd, LPARAM lParam) -> BOOL
+  {
+    window_state &state = *reinterpret_cast<window_state *>(lParam); 
+    if (window::IsRealWindow(hwnd, OBJID_WINDOW, CHILDID_SELF) &&
+        IsWindow(hwnd) && IsWindowVisible(hwnd))
+    {
+      window_state::status status{
+        .lastUpdatedTime = 0,
+        .windowTitle = window::GetWindowTitle(hwnd),
+        .executablePath = window::GetWindowExecutablePath(hwnd),
+      };
+      state.windows.emplace(hwnd, status);
+    }
+    return true;
+  };
+  EnumWindows(enumWindowsProc, reinterpret_cast<LPARAM>(&state));
+  state.topWindow = GetForegroundWindow();
+  return state;
+}
 
 internal void
 ProcessWindowEvent(window::event *newEvent, window_state &state)
@@ -525,7 +548,7 @@ WinMain(HINSTANCE hPrevInstance,
   });
 
   auto controllerInput = win32::controller_input{};
-  auto windowStates = win32::window_state{};
+  auto windowStates = InitWindowState();
   bool running = true;
   while (running)
   {
