@@ -1,30 +1,14 @@
-local build_win = nil
-
 vim.keymap.set("n", "<leader>m", function()
-	local cmd = vim.fn.has("win32") == 1 and { "powershell.exe", "-command", "./build.ps1" } or { "sh", "./build.sh" }
-
-	local old_buf = vim.fn.bufnr("winspace://build")
-	if old_buf ~= -1 then
-		vim.api.nvim_buf_delete(old_buf, { force = true })
+	if vim.fn.has("win32") == 1 then
+		vim.opt_local.makeprg = "powershell.exe -command ./build.ps1"
+	elseif vim.fn.has("linux") == 1 then
+		vim.opt_local.makeprg = "sh ./build.sh"
+	else
+		assert(false, "unsupported platform")
 	end
 
-	local new_buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_call(new_buf, function()
-		vim.fn.jobstart(cmd, { term = true })
-	end)
-	vim.api.nvim_buf_set_name(new_buf, "winspace://build")
-
-	if not (build_win and vim.api.nvim_win_is_valid(build_win)) then
-		local wins = vim.api.nvim_tabpage_list_wins(0)
-		if #wins == 1 then
-			build_win = vim.api.nvim_open_win(new_buf, false, { split = "right", win = -1 })
-		else
-			local cur_win = vim.api.nvim_get_current_win()
-			build_win = vim.iter(wins):find(function(w)
-				return w ~= cur_win
-			end)
-		end
-	else
-		vim.api.nvim_win_set_buf(build_win, new_buf)
+	vim.cmd("silent make!")
+	if #vim.fn.getqflist() > 0 then
+		vim.cmd("copen")
 	end
 end, { desc = "Build winspace" })

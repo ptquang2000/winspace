@@ -1,4 +1,9 @@
 new-item -itemtype directory -force -path .\build  > $null
-push-location .\build
-cl.exe -WX -W4 -wd4100 -wd4189 -wd4201 -Gm- -nologo -MT -Zi -Od -FC -std:c++latest ../win32_winspace.cpp user32.lib -Fe:winspace.exe
-pop-location
+$warn = "-WX -W4 -wd4100 -wd4189 -wd4201 -wd4505"
+$debug = "-MTd -Zi -Od -FC"
+$out = "-Fo:build/ -Fd:build/ -Fe:build/winspace.exe"
+$libs = "user32.lib"
+$elapsed = (Measure-Command {
+    cl.exe -nologo -std:c++latest $warn $debug win32_winspace.cpp $libs $out
+}).TotalSeconds
+Write-Host ("Compilation finished in {0:N3}s" -f $elapsed)
