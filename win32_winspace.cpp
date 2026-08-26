@@ -1,6 +1,8 @@
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <array>
+#include <cassert>
 #include <deque>
 #include <expected>
 #include <format>
@@ -16,14 +18,17 @@
 #define global      static
 #define persistent  static constexpr
 
-#define i8		int8_t
-#define i16		int16_t
-#define i32		int32_t
-#define i64		int64_t
-#define u8		uint8_t
-#define u16		uint16_t
-#define u32		uint32_t
-#define u64		uint64_t
+#define i8  int8_t
+#define i16 int16_t
+#define i32 int32_t
+#define i64 int64_t
+#define u8  uint8_t
+#define u16 uint16_t
+#define u32 uint32_t
+#define u64 uint64_t
+
+#define r32 float;
+#define r64 double;
 
 #define WM_KEYBOARD WM_USER
 #define WM_WINEVENT WM_USER + 1
@@ -48,7 +53,7 @@ CallWithError(Func&& func, Args&&... args)
     if (auto r = std::invoke(
           func,
           std::forward<Args>(args)...
-          ); r != nullptr)
+          ); r)
     {
       return r;
     }
@@ -153,13 +158,20 @@ ProcessKeyboardInput(keyboard::input *keyboardInput,
 
 namespace window
 {
+enum class event_type : u32
+{
+  None,
+  Focused,
+  Shown,
+  Destroyed,
+  Moved,
+};
+
 struct event
 {
   HWND handle;
   DWORD time;
-  bool isFocused;
-  bool isShown;
-  bool isDestroyed;
+  event_type type;
 };
 
 internal std::string
@@ -199,12 +211,24 @@ bool IsRealWindow(HWND hwnd, LONG idObject, LONG idChild)
   bool isOwner = GetWindow(hwnd, GW_OWNER) == NULL;
   bool isRoot = GetAncestor(hwnd, GA_ROOT) == hwnd;
   LONG_PTR exStyle = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
-  bool isTool = (exStyle & WS_EX_TOOLWINDOW) != 0;
+  bool isTool = (exStyle & (WS_EX_TOOLWINDOW|WS_EX_TOPMOST)) != 0;
   std::string className(256, 0);
   bool isDesktop = GetClassNameA(
       hwnd, className.data(), static_cast<int>(className.size())) && 
     (className == "Progman" || className == "WorkerW");
-  return isWindowObject && isOwner && isRoot && !isTool && !isDesktop;
+  if (isWindowObject && isOwner && isRoot && !isTool && !isDesktop)
+  {
+    BOOL isCloaked;
+    if (IsWindow(hwnd) && IsWindowVisible(hwnd) &&
+        SUCCEEDED(DwmGetWindowAttribute(
+          hwnd, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked))) &&
+        isCloaked)
+    {
+      return !isCloaked;
+    }
+    return true;
+  }
+  return false;
 }
 
 internal VOID CALLBACK
@@ -227,7 +251,7 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_FOREGROUND:
     {
       // NOTE: this window is on top
-      windowEvent.isFocused = true;
+      windowEvent.type = event_type::Focused;
       PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
 
@@ -246,13 +270,13 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_MOVESIZESTART:
     {
       // TODO: window moved
-      // OutputDebugStringA("move size start\n");
+      OutputDebugStringA("move size start\n");
     } break;
 
     case EVENT_SYSTEM_MOVESIZEEND:
     {
       // TODO: window moved
-      // OutputDebugStringA("move size end\n");
+      OutputDebugStringA("move size end\n");
     } break;
 
     case EVENT_SYSTEM_MINIMIZESTART:
@@ -279,14 +303,14 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_OBJECT_DESTROY:
     {
       // NOTE: may not apply for crash/kill.
-      windowEvent.isDestroyed = true;
+      windowEvent.type = event_type::Destroyed;
       PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
 
     case EVENT_OBJECT_SHOW:
     {
       // NOTE: this window is shown
-      windowEvent.isShown = true;
+      windowEvent.type = event_type::Shown;
       PostThreadMessageA(g_mainThreadId, WM_WINEVENT, cloneEvent(), 0);
     } break;
 
@@ -359,13 +383,14 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
 struct window_state
 {
   HWND topWindow;
-  struct status
+  struct window_attribute
   {
+    HWND handle;
     u32 lastUpdatedTime;
-    std::string windowTitle;
+    std::string title;
     std::string executablePath;
   };
-  std::unordered_map<HWND, status> windows;
+  std::vector<window_attribute> windows;
 };
 
 internal window_state
@@ -378,12 +403,14 @@ InitWindowState()
     if (window::IsRealWindow(hwnd, OBJID_WINDOW, CHILDID_SELF) &&
         IsWindow(hwnd) && IsWindowVisible(hwnd))
     {
-      window_state::status status{
+      window_state::window_attribute attribute{
+        .handle = hwnd,
         .lastUpdatedTime = 0,
-        .windowTitle = window::GetWindowTitle(hwnd),
+        .title = window::GetWindowTitle(hwnd),
         .executablePath = window::GetWindowExecutablePath(hwnd),
       };
-      state.windows.emplace(hwnd, status);
+      PrintDebug("{},{},{} is added", (u64)attribute.handle, attribute.title, attribute.executablePath);
+      state.windows.emplace_back(attribute);
     }
     return true;
   };
@@ -393,25 +420,49 @@ InitWindowState()
 }
 
 internal void
-ProcessWindowEvent(window::event *newEvent, window_state &state)
+ProcessWindowEvent(window::event *newEvent,
+                  window_state &state)
 {
-  auto handle = newEvent->handle;
-  if (newEvent->isDestroyed)
+  auto w = std::ranges::find_if(state.windows,
+      [&](const auto &w){
+      return w.handle == newEvent->handle; });
+  if (w == state.windows.end())
   {
-    state.windows.erase(handle);
-    return;
+    w = state.windows.emplace(state.windows.end(), newEvent->handle);
   }
-  auto [it, isWindowNew] = state.windows.try_emplace(handle);
-  auto &[_, status] = *it;
-  status.lastUpdatedTime = static_cast<u32>(newEvent->time);
-  if (newEvent->isFocused)
+
+  w->lastUpdatedTime = static_cast<u32>(newEvent->time);
+  switch(newEvent->type)
   {
-    state.topWindow = handle;
-  }
-  else if (newEvent->isShown)
-  {
-    status.windowTitle = window::GetWindowTitle(handle);
-    status.executablePath = window::GetWindowExecutablePath(handle);
+    using namespace window;
+    case event_type::Destroyed:
+    {
+      PrintDebug("{} is removed", w->title);
+      if (w->handle == state.topWindow)
+      {
+        state.topWindow = nullptr;
+      }
+      state.windows.erase(w);
+    } break;
+    case event_type::Focused:
+    {
+      state.topWindow = newEvent->handle;
+      PrintDebug("{} is focused", w->title);
+    } break;
+    case event_type::Shown:
+    {
+      w->title = window::GetWindowTitle(newEvent->handle);
+      w->executablePath = window::GetWindowExecutablePath(newEvent->handle);
+      PrintDebug("{} is shown", w->title);
+    } break;
+    case event_type::Moved:
+    {
+      PrintDebug("{} is moved", w->title);
+    } break;
+    default:
+    {
+      assert(!"Unhandled event");
+    } break;
   }
 }
 
@@ -432,6 +483,12 @@ struct dispatch_command
   };
 };
 
+struct dwindle_layout
+{
+  HWND interactiveWindow;
+  bool wasVertical;
+};
+
 void
 ExecuteCommand(dispatch_command command, HWND hwnd)
 {
@@ -449,7 +506,7 @@ ExecuteCommand(dispatch_command command, HWND hwnd)
 
     case command::CloseWindow:
     {
-      PostMessageA(reinterpret_cast<HWND>(hwnd), WM_CLOSE, 0, 0);
+      PostMessageA(hwnd, WM_CLOSE, 0, 0);
     } break;
 
     default:
@@ -500,6 +557,70 @@ DispatchCommand(controller_input& controllerInput, window_state &windowState)
     }
   }
 }
+
+internal dwindle_layout
+InitDwindleLayout(window_state &windowState)
+{
+  dwindle_layout layout = {};
+  layout.interactiveWindow = windowState.topWindow;
+  auto kids = windowState.windows |
+    std::views::transform([](const auto &w) { return w.handle; }) |
+    std::ranges::to<std::vector>(); 
+  auto tiledWindowsCount = win32::CallWithError<win32::error::LastError>(
+      TileWindows,
+      static_cast<HWND>(0),
+      MDITILE_VERTICAL,
+      nullptr,
+      static_cast<u32>(kids.size()),
+      kids.data());
+  PrintDebug("kids={}, tiled={}", kids.size(), tiledWindowsCount.value());
+  return layout;
+}
+
+internal void
+TileDwindleLayout(dwindle_layout &layout, window_state &windowState)
+{
+  auto lastInteractive = layout.interactiveWindow;
+  layout.interactiveWindow = windowState.topWindow;
+  if (layout.interactiveWindow == windowState.topWindow)
+  {
+    return;
+  }
+
+  RECT workRect = {};
+  // TODO: do query in the same monitor of the latest focused window.
+  auto workWindow = std::ranges::find_if(
+      windowState.windows,
+      [handle = lastInteractive](const auto &w)
+      { return w.handle != handle; });
+  if (workWindow == windowState.windows.end())
+  {
+    // None interactive window has been set.
+    workWindow = windowState.windows.begin();
+  }
+
+  if (workWindow == windowState.windows.begin())
+  {
+    auto monitor = MonitorFromWindow(
+        workWindow->handle,
+        MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo = {sizeof(monitorInfo)};
+    if (GetMonitorInfoA(monitor, &monitorInfo))
+    {
+      workRect = monitorInfo.rcWork;
+    }
+  }
+  else
+  {
+    GetWindowRect(workWindow->handle, &workRect);
+  }
+
+  for (auto w = workWindow;
+      w != windowState.windows.end();
+      w++)
+  {
+  }
+}
 } // winspace
 } // win32
 
@@ -522,34 +643,40 @@ WinMain(HINSTANCE hPrevInstance,
     return 1;
   }
 
-  std::jthread keyboardHookThread([](std::stop_token running){
-      auto keyboardHookExp = win32::CallWithError<win32::error::LastError>(
-          SetWindowsHookExA,
-          WH_KEYBOARD_LL, win32::keyboard::LowLevelKeyboardProc,
-          GetModuleHandleA(nullptr), 0);
-      if (!keyboardHookExp.has_value())
+  std::jthread keyboardHookThread(
+      [](std::stop_token running)
       {
-      OutputDebugStringA(
-          "Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
-      return;
-      }
+        auto keyboardHookExp = win32::CallWithError<win32::error::LastError>(
+            SetWindowsHookExA,
+            WH_KEYBOARD_LL, win32::keyboard::LowLevelKeyboardProc,
+            GetModuleHandleA(nullptr), 0);
+        if (!keyboardHookExp.has_value())
+        {
+          OutputDebugStringA(
+              "Failed to hook SetWindowsHookExA:WH_KEYBOARD_LL");
+          return;
+        }
 
-      while (!running.stop_requested())
-      {
-      MSG msg{};
-      if (GetMessageA(&msg, 0, 0, 0) < 0)
-      {
-      continue;
-      }
-      TranslateMessage(&msg);
-      DispatchMessageA(&msg);
-      }
-      UnhookWindowsHookEx(keyboardHookExp.value());
-  });
+        while (!running.stop_requested())
+        {
+          MSG msg{};
+          if (GetMessageA(&msg, 0, 0, 0) < 0)
+          {
+            continue;
+          }
+          TranslateMessage(&msg);
+          DispatchMessageA(&msg);
+        }
+        UnhookWindowsHookEx(keyboardHookExp.value());
+      });
 
   auto controllerInput = win32::controller_input{};
   auto windowStates = InitWindowState();
+  auto windowLayout = winspace::InitDwindleLayout(windowStates);
   bool running = true;
+
+  winspace::TileDwindleLayout(windowLayout, windowStates);
+
   while (running)
   {
     MSG msg{};
@@ -576,6 +703,7 @@ WinMain(HINSTANCE hPrevInstance,
       {
         auto newWindowEvent = reinterpret_cast<window::event *>(msg.wParam);
         ProcessWindowEvent(newWindowEvent, windowStates);
+        winspace::TileDwindleLayout(windowLayout, windowStates);
         delete newWindowEvent;
       } break;
 
