@@ -483,7 +483,7 @@ struct dispatch_command
   };
 };
 
-struct dwindle_layout
+struct window_layout
 {
   HWND interactiveWindow;
   bool wasVertical;
@@ -558,68 +558,65 @@ DispatchCommand(controller_input& controllerInput, window_state &windowState)
   }
 }
 
-internal dwindle_layout
-InitDwindleLayout(window_state &windowState)
-{
-  dwindle_layout layout = {};
-  layout.interactiveWindow = windowState.topWindow;
-  auto kids = windowState.windows |
-    std::views::transform([](const auto &w) { return w.handle; }) |
-    std::ranges::to<std::vector>(); 
-  auto tiledWindowsCount = win32::CallWithError<win32::error::LastError>(
-      TileWindows,
-      static_cast<HWND>(0),
-      MDITILE_VERTICAL,
-      nullptr,
-      static_cast<u32>(kids.size()),
-      kids.data());
-  PrintDebug("kids={}, tiled={}", kids.size(), tiledWindowsCount.value());
-  return layout;
-}
-
 internal void
-TileDwindleLayout(dwindle_layout &layout, window_state &windowState)
+TileWindowLayout(window_layout &layout, window_state &windowState)
 {
   auto lastInteractive = layout.interactiveWindow;
   layout.interactiveWindow = windowState.topWindow;
-  if (layout.interactiveWindow == windowState.topWindow)
+  if (lastInteractive == windowState.topWindow)
   {
     return;
   }
 
+  int isVertical = 1;
   RECT workRect = {};
-  // TODO: do query in the same monitor of the latest focused window.
-  auto workWindow = std::ranges::find_if(
-      windowState.windows,
-      [handle = lastInteractive](const auto &w)
-      { return w.handle != handle; });
-  if (workWindow == windowState.windows.end())
+  auto windowHandles = windowState.windows | 
+    std::views::transform(&window_state::window_attribute::handle); 
+  auto monitor = MonitorFromWindow(
+      *windowHandles.begin(),
+      MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitorInfo = {sizeof(monitorInfo)};
+  if (GetMonitorInfoA(monitor, &monitorInfo))
   {
-    // None interactive window has been set.
-    workWindow = windowState.windows.begin();
-  }
-
-  if (workWindow == windowState.windows.begin())
-  {
-    auto monitor = MonitorFromWindow(
-        workWindow->handle,
-        MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo = {sizeof(monitorInfo)};
-    if (GetMonitorInfoA(monitor, &monitorInfo))
+    workRect = monitorInfo.rcWork;
+    for (auto handle = windowHandles.begin();
+        handle != windowHandles.end();
+        handle++)
     {
-      workRect = monitorInfo.rcWork;
+      int x = workRect.left;
+      int y = workRect.top;
+      int cx = workRect.right - workRect.left;
+      int cy = workRect.bottom - workRect.top;
+      if (std::next(handle) != windowHandles.end())
+      {
+        if (isVertical)
+        {
+          cx /= 2;
+          workRect.left += cx;
+        }
+        else
+        {
+          cy /= 2;
+          workRect.top += cy;
+        }
+        isVertical = (isVertical+1)%2;
+      }
+      SetWindowPos(*handle, HWND_TOP, x, y, cx, cy,
+          SWP_ASYNCWINDOWPOS|SWP_SHOWWINDOW|SWP_NOACTIVATE|SWP_FRAMECHANGED);
     }
   }
   else
   {
-    GetWindowRect(workWindow->handle, &workRect);
+    PrintDebug("Failed to GetMonitorInfoA");
   }
+}
 
-  for (auto w = workWindow;
-      w != windowState.windows.end();
-      w++)
-  {
-  }
+internal window_layout
+InitwindowLayout(window_state &windowState)
+{
+  window_layout layout = {};
+  winspace::TileWindowLayout(layout, windowState);
+  return layout;
 }
 } // winspace
 } // win32
@@ -672,10 +669,8 @@ WinMain(HINSTANCE hPrevInstance,
 
   auto controllerInput = win32::controller_input{};
   auto windowStates = InitWindowState();
-  auto windowLayout = winspace::InitDwindleLayout(windowStates);
+  auto windowLayout = winspace::InitwindowLayout(windowStates);
   bool running = true;
-
-  winspace::TileDwindleLayout(windowLayout, windowStates);
 
   while (running)
   {
@@ -703,7 +698,7 @@ WinMain(HINSTANCE hPrevInstance,
       {
         auto newWindowEvent = reinterpret_cast<window::event *>(msg.wParam);
         ProcessWindowEvent(newWindowEvent, windowStates);
-        winspace::TileDwindleLayout(windowLayout, windowStates);
+        winspace::TileWindowLayout(windowLayout, windowStates);
         delete newWindowEvent;
       } break;
 
