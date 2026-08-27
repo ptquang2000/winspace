@@ -22,10 +22,13 @@
 #define i16 int16_t
 #define i32 int32_t
 #define i64 int64_t
+
 #define u8  uint8_t
 #define u16 uint16_t
 #define u32 uint32_t
 #define u64 uint64_t
+
+#define bool32  u32
 
 #define r32 float;
 #define r64 double;
@@ -380,94 +383,6 @@ WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject,
 }
 } // window
 
-struct window_state
-{
-  HWND topWindow;
-  struct window_attribute
-  {
-    HWND handle;
-    u32 lastUpdatedTime;
-    std::string title;
-    std::string executablePath;
-  };
-  std::vector<window_attribute> windows;
-};
-
-internal window_state
-InitWindowState()
-{
-  window_state state{};
-  const auto enumWindowsProc = [](HWND hwnd, LPARAM lParam) -> BOOL
-  {
-    window_state &state = *reinterpret_cast<window_state *>(lParam); 
-    if (window::IsRealWindow(hwnd, OBJID_WINDOW, CHILDID_SELF) &&
-        IsWindow(hwnd) && IsWindowVisible(hwnd))
-    {
-      window_state::window_attribute attribute{
-        .handle = hwnd,
-        .lastUpdatedTime = 0,
-        .title = window::GetWindowTitle(hwnd),
-        .executablePath = window::GetWindowExecutablePath(hwnd),
-      };
-      PrintDebug("{},{},{} is added", (u64)attribute.handle, attribute.title, attribute.executablePath);
-      state.windows.emplace_back(attribute);
-    }
-    return true;
-  };
-  EnumWindows(enumWindowsProc, reinterpret_cast<LPARAM>(&state));
-  state.topWindow = GetForegroundWindow();
-  return state;
-}
-
-internal void
-ProcessWindowEvent(window::event *newEvent,
-                  window_state &state)
-{
-  auto w = std::ranges::find_if(state.windows,
-      [&](const auto &w){
-      return w.handle == newEvent->handle; });
-  if (w == state.windows.end())
-  {
-    w = state.windows.emplace(state.windows.end(), newEvent->handle);
-  }
-
-  w->lastUpdatedTime = static_cast<u32>(newEvent->time);
-  switch(newEvent->type)
-  {
-    using namespace window;
-    case event_type::Destroyed:
-    {
-      PrintDebug("{} is removed", w->title);
-      if (w->handle == state.topWindow)
-      {
-        state.topWindow = nullptr;
-      }
-      state.windows.erase(w);
-    } break;
-    case event_type::Focused:
-    {
-      state.topWindow = newEvent->handle;
-      PrintDebug("{} is focused", w->title);
-    } break;
-    case event_type::Shown:
-    {
-      w->title = window::GetWindowTitle(newEvent->handle);
-      w->executablePath = window::GetWindowExecutablePath(newEvent->handle);
-      PrintDebug("{} is shown", w->title);
-    } break;
-    case event_type::Moved:
-    {
-      PrintDebug("{} is moved", w->title);
-    } break;
-    default:
-    {
-      assert(!"Unhandled event");
-    } break;
-  }
-}
-
-namespace winspace
-{
 enum class command : u32
 {
   StartProcess,
@@ -488,6 +403,20 @@ struct window_layout
   HWND interactiveWindow;
   bool wasVertical;
 };
+
+struct window_state
+{
+  HWND topWindow;
+  struct window_attribute
+  {
+    HWND handle;
+    u32 lastUpdatedTime;
+    std::string title;
+    std::string executablePath;
+  };
+  std::vector<window_attribute> windows;
+};
+
 
 void
 ExecuteCommand(dispatch_command command, HWND hwnd)
@@ -524,18 +453,18 @@ persistent auto k_defaultKeybindings = std::to_array<std::span<const u32>>({
     k_closeWindow,
     });
 
-internal auto k_defaultCommands = std::to_array<winspace::dispatch_command>({
+internal auto k_defaultCommands = std::to_array<dispatch_command>({
     {
-    .type = winspace::command::StartProcess,
+    .type = command::StartProcess,
     .commandLine = "C:\\Windows\\explorer.exe",
     },
     {
-    .type = winspace::command::StartProcess,
+    .type = command::StartProcess,
     .commandLine = 
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
     },
     {
-    .type= winspace::command::CloseWindow,
+    .type= command::CloseWindow,
     },
     });
 
@@ -568,41 +497,36 @@ TileWindowLayout(window_layout &layout, window_state &windowState)
     return;
   }
 
-  int isVertical = 1;
-  RECT workRect = {};
-  auto windowHandles = windowState.windows | 
-    std::views::transform(&window_state::window_attribute::handle); 
+  RECT parentRect = {};
   auto monitor = MonitorFromWindow(
-      *windowHandles.begin(),
+      windowState.topWindow,
       MONITOR_DEFAULTTONEAREST);
   MONITORINFO monitorInfo = {sizeof(monitorInfo)};
   if (GetMonitorInfoA(monitor, &monitorInfo))
   {
-    workRect = monitorInfo.rcWork;
-    for (auto handle = windowHandles.begin();
-        handle != windowHandles.end();
-        handle++)
+    parentRect = monitorInfo.rcWork;
+    for (auto w = windowState.windows.begin();
+        w != windowState.windows.end();
+        w++)
     {
-      int x = workRect.left;
-      int y = workRect.top;
-      int cx = workRect.right - workRect.left;
-      int cy = workRect.bottom - workRect.top;
-      if (std::next(handle) != windowHandles.end())
+      int x = parentRect.left;
+      int y = parentRect.top;
+      int cx = parentRect.right - parentRect.left;
+      int cy = parentRect.bottom - parentRect.top;
+      if (std::next(w) != windowState.windows.end())
       {
-        if (isVertical)
+        if (cx > cy)
         {
           cx /= 2;
-          workRect.left += cx;
+          parentRect.left += cx;
         }
         else
         {
           cy /= 2;
-          workRect.top += cy;
+          parentRect.top += cy;
         }
-        isVertical = (isVertical+1)%2;
       }
-      SetWindowPos(*handle, HWND_TOP, x, y, cx, cy,
-          SWP_ASYNCWINDOWPOS|SWP_SHOWWINDOW|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+      SetWindowPos(w->handle, 0, x, y, cx, cy, SWP_ASYNCWINDOWPOS);
     }
   }
   else
@@ -615,10 +539,91 @@ internal window_layout
 InitwindowLayout(window_state &windowState)
 {
   window_layout layout = {};
-  winspace::TileWindowLayout(layout, windowState);
+  TileWindowLayout(layout, windowState);
   return layout;
 }
-} // winspace
+
+internal window_state
+InitWindowState()
+{
+  window_state state{};
+  const auto enumWindowsProc = [](HWND hwnd, LPARAM lParam) -> BOOL
+  {
+    window_state &state = *reinterpret_cast<window_state *>(lParam); 
+    if (window::IsRealWindow(hwnd, OBJID_WINDOW, CHILDID_SELF) &&
+        IsWindow(hwnd) && IsWindowVisible(hwnd))
+    {
+      window_state::window_attribute attribute{
+        .handle = hwnd,
+          .lastUpdatedTime = 0,
+          .title = window::GetWindowTitle(hwnd),
+          .executablePath = window::GetWindowExecutablePath(hwnd),
+      };
+      state.windows.emplace_back(attribute);
+    }
+    return true;
+  };
+  EnumWindows(enumWindowsProc, reinterpret_cast<LPARAM>(&state));
+  state.topWindow = GetForegroundWindow();
+  return state;
+}
+
+internal void
+ProcessWindowEvent(window::event *newEvent,
+    window_state &state,
+    window_layout &layout)
+{
+  auto w = std::ranges::find_if(state.windows,
+      [&](const auto &w){
+      return w.handle == newEvent->handle; });
+  if (w == state.windows.end())
+  {
+    w = state.windows.emplace(state.windows.end(), newEvent->handle);
+  }
+
+  w->lastUpdatedTime = static_cast<u32>(newEvent->time);
+  switch(newEvent->type)
+  {
+    using namespace window;
+    case event_type::Destroyed:
+    {
+      if (!w->title.empty())
+      {
+        PrintDebug("{} is removed", w->title);
+        if (w->handle == state.topWindow)
+        {
+          state.topWindow = nullptr;
+        }
+      }
+      state.windows.erase(w);
+      if (!state.windows.empty())
+      {
+        state.topWindow = state.windows.back().handle;
+        SetForegroundWindow(state.topWindow);
+      }
+    } break;
+    case event_type::Focused:
+    {
+      state.topWindow = newEvent->handle;
+      PrintDebug("{} is focused", w->title);
+    } break;
+    case event_type::Shown:
+    {
+      w->title = window::GetWindowTitle(newEvent->handle);
+      w->executablePath = window::GetWindowExecutablePath(newEvent->handle);
+      PrintDebug("{} is shown", w->title);
+      TileWindowLayout(layout, state);
+    } break;
+    case event_type::Moved:
+    {
+      PrintDebug("{} is moved", w->title);
+    } break;
+    default:
+    {
+      assert(!"Unhandled event");
+    } break;
+  }
+}
 } // win32
 
 int APIENTRY
@@ -669,7 +674,7 @@ WinMain(HINSTANCE hPrevInstance,
 
   auto controllerInput = win32::controller_input{};
   auto windowStates = InitWindowState();
-  auto windowLayout = winspace::InitwindowLayout(windowStates);
+  auto windowLayout = InitwindowLayout(windowStates);
   bool running = true;
 
   while (running)
@@ -690,15 +695,14 @@ WinMain(HINSTANCE hPrevInstance,
       {
         auto keyboardInput = reinterpret_cast<keyboard::input *>(msg.wParam);
         ProcessKeyboardInput(keyboardInput, controllerInput);
-        winspace::DispatchCommand(controllerInput, windowStates);
+        DispatchCommand(controllerInput, windowStates);
         delete keyboardInput;
       } break;
 
       case WM_WINEVENT:
       {
         auto newWindowEvent = reinterpret_cast<window::event *>(msg.wParam);
-        ProcessWindowEvent(newWindowEvent, windowStates);
-        winspace::TileWindowLayout(windowLayout, windowStates);
+        ProcessWindowEvent(newWindowEvent, windowStates, windowLayout);
         delete newWindowEvent;
       } break;
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 export PATH=~/msvc/opt/msvc/bin/x64:$PATH
 mkdir -p build
-warn="-WX -W4 -wd4100 -wd4189 -wd4201 -wd4505"
+warn="-WX -W4 -wd4100 -wd4189 -wd4201"
 debug="-MTd -Zi -Od -FC"
 out="-Fo:build/ -Fd:build/ -Fe:build/winspace.exe"
 libs="user32.lib dwmapi.lib"
